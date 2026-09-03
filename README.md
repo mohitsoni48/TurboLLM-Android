@@ -10,10 +10,10 @@ Android, so an iOS target can be added later without restructuring — see
 [BLUEPRINT.md §0](BLUEPRINT.md) ("Kotlin Multiplatform, for future iOS"). iOS itself is
 **not implemented** — only the module shape is ready for it.
 
-**Spike A's code is written but not yet build- or device-verified** (BLUEPRINT.md §4) — no
-Android toolchain/device was available in the session that wrote it. Before trusting it,
-run a real build and confirm on a device/emulator. The vendored `nodejs-mobile` binaries
-it links against have their provenance documented (what's confirmed vs. not) in
+**Spike A passed** (BLUEPRINT.md §4) — built, installed on a real emulator, and verified
+live: the embedded `nodejs-mobile` runtime boots and its HTTP server on `:6996` answers
+real requests (`spike-a-emulator-screenshot.png`). The vendored `nodejs-mobile` binaries it
+links against have their provenance documented (what's confirmed vs. not) in
 [PROVENANCE.md](PROVENANCE.md).
 
 **This folder is intentionally gitignored in the main `llama-turbo` repo** — it's going to

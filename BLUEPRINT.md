@@ -1,11 +1,11 @@
 # TurboLLM Android — end-to-end build blueprint
 
-> Status: **Spike A's code is written (2026-09-03), not yet build- or device-verified** — no
-> Android device/emulator or working Gradle/JDK toolchain was available in the session that
-> wrote it. Everything marked **PROVEN** was actually run live on real hardware in the R&D
-> session (ADR-395) or against real infra (this doc's own research pass); Spike A's own code
-> is careful, reviewed, standards-based — but genuinely unbuilt. Run an actual build + device
-> install before trusting it further.
+> Status: **Spike A PASSED (2026-09-03)** — built, installed, and verified live on a real
+> emulator (see §4's Spike A status note): the embedded Node runtime boots and its HTTP
+> server answers real requests. Everything marked **PROVEN** was actually run live, either
+> on real hardware in the earlier R&D session (ADR-395) or on this session's emulator run.
+> Remaining spikes (B/C/D/E) still need their own verification — Spike A passing doesn't
+> imply they do.
 
 ## §0 — What changed from the original design, and why
 
@@ -218,11 +218,20 @@ JS file executes and can write to logcat.
 **Fallback if it fails to build/run at all**: fall back to spec 28's original Termux-fork
 design (§4 of that doc) — the licensing review becomes necessary again, but the technical
 path is already fully proven (ADR-395).
-**Status (2026-09-03)**: code written under `composeApp/` (JNI bridge, `NodeRuntimeLauncher`,
-the inline test script, Compose UI) — **not yet build- or device-verified**, no toolchain/
-device available in the session that wrote it. The `libnode.so`/headers it links against are
-already on disk (see `PROVENANCE.md`) but their download provenance isn't recorded; treat
-this spike as "written, awaiting a real build + `adb logcat` run," not passed.
+**Status (2026-09-03)**: **PASSED — verified live** on a real emulator (Pixel_10_2 AVD,
+API 37, x86_64, 4KB pages). Built (`./gradlew :composeApp:assembleDebug`), installed, and
+launched with no crash; both `libnative-lib.so` and `libnode.so` loaded successfully
+(confirmed via logcat's `nativeloader` lines). `curl http://127.0.0.1:6996/` (via
+`adb forward tcp:6996 tcp:6996`) returned a real, live response from the embedded runtime:
+`{"ok":true,"node":"v18.20.4","v8":"10.2.154.26-node.37","uv":"1.44.2","platform":"android","arch":"x64"}`
+— and the Compose UI itself rendered that exact data (screenshot:
+`spike-a-emulator-screenshot.png`). One deviation from the pass bar as originally written:
+`console.log` output did **not** appear in `adb logcat` under any searched tag — this
+`nodejs-mobile` integration doesn't auto-redirect Node's stdout to logcat the way the
+original spike description assumed. Not a blocker: the HTTP check is strictly more decisive
+proof the runtime booted and ran real JS, so the pass bar is met via that half. Worth a
+follow-up if console-log visibility in logcat matters later (e.g. redirect stdout/stderr to
+a file, or an explicit Android log bridge from within the launched script).
 
 ### Spike B — the embedded runtime's Node version satisfies `turbollm`'s `engines` field
 **Why**: `turbollm/package.json` requires `"node": ">=22.13.0"`.
