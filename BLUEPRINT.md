@@ -104,7 +104,7 @@ export ANDROID_NDK_HOME=~/android-sdk/ndk/27.2.12479018
 
 ```bash
 git clone --depth 1 --branch "$(grep -oP "export const LLAMA_BUILD = '\K[^']+" \
-  /mnt/d/llama-turbo/.claude/worktrees/android-app-rebase-main-a224ba/turbollm/src/engines/download.ts)" \
+  /mnt/d/llama-turbo/turbollm/src/engines/download.ts)" \
   https://github.com/ggml-org/llama.cpp llama.cpp-src
 # (or just hardcode the tag — check download.ts's current LLAMA_BUILD const directly)
 
@@ -129,7 +129,7 @@ cp build/bin/*.so* out/ 2>/dev/null || true
 cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/"*"/lib/linux/aarch64/libomp.so" out/
 
 TAG=$(grep -oP "export const LLAMA_BUILD = '\K[^']+" \
-  /mnt/d/llama-turbo/.claude/worktrees/android-app-rebase-main-a224ba/turbollm/src/engines/download.ts)
+  /mnt/d/llama-turbo/turbollm/src/engines/download.ts)
 tar -C out -czf "llama-${TAG}-bin-android-arm64.tar.gz" .
 ```
 
