@@ -43,17 +43,18 @@ This repo does **not** vendor `turbollm`'s source. It's a separate product repo,
 as an external dependency (build output bundled into the APK's assets, per BLUEPRINT.md
 §7) — a fresh chat working only inside this repo needs to be pointed at it explicitly:
 
-- **Repo**: [`mohitsoni48/TurboLLM`](https://github.com/mohitsoni48/TurboLLM) (private).
-  Local clone on this machine: `D:\llama-turbo` (branch `main`).
+- **Read/edit it directly on disk at `D:\llama-turbo`** (branch `main`) — that's the real,
+  already-checked-out working copy on this machine. Don't clone a fresh copy of
+  [`mohitsoni48/TurboLLM`](https://github.com/mohitsoni48/TurboLLM) (private) into this
+  folder or anywhere else; there is exactly one checkout to work from.
 - **Node version**: `turbollm/package.json`'s `engines` field pins `>=22.13.0` — this is
   the floor Spike B (BLUEPRINT.md §4) checks the embedded `nodejs-mobile` runtime against.
 - **Status as of 2026-09-03**: the Android platform support this blueprint builds on
   (ADR-390/391 — `download.ts`'s Android backend resolution, the NDK-cross-compile CI
-  workflow, the `probe.ts` fix, the catalog entry) was sitting as *uncommitted* changes in
-  a git worktree earlier today. It's now merged to `main`
-  ([PR #203](https://github.com/mohitsoni48/TurboLLM/pull/203), merge commit `b54a370`) —
-  a plain `git pull` on `D:\llama-turbo` (or a fresh clone of `main`) has everything
-  BLUEPRINT.md references.
+  workflow, the `probe.ts` fix, the catalog entry) is merged into `D:\llama-turbo`'s `main`
+  already ([PR #203](https://github.com/mohitsoni48/TurboLLM/pull/203), merge commit
+  `b54a370`) — nothing further to fetch before starting a spike that touches
+  `turbollm/src/engines/`.
 - **Files BLUEPRINT.md names directly**: `turbollm/src/engines/download.ts` (§3.2's
   `availableBackends()`/`provisionBackend()` change), `turbollm/src/hf/hf.ts` (the
   existing `fileUrl()` HF client §3.2 reuses), `turbollm/src/engines/{catalog,compat,
