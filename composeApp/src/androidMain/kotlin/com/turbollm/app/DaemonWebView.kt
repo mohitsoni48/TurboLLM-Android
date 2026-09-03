@@ -27,28 +27,70 @@ import kotlinx.coroutines.delay
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
- *  socket: the app's CSS never sets an explicit height on html/body/#root (it doesn't need to
- *  on desktop Chrome — verified the loaded stylesheet has no such rule), and instead relies on
- *  `h-full`/`h-dvh` Tailwind utilities resolving through the viewport. In THIS WebView (Android
- *  System WebView, Chromium 145 on this emulator) those all compute to a literal 0px — DOM and
- *  CSS both load correctly (194 rules, zero console errors) but nothing ever gets a real
- *  height, so the whole app renders with zero pixels of visible content despite being fully
- *  mounted. Setting an explicit PIXEL height from `window.innerHeight` (not a CSS unit at all)
- *  sidesteps whatever WebView-specific dvh/vh-in-a-WebView-host resolution bug causes this —
- *  confirmed live this alone makes the real app appear. Re-applied on resize (keyboard,
- *  rotation) since a WebView-hosted page doesn't get the same dynamic-viewport recalculation a
- *  real browser tab does. */
+ *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
+ *  raw `vh`-family CSS length (`vh`/`dvh`/`svh`/`lvh`) to a literal 0px — not just on
+ *  html/body/#root (the first occurrence found, fixed below by setting an explicit pixel
+ *  height from `window.innerHeight`), but on ANY element anywhere in the app that uses one,
+ *  including ones that only exist inside dynamically-rendered content (confirmed on a second,
+ *  unrelated occurrence: the Models → Discover results list, `max-h-[45vh]`, which only
+ *  renders after an async fetch completes — so a page-load-time-only fix can't reach it. DOM
+ *  and CSS both load correctly (zero console errors, real data in `innerText`) but the
+ *  affected subtree paints zero pixels regardless.
+ *
+ *  Fixed generally: htmlFix pins html/body/#root's own height in pixels (unchanged from the
+ *  original fix). vhClassFix separately scans element classNames for Tailwind's arbitrary-value
+ *  bracket syntax (`h-[45vh]`, `max-h-[100dvh]`, `min-h-[50svh]`, …) — which is a literal
+ *  substring of the class attribute, not something requiring stylesheet introspection — and
+ *  overrides the corresponding CSS property with an `!important` inline pixel value computed
+ *  from `window.innerHeight`. A MutationObserver re-runs it on every newly-added subtree so
+ *  content rendered after page load (any async-fetched list, not just Discover) is covered
+ *  too, not just what exists at `onPageFinished` time. */
 private const val HEIGHT_FIX_JS = """
 (function() {
-  function fixHeight() {
+  function htmlFix() {
     var px = window.innerHeight + 'px';
     document.documentElement.style.height = px;
     document.body.style.height = px;
     var root = document.getElementById('root');
     if (root) root.style.height = px;
   }
-  fixHeight();
-  window.addEventListener('resize', fixHeight);
+
+  var VH_CLASS_RE = /^(min-h|max-h|h)-\[(\d+(?:\.\d+)?)(?:d|s|l)?vh\]${'$'}/;
+  var PROP_BY_PREFIX = { 'h': 'height', 'min-h': 'min-height', 'max-h': 'max-height' };
+
+  function fixVhElement(el) {
+    if (!el.classList) return;
+    for (var i = 0; i < el.classList.length; i++) {
+      var m = VH_CLASS_RE.exec(el.classList[i]);
+      if (!m) continue;
+      var prop = PROP_BY_PREFIX[m[1]];
+      var px = (parseFloat(m[2]) / 100 * window.innerHeight) + 'px';
+      el.style.setProperty(prop, px, 'important');
+    }
+  }
+
+  function fixVhSubtree(node) {
+    if (node.nodeType !== 1) return;
+    fixVhElement(node);
+    var descendants = node.querySelectorAll ? node.querySelectorAll('[class*="vh]"]') : [];
+    for (var i = 0; i < descendants.length; i++) fixVhElement(descendants[i]);
+  }
+
+  function fixAll() {
+    htmlFix();
+    fixVhSubtree(document.documentElement);
+  }
+
+  fixAll();
+  window.addEventListener('resize', fixAll);
+
+  var observer = new MutationObserver(function(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var added = mutations[i].addedNodes;
+      for (var j = 0; j < added.length; j++) fixVhSubtree(added[j]);
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
 """
 
