@@ -1,15 +1,17 @@
 [versions]
 agp = "8.7.3"
 kotlin = "2.2.20"
-composeMultiplatform = "1.12.0"
+composeMultiplatform = "1.9.3"
 androidxActivityCompose = "1.9.2"
 androidxAppcompat = "1.7.0"
+material = "1.12.0"
 ktor = "3.0.1"
 kotlinxCoroutines = "1.9.0"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidxActivityCompose" }
 androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "androidxAppcompat" }
+android-material = { module = "com.google.android.material:material", version.ref = "material" }
 ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-client-android = { module = "io.ktor:ktor-client-android", version.ref = "ktor" }
 ktor-client-darwin = { module = "io.ktor:ktor-client-darwin", version.ref = "ktor" }
