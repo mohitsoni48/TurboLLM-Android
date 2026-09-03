@@ -291,7 +291,8 @@ terminal for the Code/Agents feature) is a native addon almost certainly not ava
 v1 unless someone separately cross-compiles it. Not a spike blocker; just don't be
 surprised by it, and don't spend Phase 0 time chasing it.
 
-**Status (2026-09-03)**: **real, precise blocker found — not yet resolved.** Pushed the
+**Status (2026-09-03)**: **daemon boots and serves real HTTP — pass bar not yet fully
+cleared** (chat completion still needs the engine-linking fix below). Pushed the
 actual built `dist/cli.js` + a trimmed production `node_modules` onto a real emulator
 (`adb push` + `run-as` into the app's private storage, since there is no standalone `node`
 binary on the device the way Termux had one — `nodejs-mobile` only runs *inside* this
@@ -308,28 +309,67 @@ Fixed by building the same regex via `new RegExp(string)` inside a try/catch, fa
 to an ASCII pattern only on a runtime that can't parse the Unicode form — landed in
 [TurboLLM #204](https://github.com/mohitsoni48/TurboLLM/pull/204) alongside Spike C.
 
-**The real, still-open blocker**: past that fix, the SAME crash recurs from **third-party
-dependencies** — `@earendil-works/pi-tui` (fixed locally, verification-only, not merged —
-4 occurrences patched) and then `marked` (the markdown renderer `pi-coding-agent` depends
-on), which uses `\p{P}`/`\p{S}`/`\p{L}`/`\p{N}` Unicode-property classes **pervasively**
-throughout its emphasis/strikethrough tokenizer — patching every occurrence individually
-is impractical (proved this by trying: fixing one line just reveals the next one a few
-lines later). Traced the actual entry point: `server.ts` has exactly **one** static import
-— `import { registerCodeRoutes } from './code/code-routes'` — that pulls in
-`code-session.ts` → `@earendil-works/pi-ai`/`pi-coding-agent` → `pi-tui`/`marked`,
-unconditionally, at daemon startup, regardless of whether the Code/Agents feature is ever
-used. **The correct fix is making that one import lazy** (dynamic `import()` deferred
-until a Code/Agents route is actually hit, or gated behind `process.platform !==
-'android'` given `node-pty`'s already-known unavailability makes the whole feature
-unusable there anyway) — not patching regexes in vendored dependencies one at a time.
+**Update (2026-09-03, later same day) — the daemon now boots fully.** The lazy-loading fix
+described above as "deliberately not attempted yet" is now done, landed in a follow-up
+TurboLLM PR (branch `feat/android-sqlite-adapter`, commit `a7a85c2`), and **verified live**:
+`GET /api/v1/status` and `GET /api/v1/models` both return real JSON from the daemon running
+inside the emulator. The mechanism, in combination (any one piece alone was insufficient —
+each was found by testing the previous "fix" and hitting the next layer of the same leak):
 
-**Deliberately not attempted yet**: `server.ts`'s route-registration flow is shared,
-heavily-tested product code — the same category of code that produced the invasive,
-wrongly-scoped Spike C mistake earlier in this session when changed under time pressure
-without enough care. This needs its own careful pass (confirm `createApp`'s call site can
-tolerate a lazy/async registration, confirm nothing else depends on `registerCodeRoutes`
-running synchronously at startup), not a rushed patch. Real, honest progress either way:
-the actual blocker is now precisely identified with evidence, not guessed at.
+- `server.ts`/`cli.ts`: `registerCodeRoutes`'s import and `CodeRunManager`'s construction
+  are both now behind `if (process.platform === 'android') return/skip` AND a dynamic
+  `import()`, with the specifier built via `pathToFileURL(join(dirname(fileURLToPath(
+  import.meta.url)), ...))` rather than `new URL(relative, import.meta.url)` — esbuild
+  statically resolves the latter (same pattern `builtin.ts`'s `WORKER_PATH` uses for `new
+  Worker(url)`, but for `import()` specifically it defeats the lazy load) and inlines the
+  target anyway even when it's a separate build entry.
+- `tsup.config.ts`: two genuinely separate build passes (`export default [mainEntries,
+  codeAgentsEntries]`), because esbuild's `splitting: true` shares code across ALL entries
+  in ONE pass by module-graph reachability, not feature boundaries — giving code-routes.ts/
+  code-run-manager.ts their own entry *names* in the same config still produced one shared
+  chunk file that `cli.js` statically imported.
+- `code/run-buffer.ts`: `RingBuffer`/`subscribeToBuffer` extracted out of
+  `code-run-manager.ts` (which pulls in the whole `pi-coding-agent` chain) into their own
+  dependency-free file, because `ext/run-manager.ts` only ever needed those two primitives
+  but importing them *from* `code-run-manager.ts` dragged in everything else in that file too.
+- `patches/typebox` (via `patch-package`, durable): 3 files' `\p{...}` regex literals
+  rebuilt as `new RegExp(string)` in try/catch.
+
+Confirmed via `dist/cli.js` bundle inspection after the fix: zero `pi-tui`/`marked`
+references, zero raw `\p{...}` regex literals (only the already-safe
+`tryUnicodeRegex(string, ...)` call-time constructions), and the real
+`@earendil-works/pi-coding-agent` chain is isolated to `code-routes.js`/
+`code-run-manager.js`'s own separate chunk — never statically reachable from `cli.js`.
+
+**A second, unrelated crash surfaced once the above cleared**, from a genuinely different
+root cause: `undici` (a real npm dependency, used transitively for fetch) reads a `File`
+global at its own module-load time (`webidl.is.File = webidl.util.MakeTypeAssertion(File)`),
+which this embedded Node build doesn't expose — and confirmed live that `node:buffer`'s own
+`File` export is *also* unavailable here, so no amount of re-exporting fixes it. The
+non-obvious part: a plain top-level `import` at the very top of `cli.ts`'s own source does
+**not** reliably run before this — confirmed with a synchronous disk-write diagnostic (not
+`console.error`, whose output was confirmed unreliable to reach logcat before a crash) that
+showed literally zero evidence of the import's module body having executed. Root cause:
+Node's ESM linker executes CommonJS dependencies' top-level code to resolve their named
+exports during the **link phase**, which covers the whole import graph before *any* module
+(including the entry module's own body) reaches evaluation — so "first import in the
+source" does not mean "runs first." The fix that actually works:
+`src/util/android-preload.cjs` (a plain CJS file, polyfilling `File` from `Blob`) loaded via
+a `--require` flag passed to `node` **before** the script path — `NodeRuntimeLauncher.
+startScript()` gained a `preloadScripts` parameter for this (TurboLLM-Android side), because
+`--require` runs via Node's own CLI bootstrap strictly before it begins loading the entry
+module at all, which is the only mechanism confirmed to reliably beat the link-phase issue.
+
+**Next, not yet done**: registering the §2/§3 `llama-server` engine + a small test GGUF and
+hitting a real chat completion (this spike's original pass bar). Found one more blocker
+attempting this: the NDK-cross-compiled `llama-server` binary fails to dynamically link its
+sibling `.so` files (`libllama-server-impl.so` etc., all staged alongside it) even with
+`LD_LIBRARY_PATH` correctly set to their directory — Android's dynamic linker does not
+honor `LD_LIBRARY_PATH` for regular executables the way desktop Linux does (linker-namespace
+hardening since Android 7.0). The standard fix is recompiling with `-Wl,-rpath,'$ORIGIN'` (or
+an equivalent `CMAKE_INSTALL_RPATH` setting) so the fix lives in the ELF's own `DT_RUNPATH`
+instead of an environment variable — this needs a rebuild via §2's WSL/NDK toolchain, not an
+app-side change. Not yet attempted.
 
 ### Spike E — the foreground-service backgrounding fix, in this new architecture
 **Why**: ADR-395 found a real bug — the daemon becomes unreachable (`SYN_SENT`, no

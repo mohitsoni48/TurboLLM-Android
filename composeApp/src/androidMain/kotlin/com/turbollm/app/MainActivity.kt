@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
                             "TMPDIR" to cacheDir.absolutePath,
                         ),
                         args = arrayOf("--no-telemetry"),
+                        preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
                     )
                     Log.i(TAG, "TurboLLM daemon started successfully")
                 } catch (e: Exception) {
