@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 
-private const val DAEMON_URL = "http://127.0.0.1:6996/"
+private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: the app's CSS never sets an explicit height on html/body/#root (it doesn't need to
@@ -63,7 +63,7 @@ fun DaemonWebViewScreen() {
 
     LaunchedEffect(Unit) {
         while (!ready) {
-            ready = client.isDaemonReachable()
+            ready = client.isDaemonReachable(ANDROID_DAEMON_PORT)
             if (!ready) delay(500)
         }
     }

@@ -11,6 +11,13 @@ import androidx.activity.compose.setContent
 
 private const val TAG = "TurboLLM"
 
+/** The daemon's listen port on Android — 7000, not desktop/LAN's 6996, to avoid any ambiguity
+ *  between the two when both might be reachable on the same machine during testing (an
+ *  emulator's forwarded port and a developer's own desktop daemon). Standard for Android
+ *  testing and the app alike; used both for the --port flag the daemon is launched with
+ *  (below) and for the WebView's own URL (DaemonWebView.kt). */
+const val ANDROID_DAEMON_PORT = 7000
+
 class MainActivity : ComponentActivity() {
     private companion object {
         const val CHANNEL_ID = "TurboLLM_Daemon"
@@ -41,7 +48,7 @@ class MainActivity : ComponentActivity() {
                             "HOME" to filesDir.absolutePath,
                             "TMPDIR" to cacheDir.absolutePath,
                         ),
-                        args = arrayOf("--no-telemetry"),
+                        args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
                     )
                     Log.i(TAG, "TurboLLM daemon started successfully")

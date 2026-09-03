@@ -46,10 +46,12 @@ class DaemonClient {
     /** Plain reachability check against the REAL daemon's own status endpoint — deliberately
      *  ignores the response body/shape (unlike `status()`, which expects Spike A's toy JSON
      *  shape at `/`) since all this needs to know is "has the HTTP server come up yet," to
-     *  gate showing the WebView pointed at the daemon's real web UI. */
-    suspend fun isDaemonReachable(): Boolean =
+     *  gate showing the WebView pointed at the daemon's real web UI. `port` is caller-supplied
+     *  (not hardcoded like `status()` above) since Android runs the daemon on its own port —
+     *  see ANDROID_DAEMON_PORT. */
+    suspend fun isDaemonReachable(port: Int): Boolean =
         try {
-            val response: HttpResponse = client.get("http://127.0.0.1:6996/api/v1/status")
+            val response: HttpResponse = client.get("http://127.0.0.1:$port/api/v1/status")
             response.status.isSuccess()
         } catch (e: Exception) {
             false

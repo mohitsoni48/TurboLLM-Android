@@ -79,7 +79,16 @@ android {
         manifest.srcFile("src/androidMain/AndroidManifest.xml")
         res.srcDirs("src/androidMain/res")
         // The vendored nodejs-mobile .so's — see PROVENANCE.md for what's known about them.
-        jniLibs.srcDirs("src/androidMain/cpp/libnode/bin")
+        // src/androidMain/jniLibs/<abi> holds the NDK-cross-compiled llama-server engine
+        // (llama-server itself renamed libllama_server.so to fit the lib*.so convention) —
+        // this is the ONLY location on Android an app can execute a file from that it didn't
+        // ship in the APK itself: files an app writes to its own private storage at runtime
+        // (which is how it was staged for earlier verification passes) get EACCES from
+        // execve() on Android 10+ (W^X hardening) even with the execute bit set and even
+        // though `run-as`'s elevated debug shell can run them directly — confirmed live
+        // (BLUEPRINT.md §7 Spike D). Files here land in the installed APK's own
+        // nativeLibraryDir, which Android explicitly exempts from that restriction.
+        jniLibs.srcDirs("src/androidMain/cpp/libnode/bin", "src/androidMain/jniLibs")
     }
 
     buildTypes {
@@ -89,6 +98,19 @@ android {
         }
         debug {
             isMinifyEnabled = false
+        }
+    }
+
+    // AGP's modern default packs native libs uncompressed *inside* the APK zip and mmaps them
+    // directly (no on-disk extraction) — confirmed live this leaves the installed app's
+    // nativeLibraryDir on disk but genuinely EMPTY. That's fine for a JNI library only ever
+    // dlopen'd into this process (libnode.so, libnative-lib.so), but llama-server needs to be
+    // spawned as a separate PROCESS via execve() from a real file path — there's no file to
+    // point at without this. Forces the older "always extract native libs to disk at install
+    // time" behavior instead.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 
