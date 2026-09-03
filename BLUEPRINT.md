@@ -266,15 +266,16 @@ instance comes back.
      nontrivial NDK toolchain exercise, not a drop-in.
   Option 1 is very likely less total effort — flag it as the default fallback unless Spike
   C's investigation finds otherwise.
-**Status (2026-09-03)**: confirmed necessary (Spike B), **not yet correctly implemented**.
-An earlier attempt in this same session went with Option 1's *direction* but the *wrong
-execution*: it replaced `node:sqlite` with `sql.js` **globally** in the shared `turbollm`
-daemon (`db.ts`, `sqlite-chat-store.ts`, `capabilities.ts`) and dropped the whole product's
-`engines.node` floor to `18.20.0` — for every platform, desktop included, not just Android.
-That change was found and stashed out of the daemon repo (`D:\llama-turbo`, stash entry
-tagged `android-daemon-messed-*`), not merged. The real task is still open: implement the
-WASM-SQLite fallback as an **Android-gated** code path (e.g. selected by `process.platform`
-or a Node-major-version check) that leaves desktop's `node:sqlite` path untouched.
+**Status (2026-09-03)**: **PASSED.** Implemented correctly this time as an Android-gated
+code path (`sqlite-adapter.ts`/`sql-js-database.ts` — desktop's `node:sqlite` behavior is
+byte-for-byte unchanged; only `process.platform === 'android'` takes the `sql.js` branch).
+An earlier attempt in this same session went with the right *direction* but the wrong
+*scope*: it replaced `node:sqlite` with `sql.js` globally (every platform, desktop
+included) and dropped the whole product's `engines.node` floor — found and stashed out of
+the daemon repo, not merged. Full test suite unchanged (3558 pass, 0 regressions — the
+~100 `ConversationStore` call sites across the codebase needed zero changes because the
+fix keeps `openSqlDb()` synchronous). Open as
+[TurboLLM #204](https://github.com/mohitsoni48/TurboLLM/pull/204), not yet merged.
 
 ### Spike D — the daemon boots end-to-end inside the embedded runtime
 **Why**: proves the actual product, not just "Node runs."
@@ -289,6 +290,46 @@ terminal for the Code/Agents feature) is a native addon almost certainly not ava
 `nodejs-mobile` out of the box — expect the terminal feature to be unavailable on Android
 v1 unless someone separately cross-compiles it. Not a spike blocker; just don't be
 surprised by it, and don't spend Phase 0 time chasing it.
+
+**Status (2026-09-03)**: **real, precise blocker found — not yet resolved.** Pushed the
+actual built `dist/cli.js` + a trimmed production `node_modules` onto a real emulator
+(`adb push` + `run-as` into the app's private storage, since there is no standalone `node`
+binary on the device the way Termux had one — `nodejs-mobile` only runs *inside* this
+app's own process) and launched it via a new `NodeRuntimeLauncher.startScript()` path
+(separate from Spike A's proven inline-script path). Also set `HOME`/`TMPDIR` via a new
+native `setenv()` JNI call (`nativeSetEnv`) — without it, `os.homedir()` has nothing to
+resolve `~/.turbollm` against in an Android app process.
+
+Found and fixed one real first-party bug this surfaced: `research-service.ts` used
+`/[^\p{L}\p{N}]+/u` Unicode-property regex literals — `nodejs-mobile`'s Node 18.20.4 build
+lacks full ICU data and can't even **parse** that syntax (a module-load-time SyntaxError,
+not a catchable runtime one — it crashed the whole daemon before any of its own code ran).
+Fixed by building the same regex via `new RegExp(string)` inside a try/catch, falling back
+to an ASCII pattern only on a runtime that can't parse the Unicode form — landed in
+[TurboLLM #204](https://github.com/mohitsoni48/TurboLLM/pull/204) alongside Spike C.
+
+**The real, still-open blocker**: past that fix, the SAME crash recurs from **third-party
+dependencies** — `@earendil-works/pi-tui` (fixed locally, verification-only, not merged —
+4 occurrences patched) and then `marked` (the markdown renderer `pi-coding-agent` depends
+on), which uses `\p{P}`/`\p{S}`/`\p{L}`/`\p{N}` Unicode-property classes **pervasively**
+throughout its emphasis/strikethrough tokenizer — patching every occurrence individually
+is impractical (proved this by trying: fixing one line just reveals the next one a few
+lines later). Traced the actual entry point: `server.ts` has exactly **one** static import
+— `import { registerCodeRoutes } from './code/code-routes'` — that pulls in
+`code-session.ts` → `@earendil-works/pi-ai`/`pi-coding-agent` → `pi-tui`/`marked`,
+unconditionally, at daemon startup, regardless of whether the Code/Agents feature is ever
+used. **The correct fix is making that one import lazy** (dynamic `import()` deferred
+until a Code/Agents route is actually hit, or gated behind `process.platform !==
+'android'` given `node-pty`'s already-known unavailability makes the whole feature
+unusable there anyway) — not patching regexes in vendored dependencies one at a time.
+
+**Deliberately not attempted yet**: `server.ts`'s route-registration flow is shared,
+heavily-tested product code — the same category of code that produced the invasive,
+wrongly-scoped Spike C mistake earlier in this session when changed under time pressure
+without enough care. This needs its own careful pass (confirm `createApp`'s call site can
+tolerate a lazy/async registration, confirm nothing else depends on `registerCodeRoutes`
+running synchronously at startup), not a rushed patch. Real, honest progress either way:
+the actual blocker is now precisely identified with evidence, not guessed at.
 
 ### Spike E — the foreground-service backgrounding fix, in this new architecture
 **Why**: ADR-395 found a real bug — the daemon becomes unreachable (`SYN_SENT`, no

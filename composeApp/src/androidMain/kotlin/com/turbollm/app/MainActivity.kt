@@ -28,14 +28,28 @@ class MainActivity : ComponentActivity() {
             startedNodeAlready = true
             Thread {
                 try {
-                    nodeRuntime.start()
-                    Log.i(TAG, "Node.js started successfully")
+                    // Spike D: the real daemon, manually staged onto the device for this
+                    // verification pass (adb push + run-as) — not yet bundled into the APK's
+                    // own assets (that's the "download/extract on first launch" step, later).
+                    val daemonScript = "${filesDir.absolutePath}/daemon/dist/cli.js"
+                    nodeRuntime.startScript(
+                        daemonScript,
+                        env = mapOf(
+                            // os.homedir() has no real Unix $HOME to fall back to in an
+                            // Android app process — the daemon resolves ~/.turbollm through
+                            // it, so without this it can't find/create its data directory.
+                            "HOME" to filesDir.absolutePath,
+                            "TMPDIR" to cacheDir.absolutePath,
+                        ),
+                        args = arrayOf("--no-telemetry"),
+                    )
+                    Log.i(TAG, "TurboLLM daemon started successfully")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to start Node.js", e)
+                    Log.e(TAG, "Failed to start the daemon", e)
                     runOnUiThread {
                         Toast.makeText(
                             this@MainActivity,
-                            "Node.js start failed: ${e.message}",
+                            "Daemon start failed: ${e.message}",
                             Toast.LENGTH_LONG,
                         ).show()
                     }

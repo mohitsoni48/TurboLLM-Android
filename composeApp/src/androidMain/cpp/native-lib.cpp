@@ -3,6 +3,21 @@
 #include <cstdlib>
 #include "node.h"
 
+// Sets a process environment variable before Node starts — needed because an Android app
+// process has no real Unix $HOME by default, and Node's os.homedir() (which the daemon uses
+// to resolve its own data directory, ~/.turbollm) reads process.env.HOME first. Exposed as
+// its own JNI call (not folded into startNodeWithArguments) so the Kotlin side can set
+// HOME/TMPDIR to the app's real writable storage (Context.filesDir) before Node reads them.
+extern "C" JNIEXPORT void JNICALL
+Java_com_turbollm_app_NodeRuntimeLauncher_nativeSetEnv(
+        JNIEnv *env, jobject /* this */, jstring name, jstring value) {
+    const char *cName = env->GetStringUTFChars(name, 0);
+    const char *cValue = env->GetStringUTFChars(value, 0);
+    setenv(cName, cValue, 1);
+    env->ReleaseStringUTFChars(name, cName);
+    env->ReleaseStringUTFChars(value, cValue);
+}
+
 // Node's libUV requires all arguments to be on contiguous memory.
 //
 // Symbol name is derived from the Kotlin package + class that declares the `external fun`
