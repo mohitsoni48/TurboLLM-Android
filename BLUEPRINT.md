@@ -291,8 +291,9 @@ terminal for the Code/Agents feature) is a native addon almost certainly not ava
 v1 unless someone separately cross-compiles it. Not a spike blocker; just don't be
 surprised by it, and don't spend Phase 0 time chasing it.
 
-**Status (2026-09-03)**: **daemon boots and serves real HTTP — pass bar not yet fully
-cleared** (chat completion still needs the engine-linking fix below). Pushed the
+**Status (2026-09-03)**: **PASSED.** Daemon boots, serves real HTTP, and a real chat
+completion works end-to-end against a real GGUF via a real `llama-server` engine — see the
+full resolution below. Pushed the
 actual built `dist/cli.js` + a trimmed production `node_modules` onto a real emulator
 (`adb push` + `run-as` into the app's private storage, since there is no standalone `node`
 binary on the device the way Termux had one — `nodejs-mobile` only runs *inside* this
@@ -360,16 +361,55 @@ startScript()` gained a `preloadScripts` parameter for this (TurboLLM-Android si
 `--require` runs via Node's own CLI bootstrap strictly before it begins loading the entry
 module at all, which is the only mechanism confirmed to reliably beat the link-phase issue.
 
-**Next, not yet done**: registering the §2/§3 `llama-server` engine + a small test GGUF and
-hitting a real chat completion (this spike's original pass bar). Found one more blocker
-attempting this: the NDK-cross-compiled `llama-server` binary fails to dynamically link its
-sibling `.so` files (`libllama-server-impl.so` etc., all staged alongside it) even with
-`LD_LIBRARY_PATH` correctly set to their directory — Android's dynamic linker does not
-honor `LD_LIBRARY_PATH` for regular executables the way desktop Linux does (linker-namespace
-hardening since Android 7.0). The standard fix is recompiling with `-Wl,-rpath,'$ORIGIN'` (or
-an equivalent `CMAKE_INSTALL_RPATH` setting) so the fix lives in the ELF's own `DT_RUNPATH`
-instead of an environment variable — this needs a rebuild via §2's WSL/NDK toolchain, not an
-app-side change. Not yet attempted.
+**Update (2026-09-03, later same day) — pass bar cleared: a real chat completion works.**
+Verified live: `POST /v1/chat/completions` against a real `llama-server` process, loaded
+with a real GGUF, running entirely on the Android x86_64 emulator, returns real generated
+tokens (`stories260K.gguf`'s output is incoherent by design — it's a tiny toy model — but
+the pipeline is genuine: real inference, real engine process, real daemon wiring). Three
+more real platform blockers stood between "daemon boots" and this actually working, each
+found and fixed in turn:
+
+1. **W^X (write XOR execute), Android 10+.** An app cannot `execve()` a file it wrote to
+   its own private storage at runtime — confirmed live as `EACCES` from Node's `execFile`
+   even with the executable bit set, even though `run-as`'s elevated debug shell could run
+   the identical file directly (which is why every earlier manual verification pass in this
+   doc worked — `run-as` bypasses this restriction; the app's own process does not). Files
+   must ship inside the installed APK's own `nativeLibraryDir` instead. Fixed by packaging
+   `llama-server` (renamed `libllama_server.so` — must match the `lib*.so` convention to be
+   picked up as a native lib at all) plus its `.so` dependencies under
+   `composeApp/src/androidMain/jniLibs/<abi>/`.
+2. **AGP's modern default packs native libs uncompressed inside the APK zip and mmaps them
+   directly, rather than extracting to disk.** Confirmed live this leaves the installed
+   app's `nativeLibraryDir` on disk but genuinely *empty* — fine for a JNI library only ever
+   `dlopen`'d into this process (`libnode.so`, `libnative-lib.so`), useless for
+   `llama-server`, which needs to be spawned as a *separate process* from a real file path.
+   Fixed via `packaging { jniLibs { useLegacyPackaging = true } }` in `build.gradle.kts`,
+   forcing real on-disk extraction at install time.
+3. **The actual `llama-server` binary segfaulted even once it could finally execute.**
+   Root-caused via a small custom `dlopen` probe tool and an NDK hello-world sanity check
+   (which ran fine, ruling out the toolchain/emulator generally) all the way down to
+   `patchelf` itself: even a single `--set-rpath` call corrupts the `.gnu.hash` section in a
+   way Android's bionic linker rejects at `dlopen`/`execve` time (`empty/missing
+   DT_HASH/DT_GNU_HASH`) — while `readelf -d` still shows a perfectly plausible-looking
+   `DT_GNU_HASH` pointer, so the corruption is invisible to the exact tool used to verify
+   the fix worked. This is why the `LD_LIBRARY_PATH`-doesn't-help finding below turned out to
+   be a red herring — the binaries tested there were already patchelf-corrupted regardless
+   of `LD_LIBRARY_PATH`. Fixed by never running `patchelf` at all: bake the `$ORIGIN` rpath
+   in at **link time** instead (`-DCMAKE_EXE_LINKER_FLAGS`/`-DCMAKE_SHARED_LINKER_FLAGS`
+   passed to `cmake`), which the NDK toolchain itself never corrupts.
+
+**Still not resolved**: `arm64-v8a`'s bundled `llama-server` is included in the APK but
+**untested past `--version`** — the `arm64-v8a` `libnode.so` itself still fails to load on
+this 16KB-page-size emulator (Android 15's page-size migration; a separate, pre-existing
+blocker — see the `program alignment (4096) cannot be smaller than system page size (16384)`
+finding above). `x86_64` is the verified, fully working path on this specific emulator.
+
+**Original finding (superseded by the patchelf root-cause above, kept for the record)**: the
+NDK-cross-compiled `llama-server` binary appeared to fail dynamically linking its sibling
+`.so` files even with `LD_LIBRARY_PATH` correctly set to their directory, which looked like
+Android's dynamic linker not honoring `LD_LIBRARY_PATH` for regular executables the way
+desktop Linux does. That diagnosis was incomplete — the binaries under test had already been
+corrupted by `patchelf`, so `LD_LIBRARY_PATH` was never actually the variable that mattered.
 
 ### Spike E — the foreground-service backgrounding fix, in this new architecture
 **Why**: ADR-395 found a real bug — the daemon becomes unreachable (`SYN_SENT`, no
