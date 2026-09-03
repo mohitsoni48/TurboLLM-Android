@@ -5,6 +5,8 @@ import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
+import io.ktor.client.statement.HttpResponse
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -39,5 +41,17 @@ class DaemonClient {
             client.get("http://127.0.0.1:6996/").body()
         } catch (e: Exception) {
             null
+        }
+
+    /** Plain reachability check against the REAL daemon's own status endpoint — deliberately
+     *  ignores the response body/shape (unlike `status()`, which expects Spike A's toy JSON
+     *  shape at `/`) since all this needs to know is "has the HTTP server come up yet," to
+     *  gate showing the WebView pointed at the daemon's real web UI. */
+    suspend fun isDaemonReachable(): Boolean =
+        try {
+            val response: HttpResponse = client.get("http://127.0.0.1:6996/api/v1/status")
+            response.status.isSuccess()
+        } catch (e: Exception) {
+            false
         }
 }

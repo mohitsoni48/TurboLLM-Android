@@ -58,7 +58,7 @@ class MainActivity : ComponentActivity() {
             }.start()
         }
 
-        setContent { App() }
+        setContent { DaemonWebViewScreen() }
     }
 
     private fun createNotificationChannel() {
