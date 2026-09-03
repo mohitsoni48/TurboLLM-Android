@@ -36,3 +36,28 @@ full — see the main repo for the underlying evidence):
 - `.github/workflows/android-llama-build.yml` — the CI recipe for the NDK cross-compile;
   this plan runs the same commands locally in WSL instead (founder direction: no CI for
   now).
+
+## Where the actual daemon/engine code lives
+
+This repo does **not** vendor `turbollm`'s source. It's a separate product repo, consumed
+as an external dependency (build output bundled into the APK's assets, per BLUEPRINT.md
+§7) — a fresh chat working only inside this repo needs to be pointed at it explicitly:
+
+- **Repo**: [`mohitsoni48/TurboLLM`](https://github.com/mohitsoni48/TurboLLM) (private).
+  Local clone on this machine: `D:\llama-turbo` (branch `main`).
+- **Node version**: `turbollm/package.json`'s `engines` field pins `>=22.13.0` — this is
+  the floor Spike B (BLUEPRINT.md §4) checks the embedded `nodejs-mobile` runtime against.
+- **Status as of 2026-09-03**: the Android platform support this blueprint builds on
+  (ADR-390/391 — `download.ts`'s Android backend resolution, the NDK-cross-compile CI
+  workflow, the `probe.ts` fix, the catalog entry) was sitting as *uncommitted* changes in
+  a git worktree until today. It's now committed and open as
+  [PR #203](https://github.com/mohitsoni48/TurboLLM/pull/203) on branch
+  `claude/android-app-rebase-main-a224ba` — **not yet merged to `main`**. Until that PR
+  merges, `D:\llama-turbo` (main) does not have this code; check out that branch (or wait
+  for the merge) before starting any spike that touches `turbollm/src/engines/`.
+- **Files BLUEPRINT.md names directly**: `turbollm/src/engines/download.ts` (§3.2's
+  `availableBackends()`/`provisionBackend()` change), `turbollm/src/hf/hf.ts` (the
+  existing `fileUrl()` HF client §3.2 reuses), `turbollm/src/engines/{catalog,compat,
+  probe,build-runner,build-prereqs}.ts` (already-shipped Android support, §7 reuses
+  as-is), `turbollm/package.json` (the `node-pty`/`node:sqlite` dependencies behind
+  Spike C/D's risk).
