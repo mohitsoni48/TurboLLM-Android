@@ -50,11 +50,10 @@ as an external dependency (build output bundled into the APK's assets, per BLUEP
 - **Status as of 2026-09-03**: the Android platform support this blueprint builds on
   (ADR-390/391 — `download.ts`'s Android backend resolution, the NDK-cross-compile CI
   workflow, the `probe.ts` fix, the catalog entry) was sitting as *uncommitted* changes in
-  a git worktree until today. It's now committed and open as
-  [PR #203](https://github.com/mohitsoni48/TurboLLM/pull/203) on branch
-  `claude/android-app-rebase-main-a224ba` — **not yet merged to `main`**. Until that PR
-  merges, `D:\llama-turbo` (main) does not have this code; check out that branch (or wait
-  for the merge) before starting any spike that touches `turbollm/src/engines/`.
+  a git worktree earlier today. It's now merged to `main`
+  ([PR #203](https://github.com/mohitsoni48/TurboLLM/pull/203), merge commit `b54a370`) —
+  a plain `git pull` on `D:\llama-turbo` (or a fresh clone of `main`) has everything
+  BLUEPRINT.md references.
 - **Files BLUEPRINT.md names directly**: `turbollm/src/engines/download.ts` (§3.2's
   `availableBackends()`/`provisionBackend()` change), `turbollm/src/hf/hf.ts` (the
   existing `fileUrl()` HF client §3.2 reuses), `turbollm/src/engines/{catalog,compat,
