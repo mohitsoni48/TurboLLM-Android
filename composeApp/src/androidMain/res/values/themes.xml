@@ -1,0 +1,15 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme (Compose — no XML layouts) -->
+    <style name="Base.Theme.TurboLLM" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/turbollm_primary</item>
+        <item name="colorPrimaryVariant">@color/turbollm_primary_dark</item>
+        <item name="android:windowTranslucentStatus">false</item>
+        <item name="android:statusBarColor">@color/turbollm_primary_dark</item>
+    </style>
+
+    <style name="Theme.TurboLLM" parent="Base.Theme.TurboLLM" />
+
+    <!-- A real splash-screen variant (BLUEPRINT.md §6's loading state, distinct from this
+         theme, with the Android 12+ SplashScreen API) is Phase 2 scope, not Spike A —
+         AndroidManifest.xml intentionally points at the plain theme above until then. -->
+</resources>

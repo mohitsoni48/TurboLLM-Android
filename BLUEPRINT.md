@@ -1,10 +1,11 @@
 # TurboLLM Android — end-to-end build blueprint
 
-> Status: **plan only, nothing executed from this document yet.** Written 2026-09-03 in the
-> R&D chat; execution starts in a fresh chat against this folder once it's its own repo.
-> Everything marked **PROVEN** was actually run live on real hardware in the R&D session
-> (ADR-395) or against real infra (this doc's own research pass) — everything else is a
-> named risk with a spike attached before the plan leans on it.
+> Status: **Spike A's code is written (2026-09-03), not yet build- or device-verified** — no
+> Android device/emulator or working Gradle/JDK toolchain was available in the session that
+> wrote it. Everything marked **PROVEN** was actually run live on real hardware in the R&D
+> session (ADR-395) or against real infra (this doc's own research pass); Spike A's own code
+> is careful, reviewed, standards-based — but genuinely unbuilt. Run an actual build + device
+> install before trusting it further.
 
 ## §0 — What changed from the original design, and why
 
@@ -32,6 +33,27 @@ Net effect: **§4's legal gate goes away.** Nothing here needs a licensing revie
 implementation starts, because nothing here forks a GPL'd project. The tradeoff, honestly
 stated: `nodejs-mobile` is community-maintained, not battle-tested at TurboLLM's scale, and
 several things about it are unverified against *this specific daemon* — hence Phase 0.
+
+### Kotlin Multiplatform, for future iOS (founder decision, 2026-09-03)
+
+The project is structured as **Kotlin Multiplatform + Compose Multiplatform** from the
+start, not plain Android, so an iOS target can be added later without a rewrite. Concretely:
+
+- `nodejs-mobile` ships for both Android and iOS, but the *bridge* to it is inherently
+  platform-specific either way — JNI on Android, Objective-C/Swift interop on iOS — so KMP
+  doesn't unify that part. What it does unify: the daemon HTTP client (`DaemonClient.kt`,
+  Ktor-based) and the entire Compose UI (`App.kt`) live in `commonMain`, genuinely shared,
+  zero Android-specific code in either.
+- Module shape: `composeApp/src/{commonMain,androidMain,iosMain}` — an `expect class
+  NodeRuntimeLauncher` in `commonMain` with a real JNI-backed `actual` in `androidMain` and
+  a deliberately-unimplemented stub `actual` in `iosMain` (throws `NotImplementedError`,
+  clearly commented). iOS targets (`iosX64`/`iosArm64`/`iosSimulatorArm64`) are declared in
+  `composeApp/build.gradle.kts` so the module compiles for them, but **no iOS app work has
+  started** — no Xcode project, no WKWebView shell, nothing beyond the stub. Don't read the
+  declared targets as "iOS is supported."
+- Package is `com.turbollm.app` throughout (not `com.turbollm.android`) — reflects that the
+  Kotlin code itself is no longer Android-only, even though `applicationId` stays
+  `com.turbollm.android` for app-identity continuity.
 
 Everything else from spec 28 carries over unchanged: WebView shell (no URL bar), foreground
 service (fixes the real backgrounding bug ADR-395 found — daemon becomes unreachable the
@@ -196,6 +218,11 @@ JS file executes and can write to logcat.
 **Fallback if it fails to build/run at all**: fall back to spec 28's original Termux-fork
 design (§4 of that doc) — the licensing review becomes necessary again, but the technical
 path is already fully proven (ADR-395).
+**Status (2026-09-03)**: code written under `composeApp/` (JNI bridge, `NodeRuntimeLauncher`,
+the inline test script, Compose UI) — **not yet build- or device-verified**, no toolchain/
+device available in the session that wrote it. The `libnode.so`/headers it links against are
+already on disk (see `PROVENANCE.md`) but their download provenance isn't recorded; treat
+this spike as "written, awaiting a real build + `adb logcat` run," not passed.
 
 ### Spike B — the embedded runtime's Node version satisfies `turbollm`'s `engines` field
 **Why**: `turbollm/package.json` requires `"node": ">=22.13.0"`.
@@ -206,6 +233,10 @@ trust a remembered number).
 **Fallback if it's older**: check whether `nodejs-mobile` has a newer unreleased branch,
 or whether the daemon's actual minimum can be relaxed (audit what specifically needs
 22.13+ — likely just `node:sqlite`, see Spike C) rather than blocking on the whole plan.
+**Status (2026-09-03)**: **failed, confirmed** — the vendored `libnode.so`'s own
+`node_version.h` reads 18.20.4 (`nodejs-mobile`'s actual current release line), well below
+22.13.0. This is ground truth from the binary itself, not a guess. Spike C's fallback is
+therefore a **confirmed requirement, not a hypothetical** — see its status note below.
 
 ### Spike C — `node:sqlite` works inside the embedded runtime (the sharpest real risk)
 **Why**: `turbollm`'s build step (`package.json`'s `build` script) rewrites the chat
@@ -226,6 +257,15 @@ instance comes back.
      nontrivial NDK toolchain exercise, not a drop-in.
   Option 1 is very likely less total effort — flag it as the default fallback unless Spike
   C's investigation finds otherwise.
+**Status (2026-09-03)**: confirmed necessary (Spike B), **not yet correctly implemented**.
+An earlier attempt in this same session went with Option 1's *direction* but the *wrong
+execution*: it replaced `node:sqlite` with `sql.js` **globally** in the shared `turbollm`
+daemon (`db.ts`, `sqlite-chat-store.ts`, `capabilities.ts`) and dropped the whole product's
+`engines.node` floor to `18.20.0` — for every platform, desktop included, not just Android.
+That change was found and stashed out of the daemon repo (`D:\llama-turbo`, stash entry
+tagged `android-daemon-messed-*`), not merged. The real task is still open: implement the
+WASM-SQLite fallback as an **Android-gated** code path (e.g. selected by `process.platform`
+or a Node-major-version check) that leaves desktop's `node:sqlite` path untouched.
 
 ### Spike D — the daemon boots end-to-end inside the embedded runtime
 **Why**: proves the actual product, not just "Node runs."
@@ -257,8 +297,13 @@ something, not just assume it).
 
 ## §5 — Phase 1: skeleton app (after Phase 0 passes)
 
-1. New Android Studio project, Kotlin, minSdk matched to `ANDROID_PLATFORM=android-24`
-   from §2 (or bump both together if a later floor turns out cleaner).
+**Status (2026-09-03)**: done, as a Kotlin Multiplatform + Compose Multiplatform project
+(`composeApp/`, minSdk 24 matching §2's `ANDROID_PLATFORM=android-24`) rather than a plain
+Android Studio project — see "Kotlin Multiplatform, for future iOS" under §0. Steps below
+kept for reference/reproducibility, not as an outstanding to-do.
+
+1. ~~New Android Studio project, Kotlin, minSdk matched to `ANDROID_PLATFORM=android-24`
+   from §2~~ → done via `composeApp/build.gradle.kts` instead.
 2. Integrate `nodejs-mobile`'s Android library per its own docs — this is a real Gradle
    module dependency + a native library init call, not custom low-level JNI work.
 3. `MainActivity` — just enough to host a WebView (real UI comes in §6) and confirm the

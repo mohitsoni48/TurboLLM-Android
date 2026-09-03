@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Placeholder mark only — real branding is Phase 6 (BLUEPRINT.md §10), not Spike A.
+     A plain circle inside the adaptive-icon safe zone so it never gets cropped oddly. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,30 A24,24 0 1 1 53.99,30 Z" />
+</vector>

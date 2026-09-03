@@ -5,6 +5,17 @@ no visible terminal. WebView shell + an embedded Node runtime (`nodejs-mobile`) 
 daemon and NDK-cross-compiled `llama-server` already proven working end-to-end on a real
 phone in the main repo's R&D session (2026-09).
 
+Built as **Kotlin Multiplatform + Compose Multiplatform** (`composeApp/`), not plain
+Android, so an iOS target can be added later without restructuring — see
+[BLUEPRINT.md §0](BLUEPRINT.md) ("Kotlin Multiplatform, for future iOS"). iOS itself is
+**not implemented** — only the module shape is ready for it.
+
+**Spike A's code is written but not yet build- or device-verified** (BLUEPRINT.md §4) — no
+Android toolchain/device was available in the session that wrote it. Before trusting it,
+run a real build and confirm on a device/emulator. The vendored `nodejs-mobile` binaries
+it links against have their provenance documented (what's confirmed vs. not) in
+[PROVENANCE.md](PROVENANCE.md).
+
 **This folder is intentionally gitignored in the main `llama-turbo` repo** — it's going to
 become its own git repository (`git init` already done here) so the Android app has a
 clean, independent history separate from the daemon/desktop product repo. Copy or clone

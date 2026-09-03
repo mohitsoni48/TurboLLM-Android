@@ -1,0 +1,27 @@
+# Local machine config — never portable, contains an absolute SDK path.
+/local.properties
+
+# Build outputs
+**/build/
+.gradle/
+.kotlin/
+
+# Native build intermediates (NDK/CMake)
+**/.cxx/
+**/.externalNativeBuild/
+
+# The vendored nodejs-mobile runtime (~190MB of .so binaries + headers) — real build
+# input, kept ON DISK, but never committed. See PROVENANCE.md for what's known about it.
+composeApp/src/androidMain/cpp/libnode/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Agent tooling scratch — not project source
+.omc/
