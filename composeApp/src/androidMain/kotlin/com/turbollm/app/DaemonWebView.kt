@@ -44,7 +44,15 @@ private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
  *  overrides the corresponding CSS property with an `!important` inline pixel value computed
  *  from `window.innerHeight`. A MutationObserver re-runs it on every newly-added subtree so
  *  content rendered after page load (any async-fetched list, not just Discover) is covered
- *  too, not just what exists at `onPageFinished` time. */
+ *  too, not just what exists at `onPageFinished` time.
+ *
+ *  QA_BUGS.md BUG-05 (2026-09-04): the same bug also breaks Tailwind's NAMED vh-family
+ *  utilities (`min-h-dvh`, `h-screen`, …), not just the bracket arbitrary-value form above —
+ *  `.app-shell`'s `min-h-dvh` (Shell.tsx, document-scroll mode) collapsing to 0 left the
+ *  bottom tab bar rendering right after short content instead of pinned to the real bottom of
+ *  the screen. fixNamedVhClasses covers this with one small stylesheet (updated on resize)
+ *  instead of per-element scanning — a CSS class selector already applies to elements added
+ *  after it exists, so no MutationObserver entry is needed for this half of the fix. */
 private const val HEIGHT_FIX_JS = """
 (function() {
   function htmlFix() {
@@ -76,9 +84,33 @@ private const val HEIGHT_FIX_JS = """
     for (var i = 0; i < descendants.length; i++) fixVhElement(descendants[i]);
   }
 
+  // QA_BUGS.md BUG-05: the same 0px-vh bug also breaks Tailwind's NAMED viewport-height
+  // utilities (`min-h-dvh`, `h-dvh`, `h-screen`, ...) — not just the bracket arbitrary-value
+  // form vhClassFix (above) already covers. `.app-shell` uses `min-h-dvh` in document-scroll
+  // mode (Shell.tsx) to let MobileNav stick to the true viewport bottom; with min-height
+  // collapsing to 0 the shell only grew to its own (often short) content, so the tab bar
+  // rendered right after that content instead of pinned to the screen — reported as "the
+  // tab bar floats mid-screen with a dead white gap below it" on tabs with little content.
+  // A single stylesheet, updated on resize, covers every element with these classes at
+  // once — no MutationObserver needed here, unlike vhClassFix's inline-style scan, since
+  // CSS class selectors apply to future elements automatically.
+  var namedVhStyleEl = null;
+  function fixNamedVhClasses() {
+    var px = window.innerHeight + 'px';
+    if (!namedVhStyleEl) {
+      namedVhStyleEl = document.createElement('style');
+      document.documentElement.appendChild(namedVhStyleEl);
+    }
+    namedVhStyleEl.textContent =
+      '.h-dvh,.h-svh,.h-lvh,.h-screen{height:' + px + ' !important}' +
+      '.min-h-dvh,.min-h-svh,.min-h-lvh,.min-h-screen{min-height:' + px + ' !important}' +
+      '.max-h-dvh,.max-h-svh,.max-h-lvh,.max-h-screen{max-height:' + px + ' !important}';
+  }
+
   function fixAll() {
     htmlFix();
     fixVhSubtree(document.documentElement);
+    fixNamedVhClasses();
   }
 
   fixAll();
@@ -132,8 +164,19 @@ fun DaemonWebViewScreen() {
 @Composable
 private fun TurboLLMWebView() {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    // QA_BUGS.md BUG-02: `webViewRef?.canGoBack() == true` as BackHandler's `enabled` directly
+    // was a snapshot taken once (whenever `webViewRef` itself was last reassigned, i.e. almost
+    // never after the initial composition) — Compose has no way to know `canGoBack()`'s return
+    // value changed later, since it's a plain method call on a View, not an observed State. A
+    // real page navigation happened to still exit correctly in the earlier top/bottom-inset
+    // fixes because those never depended on `canGoBack()` flipping true; the web app's own
+    // `history.pushState()` (use-backable-overlay.ts, opening the conversations drawer) does
+    // depend on it, and needed a real reactive value. `doUpdateVisitedHistory` fires for both
+    // ordinary page loads AND same-document pushState/popstate navigation, so it is the one
+    // WebViewClient hook that can keep this correct for both cases.
+    var canGoBack by remember { mutableStateOf(false) }
 
-    BackHandler(enabled = webViewRef?.canGoBack() == true) {
+    BackHandler(enabled = canGoBack) {
         webViewRef?.goBack()
     }
 
@@ -148,6 +191,11 @@ private fun TurboLLMWebView() {
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
                         view.evaluateJavascript(HEIGHT_FIX_JS, null)
+                        canGoBack = view.canGoBack()
+                    }
+                    override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                        super.doUpdateVisitedHistory(view, url, isReload)
+                        canGoBack = view.canGoBack()
                     }
                 }
                 loadUrl(DAEMON_URL)

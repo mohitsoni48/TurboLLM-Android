@@ -47,6 +47,16 @@ class MainActivity : ComponentActivity() {
                             // it, so without this it can't find/create its data directory.
                             "HOME" to filesDir.absolutePath,
                             "TMPDIR" to cacheDir.absolutePath,
+                            // QA_BUGS.md BUG-01: applicationInfo.nativeLibraryDir is the ONLY
+                            // place Android's W^X hardening exempts (build.gradle.kts's jniLibs
+                            // comment) — and PackageManager regenerates it on every install/
+                            // update (a fresh signing session even for the identical APK), so a
+                            // path saved from a previous run is not reliable across app updates.
+                            // The daemon reads this at boot to self-register/repair its bundled
+                            // llama-server engine (engines/seed.ts's ensureAndroidBundledEngine)
+                            // instead of depending on a manual one-time registration that goes
+                            // stale the next time the app is reinstalled.
+                            "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
                         ),
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),

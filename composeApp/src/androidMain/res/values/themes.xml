@@ -5,6 +5,9 @@
         <item name="colorPrimaryVariant">@color/turbollm_primary_dark</item>
         <item name="android:windowTranslucentStatus">false</item>
         <item name="android:statusBarColor">@color/turbollm_primary_dark</item>
+        <!-- QA_BUGS.md BUG-08: was the platform default (off-white/pink), visible as a jarring
+             flash before Compose's first frame on a cold start — see colors.xml. -->
+        <item name="android:windowBackground">@color/turbollm_window_bg</item>
     </style>
 
     <style name="Theme.TurboLLM" parent="Base.Theme.TurboLLM" />

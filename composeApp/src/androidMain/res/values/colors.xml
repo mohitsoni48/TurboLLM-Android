@@ -2,4 +2,10 @@
 <resources>
     <color name="turbollm_primary">#FF6C3CE1</color>
     <color name="turbollm_primary_dark">#FF4A1FB5</color>
+    <!-- Matches TurboLLMTheme's Compose `background` (App.kt) — QA_BUGS.md BUG-08: the raw
+         Android window paints this color for the brief window between process start and
+         Compose's first frame (most visible on a force-stop cold start), so it must match the
+         "Starting TurboLLM…" screen behind it instead of the platform's default window
+         background, which read as a jarring off-white/pink flash. -->
+    <color name="turbollm_window_bg">#FFF8F9FA</color>
 </resources>
