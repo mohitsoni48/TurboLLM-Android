@@ -6,6 +6,77 @@
 **Tools used:** `adb`, Maestro 2.6.1, Chrome DevTools Protocol (via `WebView.setWebContentsDebuggingEnabled` + `adb forward`), `uiautomator dump`
 **Screenshots:** all evidence referenced below lives in [`qa/screenshots/`](qa/screenshots/) in this repo.
 
+---
+
+## RETEST — 2026-09-04, later build (commit `f18458b`, fresh APK built 15:21)
+
+Re-tested after `f18458b` claimed to fix BUG-01, BUG-02, BUG-05, BUG-08. Verdict: **regressed, not
+fixed** — the app now crashes on 100% of launches, before it even reaches the point any of those
+four fixes could matter. This is a new, more severe P0 than anything in the original pass.
+
+### BUG-14 (NEW, P0): App crashes with SIGSEGV on every single launch — daemon never boots
+Freshly installed the rebuilt APK (`composeApp-debug.apk`, rebuilt 2026-09-04 15:21, same-day as
+the fix commit) on a clean emulator boot. Every launch attempt (3/3) crashes silently within ~1.5s
+— no error dialog, no crash UI, just an instant snap back to the home screen mid-launch-animation
+(see [retest-02-t1s.png](qa/screenshots/retest-02-t1s.png), caught mid-icon-zoom-out as Android
+tears the task down). `logcat` confirms a real native crash both times:
+```
+E nodejs  : Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+E nodejs  :     at new NodeError (node:internal/errors:405:5)
+E nodejs  :     at ModuleLoader.builtinStrategy (node:internal/modules/esm/translators:300:11)
+E nodejs  : Node.js v18.20.4
+...
+I Zygote  : Process 3404 exited due to signal 11 (Segmentation fault)
+```
+**Root cause, fully traced:** this is *not* a device/cache artifact — it's a real release gap.
+- `turbollm/src/chat/store/sqlite-adapter.ts` (main `llama-turbo` repo) is correctly gated —
+  `openSqlDb()` only calls `requireSync('node:sqlite')` when `process.platform !== 'android'`,
+  exactly as intended (see that file's own header comment explaining why a *static* top-level
+  `import ... from 'node:sqlite'` would crash Android's Node 18.20.4 the instant the module loads).
+- But `turbollm/src/chat/db.ts` used to have its own separate top-level
+  `import { DatabaseSync } from 'node:sqlite'` that bypassed the adapter entirely. That's fixed in
+  the *current* local source (`db.ts` now correctly imports `openSqlDb` from `sqlite-adapter.js`
+  — verified by reading the file directly), and the *locally built* `turbollm/dist/cli.js`
+  reflects that fix correctly.
+- **The published `turbollm@1.12.2` npm package does not.** Downloaded the actual tarball npm
+  serves right now (`https://registry.npmjs.org/turbollm/-/turbollm-1.12.2.tgz`) and its bundled
+  `dist/cli.js` still contains the broken static import at line 14488:
+  `import { DatabaseSync } from "node:sqlite";` — byte-identical to what's sitting in this
+  device's cached daemon at `/data/data/com.turbollm.android/files/daemon/dist/cli.js:14554`
+  (pulled directly off the device with `run-as` to confirm). The package.json `version` field is
+  `1.12.2` in all three places (local source, local dist, published npm) — **the fix commit landed
+  in git but the version was never bumped and the package was never republished**, so npm is still
+  serving the pre-fix build, and every Android install (this one included, cache or fresh) gets it.
+- The Android app itself has no fallback here: `DaemonWebView.kt`/`NodeRuntimeLauncher.android.kt`
+  hand the daemon whatever's in the npm tarball straight to the embedded Node 18.20.4 runtime,
+  which has never had `node:sqlite` at any version — so `db.ts`'s top-level import throws
+  synchronously on the very first module evaluation, before the daemon's HTTP server, the WebView,
+  or *any* app UI exists. That's why nothing ever appears — not even the "Starting TurboLLM…"
+  splash from the first QA pass.
+**Impact:** every one of BUG-01/02/05/08's fixes (all inside the Android app repo) is currently
+**unverifiable** — the app can't reach the point where any of them would be exercised. This is
+strictly worse than the original P0 (BUG-01: model load fails) since that at least got you to a
+usable chat shell; this crashes before any screen renders at all.
+**Fix:** bump `turbollm/package.json`'s version and run the project's normal release/publish step
+(`docs/RELEASE.md` in the main repo) so npm actually serves a `dist/cli.js` matching current
+`main` — then reinstall/re-fetch the daemon on the Android app and retest. No Android-app-side
+change is needed for this specific bug; the fix already exists, it's just not released.
+**Evidence:** [retest-01-launch.png](qa/screenshots/retest-01-launch.png) through
+[retest-04-t4s.png](qa/screenshots/retest-04-t4s.png) (home screen every time, no app UI ever
+painted); root-cause trace in this session's transcript (full `logcat`, pulled `dist/cli.js` from
+both the device and the npm tarball, `grep`-diffed against local `turbollm/src`).
+
+### Everything else in this pass
+Untestable as a direct result of BUG-14 — the app cannot progress past the crash to reach the
+Workspace/Models/Engines screens where BUG-01 through BUG-13 live, so none of them could be
+re-verified this session. Recommend re-running this full retest once BUG-14 is resolved (republish
+`turbollm` to npm); until then treat every bug below as **still open, unconfirmed-fixed**,
+regardless of what the `f18458b` commit message claims to have addressed.
+
+---
+
+## ORIGINAL PASS — 2026-09-04, first build
+
 ## How to read this report
 
 The app is a native Compose shell hosting one full-screen `WebView` that renders TurboLLM's
