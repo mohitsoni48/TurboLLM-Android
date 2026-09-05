@@ -63,7 +63,7 @@ android {
         minSdk = 24
         targetSdk = 35
         versionCode = 1
-        versionName = "0.1.0-spike-a"
+        versionName = "1.12.4"
 
         externalNativeBuild {
             cmake {
@@ -130,4 +130,67 @@ android {
 
 dependencies {
     debugImplementation(compose.uiTooling)
+}
+
+// ── The daemon that ships inside the APK ──────────────────────────────────────────────────
+//
+// The app is a WebView over a Node daemon, and that daemon has to be IN the APK: a Play Store
+// user has no adb and no `npm install`. Staging it is therefore part of the build, not a
+// manual step someone has to remember — forgetting it produces an APK that installs happily
+// and then dies at boot with `Cannot find package '@hono/node-server'`, which is exactly how
+// this was discovered. See BUILDING-ENGINES.md § "The daemon payload".
+//
+// Hooked to the merge*Assets tasks rather than preBuild, because those are what actually
+// consume src/androidMain/assets — depending on preBuild would let a stale or missing payload
+// through whenever Gradle skipped straight to the merge.
+//
+// The staged directory is gitignored build output; the script rebuilds the daemon bundle each
+// time (~200 ms) so the APK can never ship a daemon older than the source.
+// Resolved to an ABSOLUTE path up front, against the app checkout root. A relative value would
+// mean two different directories depending on who resolves it — Exec's workingDir is the root
+// project, while Gradle's file() is relative to this module — which is precisely the mismatch
+// that made the first version of this look for turbollm inside the Android repo. The default
+// assumes the sibling layout this project is developed in: <parent>/TurboLLM Android and
+// <parent>/turbollm. Override with -Pturbollm.dir=<path> or a line in gradle.properties.
+val turbollmDir: File = rootProject.projectDir
+    .resolve(providers.gradleProperty("turbollm.dir").orNull ?: "../turbollm")
+    .normalize()
+val stagedDaemonAssets = layout.projectDirectory.dir("src/androidMain/assets/daemon")
+
+val stageDaemonAssets by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Bundles the TurboLLM Node daemon into src/androidMain/assets/daemon."
+    workingDir = rootProject.projectDir
+    // `node` rather than `npm`/`npx` so this doesn't depend on a shell resolving a .cmd
+    // shim differently across platforms.
+    commandLine("node", "scripts/stage-daemon-assets.mjs", turbollmDir.absolutePath)
+
+    // Deliberately NOT declared up-to-date-able on its inputs: the script's own first step is
+    // rebuilding the bundle from turbollm/src, and teaching Gradle to track that whole tree
+    // across two repos is more fragile than just running a fast script every time.
+    outputs.upToDateWhen { false }
+
+    doFirst {
+        if (!turbollmDir.exists()) {
+            throw GradleException(
+                "No turbollm checkout at ${turbollmDir.absolutePath}.\n" +
+                    "Set it with -Pturbollm.dir=<path> or in gradle.properties.",
+            )
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(stageDaemonAssets)
+}
+
+// A build that produced no payload would ship a broken app, so fail loudly at assemble time
+// rather than at the user's first launch.
+tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }.configureEach {
+    doLast {
+        val cli = stagedDaemonAssets.file("dist/cli.js").asFile
+        if (!cli.exists()) {
+            throw GradleException("Daemon payload missing: ${cli.absolutePath} — the APK would boot to a crash.")
+        }
+    }
 }

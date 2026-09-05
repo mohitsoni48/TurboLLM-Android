@@ -24,6 +24,7 @@
 //                                           .wasm relative to its package dir at runtime
 //
 // Usage: node scripts/stage-daemon-assets.mjs [path-to-turbollm-checkout]
+import { execSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -39,7 +40,29 @@ const preload = join(turbollm, 'src', 'util', 'android-preload.cjs')
 // debug builds — 24 MB in total, against ~1 MB for the two files actually loaded here.
 const sqlJs = join(turbollm, 'node_modules', 'sql.js')
 
-for (const [label, p] of [['android bundle (run: npx tsup --config tsup.android.config.ts)', bundle], ['web UI', webdist], ['android preload', preload], ['sql.js', sqlJs]]) {
+if (!existsSync(turbollm)) {
+  console.error(`FATAL: no turbollm checkout at ${turbollm}\nPass its path: node scripts/stage-daemon-assets.mjs <path-to-turbollm>`)
+  process.exit(1)
+}
+
+// Always rebuild the Android bundle rather than reusing whatever is on disk. It takes ~200 ms,
+// and the alternative is the failure mode this whole pipeline exists to prevent: an APK that
+// looks fine and silently ships a daemon older than the source. The web UI is NOT rebuilt here —
+// that one is slow, changes far less often, and has its own `npm run build` in web/.
+console.log('building the Android daemon bundle…')
+try {
+  execSync('npx tsup --config tsup.android.config.ts', { cwd: turbollm, stdio: 'inherit' })
+} catch {
+  console.error(`FATAL: the Android daemon bundle failed to build in ${turbollm}`)
+  process.exit(1)
+}
+
+for (const [label, p] of [
+  ['android bundle', bundle],
+  ["web UI (run: npm run build in turbollm/web)", webdist],
+  ['android preload', preload],
+  ['sql.js (run: npm install in turbollm)', sqlJs],
+]) {
   if (!existsSync(p)) {
     console.error(`FATAL: missing ${label}: ${p}`)
     process.exit(1)

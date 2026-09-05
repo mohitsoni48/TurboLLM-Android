@@ -14,6 +14,12 @@ paste into a search box in three months.
 
 ## What you actually need to do
 
+- **Just building the app?** Nothing special — `./gradlew assembleDebug` stages the Node
+  daemon into the APK for you (`stageDaemonAssets`). It only needs the `turbollm` checkout
+  beside this repo, or `-Pturbollm.dir=<path>`. See
+  [the daemon payload](#the-daemon-payload--what-makes-the-apk-self-sufficient) — read that
+  before touching anything about how the daemon is packaged, because the failure mode is an
+  APK that builds and installs cleanly and then dies at first launch.
 - **Shipping a new CPU engine?** You don't build it by hand. Bump `LLAMA_BUILD` in
   `turbollm/src/engines/download.ts`, push to `main`, and the
   [`android-llama-build.yml`](../.github/workflows/android-llama-build.yml) workflow
@@ -27,6 +33,96 @@ paste into a search box in three months.
   [the platform constraint](#the-platform-constraint-that-shapes-everything). It is the
   reason the binaries are bundled rather than downloaded, the reason they are named
   `lib*.so`, and the reason `useLegacyPackaging = true` is not optional.
+
+---
+
+## The daemon payload — what makes the APK self-sufficient
+
+The engine binaries are only half of what ships inside the APK. The other half is the **Node
+daemon**, and it has to be in there too: someone installing from the Play Store has no `adb`
+and no `npm install`.
+
+**You do not run anything by hand.** `./gradlew assembleDebug` (or `bundleRelease`) runs
+`scripts/stage-daemon-assets.mjs` first, via the `stageDaemonAssets` task wired up in
+`composeApp/build.gradle.kts`. It is attached to the **`merge*Assets`** tasks — not `preBuild`,
+which Gradle can skip past — and `assemble*`/`bundle*` additionally fail if the payload is
+missing, so a broken APK cannot get as far as a device.
+
+The script expects the `turbollm` checkout as a sibling of this repo. If it lives elsewhere:
+
+```bash
+./gradlew assembleDebug -Pturbollm.dir=/path/to/turbollm
+# or put turbollm.dir=/path/to/turbollm in gradle.properties
+```
+
+It rebuilds the daemon bundle every time (~200 ms) rather than trusting what is on disk, so the
+APK can never ship a daemon older than the source. It does **not** rebuild the web UI — that is
+slower and changes less often, so run `npm run build` in `turbollm/web` when the UI changes.
+
+### Why the payload is built specially instead of just copying `dist/`
+
+Because copying `dist/` does not work, and fails in a way that looks fine until a user installs
+it. The npm build deliberately leaves `dependencies` **external** — correct for npm, which
+installs them — so a fresh install crashed at boot with:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@hono/node-server'
+    imported from /data/data/com.turbollm.android/files/daemon/dist/cli.js
+```
+
+This went unnoticed for a long time because dev sessions had pushed extra files onto the test
+device by hand, so the app only ever ran against injected state a real download never has.
+
+Shipping `node_modules` instead is not an option either: the production tree is **362 MB**,
+about 220 MB of which is `@earendil-works/pi-*` plus its `@mistralai`/`@google`/`openai`/
+`@opentelemetry` transitives — the Code feature, which Android does not even expose. So
+`turbollm/tsup.android.config.ts` is a **separate build pass** that bundles the dependencies in.
+Total payload: **14.5 MB**.
+
+Four things in that config are load-bearing, each one a crash that was hit and fixed:
+
+| Setting | Without it |
+|---|---|
+| `target: 'node18'` | nodejs-mobile embeds Node **18.20.4**, not the 22 the desktop package targets — syntax the phone cannot parse |
+| `banner` defines `require` | bundled CommonJS keeps esbuild's `__require` shim, which throws: `Dynamic require of "assert" is not supported` (undici) |
+| `banner` defines `__dirname` | `ReferenceError: __dirname is not defined in ES module scope` — sql.js locates its own `.wasm` that way |
+| `dist/package.json` = `{"type":"module"}` | Node decides ESM by walking up for the nearest `package.json`; without one above the extracted bundle it reads the ESM entrypoint as CommonJS and dies on `import` |
+
+Two files cannot be bundled and are staged beside the bundle instead:
+
+- **`sql-wasm.wasm`** — a binary sql.js loads at runtime via `__dirname + "/"`. Only the wasm is
+  copied; the package's other ~23 MB is asm.js, browser and debug variants.
+- **`node_modules/ws`** — reached through a real runtime `require('ws')`, which esbuild cannot
+  bundle. The source has exactly three bare requires: `net` (a builtin), `node-pty` (native, and
+  only used by the Code feature that Android cuts) and this one.
+
+### On the device
+
+`MainActivity.extractDaemonFromAssets()` unpacks `assets/daemon` into `files/daemon` on first
+launch, keyed on the APK's `lastUpdateTime` so an app update cannot be shadowed by a stale copy.
+`~/.turbollm` — models, chat history — lives outside `daemon/` and is never touched. A failed
+extraction leaves no stamp behind, so the next launch retries instead of booting a half-written
+tree.
+
+The staged directory is **gitignored**: it is build output that would otherwise churn on every
+daemon change.
+
+### How to verify self-sufficiency (do this before any release)
+
+Injected state is invisible and will lie to you. The only honest test is a full wipe:
+
+```bash
+adb uninstall com.turbollm.android
+adb shell "run-as com.turbollm.android ls files"   # must say: unknown package
+adb install composeApp/build/outputs/apk/debug/composeApp-debug.apk
+adb shell am start -n com.turbollm.android/com.turbollm.app.MainActivity
+# then, with NOTHING pushed:
+adb logcat -d | grep -E "E nodejs|TurboLLM:"
+adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/api/v1/engines
+```
+
+Last run of exactly that: daemon booted, UI served HTTP 200, and both engines registered
+(`llama-server-android` and `llama-server-android-vulkan`).
 
 ---
 
