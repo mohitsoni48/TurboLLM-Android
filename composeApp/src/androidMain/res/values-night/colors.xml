@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark-mode counterparts of values/colors.xml — matches the web UI's dark-mode bg token
-         (index.css .dark, spec 11 §1) instead of the light one. -->
-    <color name="turbollm_status_bar">#FF0E0E10</color>
+    <!-- Dark-mode counterpart of values/colors.xml's window background — matches the web UI's
+         dark-mode bg token (index.css .dark, spec 11 §1) instead of the light one.
+         turbollm_status_bar is NOT overridden here: it's the same branded orange in both
+         themes, so values/colors.xml's definition is inherited as-is. -->
     <color name="turbollm_window_bg">#FF0E0E10</color>
 </resources>
