@@ -36,6 +36,7 @@ kotlin {
             implementation(libs.androidx.appcompat)
             implementation(libs.android.material)
             implementation(libs.ktor.client.android)
+            implementation(libs.lottie.compose)
         }
         commonMain.dependencies {
             implementation(compose.runtime)
