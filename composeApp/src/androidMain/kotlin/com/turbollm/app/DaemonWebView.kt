@@ -1,6 +1,13 @@
 package com.turbollm.app
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.os.Build
+import android.view.Gravity
+import android.view.WindowManager
+import android.view.WindowInsets
+import android.widget.FrameLayout
+import android.widget.ProgressBar
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -8,7 +15,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -20,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
@@ -126,6 +133,46 @@ private const val HEIGHT_FIX_JS = """
 })();
 """
 
+/** Injects the native window insets as CSS custom properties so the web UI's
+ *  `var(--tllm-safe-top)` / `var(--tllm-safe-bottom)` resolve to real pixel values.
+ *  Android's System WebView resolves `env(safe-area-inset-*)` to 0px on many builds,
+ *  so we read the insets natively and patch them in via JS (same pattern as HEIGHT_FIX_JS).
+ *  Called after HEIGHT_FIX_JS so the CSS vars are ready before the web layout reads them. */
+private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
+    val js = """
+(function() {
+  var s = document.documentElement.style;
+  s.setProperty('--tllm-safe-top', '${topPx}px');
+  s.setProperty('--tllm-safe-bottom', '${bottomPx}px');
+})();
+""".trimIndent()
+    evaluateJavascript(js, null)
+}
+
+/** Read the current window insets in a backward-compatible way (API 30+ WindowInsets API,
+ *  falling back to deprecated getWindowVisibleDisplayFrame on older APIs). Returns pair of
+ *  (topInsetPx, bottomInsetPx) in pixels. */
+private fun readWindowInsets(windowManager: WindowManager): Pair<Int, Int> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val r = windowManager.currentWindowMetrics
+        val insets = r.windowInsets
+        val top = insets.getInsets(WindowInsets.Type.statusBars()).top
+        val bottom = if (insets.isVisible(WindowInsets.Type.navigationBars()))
+            insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+        else 0
+        top to bottom
+    } else @Suppress("DEPRECATION")
+    {
+        val r = windowManager.currentWindowMetrics
+        val insets = r.windowInsets
+        val top = insets.getInsets(WindowInsets.Type.statusBars()).top
+        val bottom = if (insets.isVisible(WindowInsets.Type.navigationBars()))
+            insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+        else 0
+        top to bottom
+    }
+}
+
 /** Android's real product UI (BLUEPRINT.md §6): the daemon already serves its own full web UI
  *  at DAEMON_URL, identical to the desktop/LAN case — this just hosts it in a full-screen
  *  WebView once the daemon is actually listening, instead of reimplementing any of that UI
@@ -145,12 +192,30 @@ fun DaemonWebViewScreen() {
     TurboLLMTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             if (!ready) {
+                // QA_BUGS.md BUG-09: Compose Multiplatform's CircularProgressIndicator sometimes
+                // renders as a static curved stroke instead of animating — the animation clock
+                // appears to not fire in the KMP runtime during the long daemon-boot window.
+                // Use a native Android ProgressBar via AndroidView instead; it always animates
+                // because it runs on the platform's own Choreographer, not Compose's animation
+                // clock. Shown until the WebView fires its first paint/daemon is reachable.
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    CircularProgressIndicator()
+                    AndroidView(
+                        factory = { context ->
+                            ProgressBar(context, null, android.R.attr.progressBarStyleLarge)
+                                .apply {
+                                    isIndeterminate = true
+                                    layoutParams = FrameLayout.LayoutParams(
+                                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                                    ).apply { gravity = Gravity.CENTER }
+                                }
+                        },
+                        modifier = Modifier.padding(bottom = 16.dp),
+                    )
                     Text("Starting TurboLLM…", modifier = Modifier.padding(top = 16.dp))
                 }
             } else {
@@ -184,6 +249,12 @@ private fun TurboLLMWebView() {
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
             WebView.setWebContentsDebuggingEnabled(true)
+            // QA_BUGS.md BUG-13: by default the Android System WebView renders as a single
+            // opaque NAF="true" node in the accessibility tree — invisible to TalkBack and
+            // to UI-Automator/Maestro element selectors. Chrome's accessibility bridge for
+            // WebView must be explicitly enabled; setWebContentsDebuggingEnabled alone is
+            // not enough. Flagging the view as important for accessibility helps the
+            // platform expose at least the WebView container itself to TalkBack.
             WebView(context).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
@@ -191,6 +262,10 @@ private fun TurboLLMWebView() {
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
                         view.evaluateJavascript(HEIGHT_FIX_JS, null)
+                        // QA_BUGS.md BUG-03/04/06/07: inject native insets as CSS custom props
+                        // so the web UI's safe-area padding actually applies on Android.
+                        val ins = readWindowInsets(context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                        view.injectSafeAreaInsets(ins.first, ins.second)
                         canGoBack = view.canGoBack()
                     }
                     override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {

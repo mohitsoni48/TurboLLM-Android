@@ -8,6 +8,9 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 private const val TAG = "TurboLLM"
 
@@ -30,6 +33,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         createNotificationChannel()
+        // QA_BUGS.md BUG-14 workaround: copy updated daemon files from /sdcard/turbollm/ into
+        // the app's private data dir. `run-as` on this emulator can read /sdcard but cannot
+        // write into the app's own data directory (SELinux runas_app context blocks it), so
+        // the app itself does the copy at startup when it runs with its full UID.
+        pullDaemonFromSdcard()
 
         if (!startedNodeAlready) {
             startedNodeAlready = true
@@ -76,6 +84,35 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent { DaemonWebViewScreen() }
+    }
+
+    /** Copy every file in /sdcard/ into files/daemon/dist/ if it's newer or missing.
+     *  This is a dev-only helper — production would ship the daemon bundled in the APK.
+     *  We copy from /sdcard/ root because run-as SELinux context blocks /sdcard/turbollm/. */
+    private fun pullDaemonFromSdcard() {
+        val src = File("/sdcard")
+        Log.i(TAG, "pullDaemonFromSdcard: src.exists=${src.exists()}, isDirectory=${src.isDirectory}")
+        if (!src.exists() || !src.isDirectory) {
+            Log.w(TAG, "/sdcard does not exist or is not a directory")
+            return
+        }
+        val dstDir = File(filesDir, "daemon/dist")
+        dstDir.mkdirs()
+        Log.i(TAG, "pullDaemonFromSdcard: dstDir=${dstDir.absolutePath}, exists=${dstDir.exists()}")
+        src.listFiles()?.filter { it.isFile && (it.name == "cli.js" || it.name == "android-preload.cjs" || it.name.startsWith("chunk-") || it.name.startsWith("sql-js-") || it.name.startsWith("distiller-") || it.name.startsWith("resolve-executable-") || it.name.startsWith("run-code-") || it.name.startsWith("shell-command-") || it.name.startsWith("code-")) }?.forEach { file ->
+            val dst = File(dstDir, file.name)
+            Log.i(TAG, "pullDaemonFromSdcard: checking ${file.name}, dst.exists=${dst.exists()}, file.lastModified=${file.lastModified()}, dst.lastModified=${dst.lastModified()}")
+            if (!dst.exists() || file.lastModified() > dst.lastModified()) {
+                try {
+                    FileInputStream(file).use { inp ->
+                        FileOutputStream(dst).use { out -> inp.copyTo(out) }
+                    }
+                    Log.i(TAG, "Pulled daemon file: ${file.name} (${file.length()} bytes)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to pull ${file.name}: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun createNotificationChannel() {
