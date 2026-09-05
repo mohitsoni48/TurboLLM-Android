@@ -3,11 +3,8 @@ package com.turbollm.app
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
-import android.view.Gravity
 import android.view.WindowManager
 import android.view.WindowInsets
-import android.widget.FrameLayout
-import android.widget.ProgressBar
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -15,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -26,9 +24,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.airbnb.lottie.compose.LottieAnimation
+import com.airbnb.lottie.compose.LottieCompositionSpec
+import com.airbnb.lottie.compose.LottieConstants
+import com.airbnb.lottie.compose.animateLottieCompositionAsState
+import com.airbnb.lottie.compose.rememberLottieComposition
 import kotlinx.coroutines.delay
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
@@ -137,13 +141,23 @@ private const val HEIGHT_FIX_JS = """
  *  `var(--tllm-safe-top)` / `var(--tllm-safe-bottom)` resolve to real pixel values.
  *  Android's System WebView resolves `env(safe-area-inset-*)` to 0px on many builds,
  *  so we read the insets natively and patch them in via JS (same pattern as HEIGHT_FIX_JS).
- *  Called after HEIGHT_FIX_JS so the CSS vars are ready before the web layout reads them. */
+ *  Called after HEIGHT_FIX_JS so the CSS vars are ready before the web layout reads them.
+ *
+ *  [topPx]/[bottomPx] are PHYSICAL pixels (that's what WindowInsets reports) — CSS `px`
+ *  inside the WebView is device-independent and gets multiplied by devicePixelRatio at
+ *  render time, so injecting the raw physical value as a literal "96px" over-applies it by
+ *  that same factor (3x on this dpr=3 device: a real ~96px status bar rendered as a ~288px
+ *  gap, visible as an oversized black band above and below the actual content — QA-reported
+ *  live on a real device). Divide by the WebView's own devicePixelRatio inside the injected
+ *  JS itself, not by Android's `density`, so this can't drift from whatever DPR the page is
+ *  actually rendering at. */
 private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
     val js = """
 (function() {
   var s = document.documentElement.style;
-  s.setProperty('--tllm-safe-top', '${topPx}px');
-  s.setProperty('--tllm-safe-bottom', '${bottomPx}px');
+  var dpr = window.devicePixelRatio || 1;
+  s.setProperty('--tllm-safe-top', (${topPx} / dpr) + 'px');
+  s.setProperty('--tllm-safe-bottom', (${bottomPx} / dpr) + 'px');
 })();
 """.trimIndent()
     evaluateJavascript(js, null)
@@ -190,33 +204,57 @@ fun DaemonWebViewScreen() {
     }
 
     TurboLLMTheme {
-        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        // The splash pins to a fixed dark background rather than following
+        // MaterialTheme.colorScheme.background: that follows ANDROID's system day/night
+        // setting, which is a separate, independent preference from the web UI's own
+        // dark/light choice (its own in-app store, read only once the WebView itself has
+        // loaded). Founder-reported: on a phone with system light mode but the app's own
+        // theme set to dark, the splash flashed a light background for a moment before the
+        // real (dark) app content appeared underneath it — jarring, and exactly the kind of
+        // mismatch QA_BUGS.md BUG-08 already fixed once for the even-earlier pre-Compose
+        // window background. The loaded WebView content still follows its own real theme
+        // once `ready` — this only fixes the splash's own brief window.
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = if (!ready) Color(0xFF0E0E10) else MaterialTheme.colorScheme.background,
+        ) {
             if (!ready) {
-                // QA_BUGS.md BUG-09: Compose Multiplatform's CircularProgressIndicator sometimes
-                // renders as a static curved stroke instead of animating — the animation clock
-                // appears to not fire in the KMP runtime during the long daemon-boot window.
-                // Use a native Android ProgressBar via AndroidView instead; it always animates
-                // because it runs on the platform's own Choreographer, not Compose's animation
-                // clock. Shown until the WebView fires its first paint/daemon is reachable.
+                // Real splash screen (BLUEPRINT.md §6 Phase 2, themes.xml's own note — this was
+                // explicitly deferred past Spike A). QA_BUGS.md BUG-09 is why this is Lottie and
+                // not Compose Multiplatform's CircularProgressIndicator: that one sometimes
+                // renders as a static curved stroke instead of animating, because the animation
+                // clock doesn't reliably fire in the KMP runtime during the long daemon-boot
+                // window. Lottie runs on its own Choreographer-driven clock, same reasoning as
+                // the native ProgressBar this replaces, but branded instead of a generic spinner.
+                // The badge asset (raw/splash_bolt.json) embeds the real launcher icon mark —
+                // orange circle + bolt, not just the bare white glyph — as a base64 image layer
+                // (see ic_launcher_background.xml for its provenance), so it reads as branded and
+                // in-color no matter what's behind it. Pop-in entrance, then a continuous gentle
+                // scale pulse plus a slow rotation wobble — still simple keyframes on one image
+                // layer, no vector tracing needed.
+                val composition by rememberLottieComposition(LottieCompositionSpec.RawRes(R.raw.splash_bolt))
+                val progress by animateLottieCompositionAsState(
+                    composition,
+                    iterations = LottieConstants.IterateForever,
+                )
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    AndroidView(
-                        factory = { context ->
-                            ProgressBar(context, null, android.R.attr.progressBarStyleLarge)
-                                .apply {
-                                    isIndeterminate = true
-                                    layoutParams = FrameLayout.LayoutParams(
-                                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                                        FrameLayout.LayoutParams.WRAP_CONTENT,
-                                    ).apply { gravity = Gravity.CENTER }
-                                }
-                        },
-                        modifier = Modifier.padding(bottom = 16.dp),
+                    LottieAnimation(
+                        composition = composition,
+                        progress = { progress },
+                        modifier = Modifier.size(200.dp),
                     )
-                    Text("Starting TurboLLM…", modifier = Modifier.padding(top = 16.dp))
+                    // Explicit light color, not the theme's default text color: the Surface
+                    // above is pinned dark regardless of system day/night (see its own comment),
+                    // so text following the theme's light-mode color would be near-invisible.
+                    Text(
+                        "Starting TurboLLM…",
+                        color = Color(0xFFEDEDEC),
+                        modifier = Modifier.padding(top = 20.dp),
+                    )
                 }
             } else {
                 TurboLLMWebView()
