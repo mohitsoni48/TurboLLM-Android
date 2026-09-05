@@ -2,14 +2,20 @@ package com.turbollm.app
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.view.View
 import android.view.WindowManager
 import android.view.WindowInsets
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -293,6 +299,22 @@ private fun TurboLLMWebView() {
         if (webView != null && webView.canGoBack()) webView.goBack() else activity?.finish()
     }
 
+    // Chat's "attach" control is a plain <input type="file">. A WebView ignores those entirely
+    // unless the app supplies a WebChromeClient that opens a picker and hands the chosen URIs
+    // back, so on Android the button looked simply dead — tapping it did nothing at all, with no
+    // error anywhere. `pendingFiles` bridges the two halves: onShowFileChooser parks the WebView's
+    // callback here and launches the intent the page itself asked for (accept=/multiple= are
+    // already encoded in FileChooserParams), and the activity result resolves it. The callback
+    // MUST be answered exactly once — dropping it leaves the input wedged, unable to open a
+    // picker ever again — so cancelling (a null result) is reported too.
+    val pendingFiles = remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        pendingFiles.value?.onReceiveValue(
+            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data),
+        )
+        pendingFiles.value = null
+    }
+
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
@@ -317,6 +339,27 @@ private fun TurboLLMWebView() {
                         // raw insets.
                         val overlap = readBarOverlap(view, context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
                         view.injectSafeAreaInsets(overlap.first, overlap.second)
+                    }
+                }
+                webChromeClient = object : WebChromeClient() {
+                    override fun onShowFileChooser(
+                        webView: WebView,
+                        filePathCallback: ValueCallback<Array<Uri>>,
+                        fileChooserParams: FileChooserParams,
+                    ): Boolean {
+                        // A picker already waiting means the page asked twice; release the older
+                        // callback rather than stranding it.
+                        pendingFiles.value?.onReceiveValue(null)
+                        pendingFiles.value = filePathCallback
+                        return try {
+                            filePicker.launch(fileChooserParams.createIntent())
+                            true
+                        } catch (e: ActivityNotFoundException) {
+                            // No picker on the device: answering false lets the WebView fall back
+                            // to its own handling instead of leaving the input dead.
+                            pendingFiles.value = null
+                            false
+                        }
                     }
                 }
                 loadUrl(DAEMON_URL)

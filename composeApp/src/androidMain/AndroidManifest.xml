@@ -15,9 +15,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.TurboLLM"
         android:usesCleartextTraffic="true">
+        <!-- adjustResize, not the default: the whole UI is a WebView whose composer is pinned to
+             the bottom of the viewport, so the window has to actually shrink when the soft
+             keyboard opens or the keyboard simply covers the text field. Resizing is enough on
+             its own here because HEIGHT_FIX_JS (DaemonWebView.kt) re-applies window.innerHeight
+             to the shell on every resize event, so the web layout follows the new height. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

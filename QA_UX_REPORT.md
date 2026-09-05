@@ -50,6 +50,10 @@ A note on method: two Radix-style popovers (the Code tab's "Choose a repo" menu,
 ### P2 — should fix before release
 
 #### F-02: Usage → Models chart defaults to a scroll position that hides the only data point, looking empty
+> **RESOLVED 2026-09-05.** DailyBarChart now opens scrolled to the right edge, the same
+> `useLayoutEffect` ActivityHeatmap already used for the same reason. Verified on-device: the same
+> chart (`scrollWidth` 1090 / `clientWidth` 294) now loads at `scrollLeft` 796 with today's bar
+> visible instead of empty axis.
 - **Screen:** Usage tab → Models sub-tab.
 - **Steps:** Usage → Models (with "All" time range selected, the default). Chart's `overflow-x-auto` container loads with `scrollLeft = 0`.
 - **Expected:** A chart for a user with exactly one day of usage should either default to showing that data, or make it obvious more content is scrollable.
@@ -59,6 +63,13 @@ A note on method: two Radix-style popovers (the Code tab's "Choose a repo" menu,
 - **Impact:** A new user with real usage would very plausibly conclude "Usage tracking is broken / shows nothing" the first time they open this tab.
 
 #### F-03: Chat/Code input placeholder & hint text is hard-clipped mid-word/mid-glyph instead of wrapping or ellipsizing
+> **RESOLVED 2026-09-05**, all three instances — and the CSS route this report implies does not
+> work here. `text-overflow: ellipsis` on `::placeholder` has **no effect in Android's WebView**:
+> the rule ships in the bundle and the class is on the element, yet a long placeholder still chops
+> mid-glyph on-device (confirmed by forcing a long value and screenshotting). So the two placeholder
+> cases are shortened in JS instead — the idle string is short enough to fit 360px outright, and a
+> model name over 22 characters is cut with a real "…" — and the Code hint drops its keybind half on
+> mobile, keeping the privacy claim whole (measured: 241px, no truncation).
 - **Screens:** Workspace → Chat (both with no model loaded, and with a model loaded), Workspace → Code.
 - **Steps:** Open Chat with no model loaded; read the message input placeholder. Load a model; read it again. Open the Code tab; read the hint line under the input.
 - **Expected:** Placeholder/hint text that doesn't fit should wrap to a second line, ellipsize, or the container should be wide enough.
@@ -70,6 +81,9 @@ A note on method: two Radix-style popovers (the Code tab's "Choose a repo" menu,
 - **Confidence:** High — same underlying pattern reproduced in 3 separate places, with actual vs. rendered text captured directly from the DOM.
 
 #### F-04: Deleting a Developer API key has no confirmation, unlike deleting a conversation
+> **RESOLVED 2026-09-05.** Revoking now opens an AlertDialog naming the key and saying plainly that
+> any app still using it stops working. Verified on-device end to end with a throwaway key: tapping
+> the trash icon leaves the key in place and shows the confirmation; confirming removes it.
 - **Screen:** Developer tab → API keys.
 - **Steps:** Create a test key ("test-key-1"), then tap its trash-can icon.
 - **Expected:** Given the app already has an explicit, default-on "Confirm before deleting a conversation" setting under Settings → General (screenshot `22-settings.png`), a comparable destructive action — permanently revoking an API key that may be wired into an external tool (Claude Code, opencode, Kilo Code) — would reasonably get the same treatment.
@@ -80,9 +94,33 @@ A note on method: two Radix-style popovers (the Code tab's "Choose a repo" menu,
 
 ---
 
+### Found outside this report (user-reported 2026-09-05, both fixed)
+
+#### The keyboard covered the text field
+The activity declared no `windowSoftInputMode`, so the window never resized and the soft keyboard
+simply sat on top of the bottom-pinned composer. Now `adjustResize`; HEIGHT_FIX_JS already
+re-applies `window.innerHeight` on every resize, so the web layout follows. Verified on-device with
+a model loaded: opening the keyboard takes the viewport 704 → 449 CSS px and the composer's bottom
+lands at 348 — fully visible, with the bottom nav pinned exactly at the new 449 edge.
+
+#### The attach button did nothing
+Chat's attach control is a plain `<input type="file">`, and a WebView **ignores those entirely**
+unless the app supplies a `WebChromeClient.onShowFileChooser` — there was no WebChromeClient at all,
+so the button was inert with no error anywhere. Now wired to an activity-result launcher.
+**Partially verified:** the picker opens, and cancelling releases the callback (a second tap
+re-opens it, so the input isn't left wedged). Actually *selecting* a file could not be driven from
+adb — DocumentsUI's list rows ignore synthetic taps, the same real-touch-only behaviour F-06 notes
+for Radix popovers — so the picked-URI-reaches-the-page step is unverified here and wants one real
+tap to confirm.
+
+---
+
 ### P3 — polish
 
 #### F-05: Settings sub-tab label "Tools & safety" is clipped to "Tools &" at the screen edge with no ellipsis or scroll cue
+> **RESOLVED 2026-09-05.** The strip wraps below md instead of scrolling, so all three pills are
+> simply visible — no hidden-scroll affordance to discover. Verified on-device: "Tools & safety"
+> now sits on a second row, fully within the 360px viewport.
 - **Screen:** Settings (any sub-tab).
 - **Steps:** Open Settings; look at the three sub-tab pills (General / Models & loading / Tools & safety).
 - **Actual:** The third tab's full label is `"Tools & safety"` (confirmed via `button.innerText`) but only `"Tools &"` is visible before the pill is cut off at the right edge of the screen. The tab strip is horizontally scrollable (confirmed — clicking the tab by exact text still works), but there's no fade/peek/arrow indicating more tabs exist off-screen; a user has to guess to scroll.
@@ -93,6 +131,10 @@ A note on method: two Radix-style popovers (the Code tab's "Choose a repo" menu,
 - Not filing as a defect — noted only so a re-tester doesn't waste time: these Radix-style popovers require a real touch/pointer event sequence; programmatic `.click()` silently no-ops. Confirmed both open correctly with an actual `adb input tap` (screenshots `06c-real-tap.png`, and the model "…" menu was reachable the same way). No app-facing issue found here.
 
 #### F-07 (unconfirmed, low confidence): Back-navigation out of the model-config sheet lands on an unrelated tab
+> **RESOLVED 2026-09-05** — and it was real, not a tab-history artifact: the same F-01 listener bug.
+> The overlay's history entry was popped while the sheet stayed open, so the app was one entry
+> further back than the screen suggested. Re-tested the exact reported path (Settings → Models →
+> Load settings → Back): the sheet closes and the app stays on Models.
 - **Screen:** Models → model "sliders" (Load settings) full-screen sheet.
 - **Steps:** From Settings tab, navigated to Models, opened the model config sheet, pressed hardware Back once.
 - **Actual:** Back correctly closed the sheet and kept the app open (unlike F-01), but landed on the **Settings** tab rather than the Models tab that was visible immediately before the sheet opened.
