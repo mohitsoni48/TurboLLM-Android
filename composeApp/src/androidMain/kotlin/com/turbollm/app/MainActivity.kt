@@ -33,11 +33,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         createNotificationChannel()
-        // QA_BUGS.md BUG-14 workaround: copy updated daemon files from /sdcard/turbollm/ into
-        // the app's private data dir. `run-as` on this emulator can read /sdcard but cannot
-        // write into the app's own data directory (SELinux runas_app context blocks it), so
-        // the app itself does the copy at startup when it runs with its full UID.
-        pullDaemonFromSdcard()
+        // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
+        // nothing pushed to the device. Synchronous on purpose: the Node thread started below
+        // runs files/daemon/dist/cli.js, which has to exist by then.
+        extractDaemonFromAssets()
 
         if (!startedNodeAlready) {
             startedNodeAlready = true
@@ -86,33 +85,59 @@ class MainActivity : ComponentActivity() {
         setContent { DaemonWebViewScreen() }
     }
 
-    /** Copy every file in /sdcard/ into files/daemon/dist/ if it's newer or missing.
-     *  This is a dev-only helper — production would ship the daemon bundled in the APK.
-     *  We copy from /sdcard/ root because run-as SELinux context blocks /sdcard/turbollm/. */
-    private fun pullDaemonFromSdcard() {
-        val src = File("/sdcard")
-        Log.i(TAG, "pullDaemonFromSdcard: src.exists=${src.exists()}, isDirectory=${src.isDirectory}")
-        if (!src.exists() || !src.isDirectory) {
-            Log.w(TAG, "/sdcard does not exist or is not a directory")
+    /** Unpack the daemon that ships inside the APK into `files/daemon/`, so a Play Store
+     *  install works with nothing ever pushed to the device.
+     *
+     *  This replaces a `/sdcard` copy that was only ever a dev helper. That approach cannot work
+     *  for a real user twice over: the app declares no storage permission, and nothing would have
+     *  put the files there anyway. It also hid a second, larger problem — the daemon bundle the
+     *  npm build produces leaves `dependencies` external (npm installs them on a desktop), so a
+     *  genuinely fresh install died at boot with `Cannot find package '@hono/node-server'`. The
+     *  payload staged into assets is therefore built by a separate Android pass with its
+     *  dependencies bundled in (turbollm/tsup.android.config.ts + scripts/stage-daemon-assets.mjs).
+     *
+     *  Re-extracted whenever the APK changes, keyed on `lastUpdateTime`: an app update ships a new
+     *  daemon, and a stale copy in filesDir would silently win over it. Everything else in
+     *  filesDir — crucially `~/.turbollm`, the user's models and chat history — lives outside
+     *  `daemon/` and is untouched. */
+    private fun extractDaemonFromAssets() {
+        val daemonDir = File(filesDir, "daemon")
+        val stamp = File(daemonDir, ".apk-stamp")
+        val installedAt = packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
+
+        if (stamp.exists() && stamp.readText() == installedAt) {
+            Log.i(TAG, "daemon assets already extracted for this build")
             return
         }
-        val dstDir = File(filesDir, "daemon/dist")
-        dstDir.mkdirs()
-        Log.i(TAG, "pullDaemonFromSdcard: dstDir=${dstDir.absolutePath}, exists=${dstDir.exists()}")
-        src.listFiles()?.filter { it.isFile && (it.name == "cli.js" || it.name == "android-preload.cjs" || it.name.startsWith("chunk-") || it.name.startsWith("sql-js-") || it.name.startsWith("distiller-") || it.name.startsWith("resolve-executable-") || it.name.startsWith("run-code-") || it.name.startsWith("shell-command-") || it.name.startsWith("code-")) }?.forEach { file ->
-            val dst = File(dstDir, file.name)
-            Log.i(TAG, "pullDaemonFromSdcard: checking ${file.name}, dst.exists=${dst.exists()}, file.lastModified=${file.lastModified()}, dst.lastModified=${dst.lastModified()}")
-            if (!dst.exists() || file.lastModified() > dst.lastModified()) {
-                try {
-                    FileInputStream(file).use { inp ->
-                        FileOutputStream(dst).use { out -> inp.copyTo(out) }
-                    }
-                    Log.i(TAG, "Pulled daemon file: ${file.name} (${file.length()} bytes)")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to pull ${file.name}: ${e.message}")
-                }
-            }
+
+        Log.i(TAG, "extracting daemon assets (apk stamp $installedAt)…")
+        val started = System.currentTimeMillis()
+        try {
+            daemonDir.deleteRecursively()
+            copyAssetDir("daemon", daemonDir)
+            stamp.writeText(installedAt)
+            Log.i(TAG, "daemon assets extracted in ${System.currentTimeMillis() - started} ms")
+        } catch (e: Exception) {
+            // Leave no stamp behind, so the next launch retries rather than booting against a
+            // half-written tree that would fail in a far more confusing way.
+            Log.e(TAG, "Failed to extract daemon assets", e)
+            runCatching { stamp.delete() }
         }
+    }
+
+    /** Recursive asset copy. `AssetManager.list()` returns an empty array for files and a
+     *  non-empty one for directories, which is the only way to tell them apart. */
+    private fun copyAssetDir(assetPath: String, dest: File) {
+        val children = assets.list(assetPath) ?: emptyArray()
+        if (children.isEmpty()) {
+            dest.parentFile?.mkdirs()
+            assets.open(assetPath).use { inp ->
+                FileOutputStream(dest).use { out -> inp.copyTo(out) }
+            }
+            return
+        }
+        dest.mkdirs()
+        for (child in children) copyAssetDir("$assetPath/$child", File(dest, child))
     }
 
     private fun createNotificationChannel() {
