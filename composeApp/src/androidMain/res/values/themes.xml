@@ -4,7 +4,10 @@
         <item name="colorPrimary">@color/turbollm_primary</item>
         <item name="colorPrimaryVariant">@color/turbollm_primary_dark</item>
         <item name="android:windowTranslucentStatus">false</item>
-        <item name="android:statusBarColor">@color/turbollm_primary_dark</item>
+        <item name="android:statusBarColor">@color/turbollm_status_bar</item>
+        <!-- Light status bar background (see colors.xml) needs dark icons/clock/battery to stay
+             readable — values-night's copy of this theme flips it back to false. -->
+        <item name="android:windowLightStatusBar">true</item>
         <!-- QA_BUGS.md BUG-08: was the platform default (off-white/pink), visible as a jarring
              flash before Compose's first frame on a cold start — see colors.xml. -->
         <item name="android:windowBackground">@color/turbollm_window_bg</item>

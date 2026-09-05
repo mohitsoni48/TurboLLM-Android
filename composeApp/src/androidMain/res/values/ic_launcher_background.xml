@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Real TurboLLM brand color, sampled from the actual icon asset
+         (turbollm/src/webdist/brand/turbollm-icon-512.jpeg) — matches the web UI's accent
+         token in its light theme (index.css spec 11 §1). Replaces the Spike A placeholder
+         purple. -->
+    <color name="ic_launcher_background">#FFCA6644</color>
+</resources>

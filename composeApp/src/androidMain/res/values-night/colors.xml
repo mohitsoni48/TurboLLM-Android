@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark-mode counterparts of values/colors.xml — matches the web UI's dark-mode bg token
+         (index.css .dark, spec 11 §1) instead of the light one. -->
+    <color name="turbollm_status_bar">#FF0E0E10</color>
+    <color name="turbollm_window_bg">#FF0E0E10</color>
+</resources>

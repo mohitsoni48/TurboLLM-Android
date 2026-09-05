@@ -2,6 +2,12 @@
 <resources>
     <color name="turbollm_primary">#FF6C3CE1</color>
     <color name="turbollm_primary_dark">#FF4A1FB5</color>
+    <!-- Matches the web UI's bg token in light mode (index.css :root, spec 11 §1) — the
+         status bar used to stay a fixed brand-purple regardless of app content, which read
+         as a jarring color-clash bar sitting above the actual (near-white/near-black) app
+         background. This resource set is light-mode; values-night/colors.xml mirrors it
+         against the dark-mode bg. -->
+    <color name="turbollm_status_bar">#FFFAF9F7</color>
     <!-- Matches TurboLLMTheme's Compose `background` (App.kt) — QA_BUGS.md BUG-08: the raw
          Android window paints this color for the brief window between process start and
          Compose's first frame (most visible on a force-stop cold start), so it must match the
