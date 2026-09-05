@@ -3,6 +3,7 @@ package com.turbollm.app
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
+import android.view.View
 import android.view.WindowManager
 import android.view.WindowInsets
 import android.webkit.WebView
@@ -163,28 +164,36 @@ private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
     evaluateJavascript(js, null)
 }
 
-/** Read the current window insets in a backward-compatible way (API 30+ WindowInsets API,
- *  falling back to deprecated getWindowVisibleDisplayFrame on older APIs). Returns pair of
- *  (topInsetPx, bottomInsetPx) in pixels. */
-private fun readWindowInsets(windowManager: WindowManager): Pair<Int, Int> {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        val r = windowManager.currentWindowMetrics
-        val insets = r.windowInsets
-        val top = insets.getInsets(WindowInsets.Type.statusBars()).top
-        val bottom = if (insets.isVisible(WindowInsets.Type.navigationBars()))
-            insets.getInsets(WindowInsets.Type.navigationBars()).bottom
-        else 0
-        top to bottom
-    } else @Suppress("DEPRECATION")
-    {
-        val r = windowManager.currentWindowMetrics
-        val insets = r.windowInsets
-        val top = insets.getInsets(WindowInsets.Type.statusBars()).top
-        val bottom = if (insets.isVisible(WindowInsets.Type.navigationBars()))
-            insets.getInsets(WindowInsets.Type.navigationBars()).bottom
-        else 0
-        top to bottom
-    }
+/** How much of the status bar / navigation bar actually OVERLAPS [view] on screen, in physical
+ *  pixels — NOT the raw system-bar insets.
+ *
+ *  The distinction is the whole point. This app doesn't opt into edge-to-edge (no
+ *  `setDecorFitsSystemWindows(false)`, and themes.xml sets `windowTranslucentStatus=false`), so
+ *  the system already lays the window out BELOW the status bar and ABOVE the navigation bar —
+ *  the WebView never extends under either one, and needs no CSS padding to clear them. Feeding
+ *  it the raw insets anyway double-counted them: founder-reported live as content clipped at
+ *  the top and the nav bar colliding with the hardware stats row, and confirmed by zeroing the
+ *  CSS variables at runtime, which made every screen lay out correctly.
+ *
+ *  Measuring the real overlap instead of assuming either state keeps this correct both ways: it
+ *  returns 0 in the current (window-inset) configuration, and real values automatically if the
+ *  app ever does go edge-to-edge — which is what BUG-03/04's original padding was written for. */
+private fun readBarOverlap(view: View, windowManager: WindowManager): Pair<Int, Int> {
+    val insets = windowManager.currentWindowMetrics.windowInsets
+    val statusBarBottom = insets.getInsets(WindowInsets.Type.statusBars()).top
+    val navBarHeight = if (insets.isVisible(WindowInsets.Type.navigationBars()))
+        insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+    else 0
+
+    val loc = IntArray(2)
+    view.getLocationOnScreen(loc)
+    val viewTop = loc[1]
+    val viewBottom = viewTop + view.height
+    val screenBottom = windowManager.currentWindowMetrics.bounds.bottom
+
+    val topOverlap = (statusBarBottom - viewTop).coerceAtLeast(0)
+    val bottomOverlap = (viewBottom - (screenBottom - navBarHeight)).coerceAtLeast(0)
+    return topOverlap to bottomOverlap
 }
 
 /** Android's real product UI (BLUEPRINT.md §6): the daemon already serves its own full web UI
@@ -300,10 +309,13 @@ private fun TurboLLMWebView() {
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
                         view.evaluateJavascript(HEIGHT_FIX_JS, null)
-                        // QA_BUGS.md BUG-03/04/06/07: inject native insets as CSS custom props
-                        // so the web UI's safe-area padding actually applies on Android.
-                        val ins = readWindowInsets(context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
-                        view.injectSafeAreaInsets(ins.first, ins.second)
+                        // QA_BUGS.md BUG-03/04/06/07: publish however much of the system bars
+                        // actually overlaps this WebView as CSS custom props, so the web UI can
+                        // pad for them. Zero in this app's current (non-edge-to-edge) window —
+                        // see readBarOverlap for why measuring the overlap beats trusting the
+                        // raw insets.
+                        val overlap = readBarOverlap(view, context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                        view.injectSafeAreaInsets(overlap.first, overlap.second)
                         canGoBack = view.canGoBack()
                     }
                     override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
