@@ -1,6 +1,7 @@
 package com.turbollm.app
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
 import android.os.Build
 import android.view.View
@@ -276,20 +277,20 @@ fun DaemonWebViewScreen() {
 @Composable
 private fun TurboLLMWebView() {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
-    // QA_BUGS.md BUG-02: `webViewRef?.canGoBack() == true` as BackHandler's `enabled` directly
-    // was a snapshot taken once (whenever `webViewRef` itself was last reassigned, i.e. almost
-    // never after the initial composition) — Compose has no way to know `canGoBack()`'s return
-    // value changed later, since it's a plain method call on a View, not an observed State. A
-    // real page navigation happened to still exit correctly in the earlier top/bottom-inset
-    // fixes because those never depended on `canGoBack()` flipping true; the web app's own
-    // `history.pushState()` (use-backable-overlay.ts, opening the conversations drawer) does
-    // depend on it, and needed a real reactive value. `doUpdateVisitedHistory` fires for both
-    // ordinary page loads AND same-document pushState/popstate navigation, so it is the one
-    // WebViewClient hook that can keep this correct for both cases.
-    var canGoBack by remember { mutableStateOf(false) }
+    // Hardware back (QA_BUGS.md BUG-02, then QA_UX_REPORT.md F-01). Two earlier shapes of this
+    // both failed: `enabled = webViewRef?.canGoBack() == true` was a snapshot Compose could never
+    // know had changed, and mirroring `canGoBack()` into Compose state from onPageFinished /
+    // doUpdateVisitedHistory still exited to the launcher after an ordinary in-app route change —
+    // measured with `history.length == 2` and the WebView plainly able to go back. Rather than
+    // keep guessing which WebViewClient hook fires for which navigation kind, ask the WebView
+    // itself at the instant back is pressed: that answer cannot be stale, because nothing caches
+    // it. The handler therefore stays permanently enabled and reproduces the platform default —
+    // finish the Activity — only when there is genuinely nowhere left to go.
+    val activity = LocalContext.current as? Activity
 
-    BackHandler(enabled = canGoBack) {
-        webViewRef?.goBack()
+    BackHandler(enabled = true) {
+        val webView = webViewRef
+        if (webView != null && webView.canGoBack()) webView.goBack() else activity?.finish()
     }
 
     AndroidView(
@@ -316,11 +317,6 @@ private fun TurboLLMWebView() {
                         // raw insets.
                         val overlap = readBarOverlap(view, context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
                         view.injectSafeAreaInsets(overlap.first, overlap.second)
-                        canGoBack = view.canGoBack()
-                    }
-                    override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
-                        super.doUpdateVisitedHistory(view, url, isReload)
-                        canGoBack = view.canGoBack()
                     }
                 }
                 loadUrl(DAEMON_URL)
