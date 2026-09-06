@@ -30,3 +30,9 @@ Thumbs.db
 # Not committed: it is ~14.5 MB of build artefacts that would churn on every daemon change.
 # Run that script before assembling an APK, or the app ships without its daemon.
 composeApp/src/androidMain/assets/daemon/
+
+# Play Store upload signing — the keystore and its credentials must never be committed.
+# Losing OR leaking these after the app is live means Google support is the only recovery.
+/keystore/
+*.jks
+*.keystore

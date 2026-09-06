@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -54,6 +55,54 @@ kotlin {
     }
 }
 
+// ── Build inputs that live outside this repo or outside git ───────────────────────────────
+
+// The turbollm checkout, resolved to an ABSOLUTE path against the app checkout root. A relative
+// value would mean two different directories depending on who resolved it — Exec's workingDir is
+// the root project, while Gradle's file() is relative to this module — which is exactly the
+// mismatch that had an earlier version looking for turbollm inside the Android repo. The default
+// assumes the sibling layout this project is developed in: <parent>/TurboLLM Android and
+// <parent>/turbollm. Override with -Pturbollm.dir=<path> or a line in gradle.properties.
+val turbollmDir: File = rootProject.projectDir
+    .resolve(providers.gradleProperty("turbollm.dir").orNull ?: "../turbollm")
+    .normalize()
+
+// local.properties is gitignored, which is why the signing credentials live there rather than in
+// this file. Read defensively: a fresh clone has only sdk.dir, and debug builds must still work.
+val localProperties = Properties().apply {
+    rootProject.projectDir.resolve("local.properties").takeIf { it.exists() }
+        ?.inputStream()?.use { load(it) }
+}
+fun localProp(name: String): String? = localProperties.getProperty(name)
+
+// Whether the (not yet working) Vulkan engine is packaged. Off by default — see the packaging
+// block below for what "not working" means concretely.
+val shipVulkanEngine: Boolean =
+    providers.gradleProperty("turbollmVulkanEngine").orNull?.toBoolean() ?: false
+
+val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
+    ?.let { rootProject.projectDir.resolve(it).normalize() }
+    ?.takeIf { it.exists() }
+
+// versionName mirrors the npm package exactly (founder direction, 2026-09-06). versionCode has to
+// be a single ascending integer for Play, so it is derived from the same semver rather than being
+// tracked by hand: 1.12.4 -> 11204. Two digits each for minor and patch caps them at 99, which is
+// far past anything this project has used.
+val turbollmVersion: String = turbollmDir.resolve("package.json")
+    .takeIf { it.exists() }
+    ?.let { Regex("""["]version["]\s*:\s*["]([^"]+)["]""").find(it.readText())?.groupValues?.get(1) }
+    ?: throw GradleException(
+        "Cannot read the version from ${turbollmDir.resolve("package.json")}. " +
+            "The Android versionName is derived from the npm package — point at it with " +
+            "-Pturbollm.dir=<path>.",
+    )
+
+val turbollmVersionCode: Int = turbollmVersion
+    .removeSuffix("-SNAPSHOT")
+    .split(".", limit = 3)
+    .map { it.takeWhile(Char::isDigit).ifEmpty { "0" }.toInt() }
+    .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+
 android {
     namespace = "com.turbollm.app"
     compileSdk = 35
@@ -62,8 +111,11 @@ android {
         applicationId = "com.turbollm.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.12.4"
+        // Single source of truth: the npm package's version. The Android app is a shell around
+        // that daemon, so two independently-bumped version lines would only ever disagree — and
+        // "which version is this?" during a beta bug report has to have one answer.
+        versionCode = turbollmVersionCode
+        versionName = turbollmVersion
 
         externalNativeBuild {
             cmake {
@@ -72,7 +124,13 @@ android {
             }
         }
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+            // armeabi-v7a is deliberately NOT here. That ABI ships libnode.so but no llama
+            // engine — jniLibs only carries arm64-v8a and x86_64 builds — so a 32-bit device
+            // would install happily, start the daemon, and then have nothing to register as an
+            // engine (engines/seed.ts): an app that opens and cannot infer. Listing the ABI is
+            // what tells Play it may serve those devices, so the honest fix is to not claim it.
+            // Add it back only alongside an armeabi-v7a engine build.
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
     }
 
@@ -92,10 +150,28 @@ android {
         jniLibs.srcDirs("src/androidMain/cpp/libnode/bin", "src/androidMain/jniLibs")
     }
 
+    // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
+    // scripts/create-release-keystore.mjs. Declared only when configured, so a plain
+    // `assembleDebug` on a fresh clone still works without any keystore present.
+    signingConfigs {
+        if (uploadStoreFile != null) {
+            create("upload") {
+                storeFile = uploadStoreFile
+                storePassword = localProp("TURBOLLM_UPLOAD_STORE_PASSWORD")
+                keyAlias = localProp("TURBOLLM_UPLOAD_KEY_ALIAS")
+                keyPassword = localProp("TURBOLLM_UPLOAD_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Unsigned rather than debug-signed when unconfigured: a debug-signed release
+            // artifact is silently rejected by Play, which is a far more confusing failure than
+            // the explicit one the bundle/assemble check below raises.
+            signingConfig = signingConfigs.findByName("upload")
         }
         debug {
             isMinifyEnabled = false
@@ -112,7 +188,35 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // The Vulkan engine is BUILT and bundleable (BUILDING-ENGINES.md Build B), but is
+            // excluded from shipping builds by default because it does not work yet: on the
+            // devices tested it either refuses to initialise (Adreno 616, "Vulkan 1.2 required")
+            // or initialises and then crashes (Mali-G78) — and there its mere presence took the
+            // working CPU engine down with it. Nothing else needs changing to flip this: the
+            // daemon registers the second engine only if the binary is actually in the APK
+            // (engines/seed.ts), so excluding the file here means users simply see one engine.
+            // Turn it on with -PturbollmVulkanEngine=true once it is proven on real hardware.
+            if (!shipVulkanEngine) {
+                excludes += "**/libllama_server_vk.so"
+            }
         }
+    }
+
+    lint {
+        // lintVitalAnalyzeRelease CRASHES on this project and so blocks every release build:
+        //   Unexpected failure during lint analysis of DaemonWebView.kt
+        //   Found class ...KaCallableMemberCall, but interface was expected
+        //   detector: androidx.lifecycle.lint.NonNullableMutableLiveDataDetector
+        // That is a version skew between the bundled lint checks and the Kotlin analysis API —
+        // a tooling bug, not a finding in this app. Disabling the single issue id does NOT help,
+        // because the detector still loads during the analysis phase, so the only lever that
+        // actually unblocks a release is this one.
+        //
+        // The trade-off is real and worth stating: release builds no longer fail on fatal lint
+        // issues. Lint is NOT gone — `./gradlew :composeApp:lintDebug` still runs the full set —
+        // so run that before a release, and revisit this once AGP and the lifecycle lint
+        // artifacts are back in step.
+        checkReleaseBuilds = false
     }
 
     compileOptions {
@@ -146,15 +250,6 @@ dependencies {
 //
 // The staged directory is gitignored build output; the script rebuilds the daemon bundle each
 // time (~200 ms) so the APK can never ship a daemon older than the source.
-// Resolved to an ABSOLUTE path up front, against the app checkout root. A relative value would
-// mean two different directories depending on who resolves it — Exec's workingDir is the root
-// project, while Gradle's file() is relative to this module — which is precisely the mismatch
-// that made the first version of this look for turbollm inside the Android repo. The default
-// assumes the sibling layout this project is developed in: <parent>/TurboLLM Android and
-// <parent>/turbollm. Override with -Pturbollm.dir=<path> or a line in gradle.properties.
-val turbollmDir: File = rootProject.projectDir
-    .resolve(providers.gradleProperty("turbollm.dir").orNull ?: "../turbollm")
-    .normalize()
 val stagedDaemonAssets = layout.projectDirectory.dir("src/androidMain/assets/daemon")
 
 val stageDaemonAssets by tasks.registering(Exec::class) {
