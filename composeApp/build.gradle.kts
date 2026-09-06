@@ -128,7 +128,15 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.turbollm.android"
+        // The Play Console app entry (created before this repo's applicationId was chosen) was
+        // set up expecting "com.turbollm" exactly — Google rejects any upload whose applicationId
+        // doesn't match ("Your APK or Android App Bundle needs to have the package name
+        // com.turbollm"), and that field is permanent once set on the console side. `namespace`
+        // above (the Kotlin/R-class package, "com.turbollm.app") is intentionally left alone:
+        // AGP has treated applicationId and namespace as independent since 7.0, so this is a
+        // one-line fix, not a source-wide package rename. Every adb command elsewhere in this
+        // repo that names the OLD applicationId (com.turbollm.android) needs updating to match.
+        applicationId = "com.turbollm"
         minSdk = 24
         targetSdk = 35
         // Single source of truth: the npm package's version. The Android app is a shell around

@@ -112,10 +112,10 @@ daemon change.
 Injected state is invisible and will lie to you. The only honest test is a full wipe:
 
 ```bash
-adb uninstall com.turbollm.android
-adb shell "run-as com.turbollm.android ls files"   # must say: unknown package
+adb uninstall com.turbollm
+adb shell "run-as com.turbollm ls files"   # must say: unknown package
 adb install composeApp/build/outputs/apk/debug/composeApp-debug.apk
-adb shell am start -n com.turbollm.android/com.turbollm.app.MainActivity
+adb shell am start -n com.turbollm/com.turbollm.app.MainActivity
 # then, with NOTHING pushed:
 adb logcat -d | grep -E "E nodejs|TurboLLM:"
 adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/api/v1/engines
