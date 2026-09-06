@@ -1,8 +1,5 @@
 package com.turbollm.app
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -22,17 +19,12 @@ private const val TAG = "TurboLLM"
 const val ANDROID_DAEMON_PORT = 7000
 
 class MainActivity : ComponentActivity() {
-    private companion object {
-        const val CHANNEL_ID = "TurboLLM_Daemon"
-    }
-
     private var startedNodeAlready = false
     private val nodeRuntime = NodeRuntimeLauncher()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        createNotificationChannel()
         // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
         // nothing pushed to the device. Synchronous on purpose: the Node thread started below
         // runs files/daemon/dist/cli.js, which has to exist by then.
@@ -138,19 +130,5 @@ class MainActivity : ComponentActivity() {
         }
         dest.mkdirs()
         for (child in children) copyAssetDir("$assetPath/$child", File(dest, child))
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "TurboLLM Daemon",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "TurboLLM local LLM daemon service"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
     }
 }
