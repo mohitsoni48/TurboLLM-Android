@@ -125,7 +125,10 @@ val turbollmVersionCode: Int = turbollmVersion
 
 android {
     namespace = "com.turbollm.app"
-    compileSdk = 35
+    // Play Console rejected the first upload at 35: "must target at least API level 36" — this
+    // is a Google Play policy floor (bumped roughly yearly for new/updated apps), not a choice.
+    // compileSdk raised alongside targetSdk since it can never be lower.
+    compileSdk = 36
 
     defaultConfig {
         // The Play Console app entry (created before this repo's applicationId was chosen) was
@@ -138,7 +141,7 @@ android {
         // repo that names the OLD applicationId (com.turbollm.android) needs updating to match.
         applicationId = "com.turbollm"
         minSdk = 24
-        targetSdk = 35
+        targetSdk = 36
         // Single source of truth: the npm package's version. The Android app is a shell around
         // that daemon, so two independently-bumped version lines would only ever disagree — and
         // "which version is this?" during a beta bug report has to have one answer.
