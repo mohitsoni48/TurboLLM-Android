@@ -106,8 +106,21 @@ val playTrack: String = providers.gradleProperty("turbollmPlayTrack").getOrElse(
 
 // versionName mirrors the npm package exactly (founder direction, 2026-09-06). versionCode has to
 // be a single ascending integer for Play, so it is derived from the same semver rather than being
-// tracked by hand: 1.12.4 -> 11204. Two digits each for minor and patch caps them at 99, which is
-// far past anything this project has used.
+// tracked by hand: 1.12.4 -> base 11204. Two digits each for minor and patch caps them at 99,
+// which is far past anything this project has used.
+//
+// The semver alone is not enough, though: Play rejected a re-upload with "Version code 11204 has
+// already been used" even though 1.12.4 never actually got a successful release — an earlier
+// upload attempt (rejected for an unrelated reason, the applicationId mismatch) had already
+// registered that code with Play, and Play never lets a code be reused, successful release or
+// not. Two upload attempts of the exact same semver in one day, both failing before the first
+// real release, is exactly the case a pure semver->code mapping can't survive. So the base is
+// multiplied by 100 and a small release-attempt counter is added on top — bump
+// `-PturbollmReleaseAttempt=<n>` (or just the default below) each time Play claims the current
+// code is taken, without needing to fake-bump the actual app version to get a new number. Ordering
+// is still preserved across real version bumps: 1.12.4's whole range (1120400-1120499) sits below
+// 1.12.5's (1120500-...), so this only ever needs revisiting if one semver needs a 100th retry.
+val turbollmReleaseAttempt: Int = providers.gradleProperty("turbollmReleaseAttempt").orNull?.toIntOrNull() ?: 1
 val turbollmVersion: String = turbollmDir.resolve("package.json")
     .takeIf { it.exists() }
     ?.let { Regex("""["]version["]\s*:\s*["]([^"]+)["]""").find(it.readText())?.groupValues?.get(1) }
@@ -121,7 +134,7 @@ val turbollmVersionCode: Int = turbollmVersion
     .removeSuffix("-SNAPSHOT")
     .split(".", limit = 3)
     .map { it.takeWhile(Char::isDigit).ifEmpty { "0" }.toInt() }
-    .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+    .let { (major, minor, patch) -> (major * 10000 + minor * 100 + patch) * 100 + turbollmReleaseAttempt }
 
 android {
     namespace = "com.turbollm.app"
