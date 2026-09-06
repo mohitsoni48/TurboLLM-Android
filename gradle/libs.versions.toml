@@ -8,6 +8,11 @@ material = "1.12.0"
 ktor = "3.0.1"
 kotlinxCoroutines = "1.9.0"
 lottieCompose = "6.7.1"
+# 3.13.0, not latest (4.x): Gradle Play Publisher 4.x requires Gradle 9.1+, and this project
+# runs Gradle 8.13 (matching AGP 8.7.3 / Kotlin 2.2.20) — confirmed live, 4.1.1 refuses to even
+# apply here. 3.13.0 is the newest release still on the Gradle 8.x line. Revisit once the whole
+# toolchain moves to Gradle 9.
+gradlePlayPublisher = "3.13.0"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidxActivityCompose" }
@@ -27,3 +32,4 @@ kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref =
 composeMultiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
 composeCompiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlinxSerialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+gradlePlayPublisher = { id = "com.github.triplet.play", version.ref = "gradlePlayPublisher" }

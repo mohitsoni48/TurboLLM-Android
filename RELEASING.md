@@ -89,7 +89,59 @@ release build. Disabling the single issue id does not help: the detector still l
 analysis phase. So `checkReleaseBuilds = false`, and the cost is that release builds no longer
 fail on fatal lint issues — run `lintDebug` yourself until the tooling is back in step.
 
+## Publishing to Play Console (Gradle Play Publisher)
+
+Modeled on a second local project (`AndroidStudioProjects/Scout`) that already publishes to Play
+this way, with one deliberate difference: Scout commits its own `play-account.json` straight into
+git. A live Play publishing credential in git history is a real secret leak regardless of whether
+the repo is private, so this project does not repeat that — the credential path lives in
+`local.properties` (gitignored) exactly like the signing keystore above, never in the build script
+or the repo.
+
+**This is scaffolding, not a working publish pipeline yet.** Two things have to happen before
+`publishReleaseBundle` can succeed, and neither is done:
+
+1. **The very first artifact on a brand-new Play Console app must be uploaded through the Play
+   Console web UI by hand.** This is a Google Play platform rule, not a limitation of this setup —
+   there is no API path around it for an app that has never had anything uploaded before. Every
+   `publish*`/`upload*` task this plugin adds will fail until that one manual upload has happened.
+2. **No service-account credential exists yet.** Create one in Google Cloud Console, grant it
+   "Release manager" (or narrower) access to this app under Play Console → Setup → API access,
+   download the JSON key, and point `local.properties` at it:
+
+   ```properties
+   TURBOLLM_PLAY_SERVICE_ACCOUNT=/path/to/the-key.json
+   ```
+
+Once both are true:
+
+```bash
+./gradlew :composeApp:publishReleaseBundle
+```
+
+uploads the signed AAB to whatever track `playTrack` resolves to — **`internal`** by default
+(Play's internal testing track: up to 100 named testers, no review, live in minutes), deliberately
+not Scout's `production` + `COMPLETED`. Override per-invocation:
+
+```bash
+./gradlew :composeApp:publishReleaseBundle -PturbollmPlayTrack=closed
+```
+
+`./gradlew :composeApp:tasks --group=publishing` lists everything the plugin adds — bootstrapping
+the store listing from Play, promoting a release between tracks, internal-sharing uploads, etc.
+
+### Why Gradle Play Publisher 3.13.0, not the latest 4.x
+
+Confirmed live: version 4.1.1 refuses to even apply — "Gradle Play Publisher's minimum Gradle
+version is at least Gradle 9.1.0 and yours is Gradle 8.13." This project's whole toolchain (AGP
+8.7.3, Kotlin 2.2.20) is still on the Gradle 8.x line; bumping to Gradle 9 to satisfy one plugin
+was judged a much bigger, untested change than this task asked for. 3.13.0 is the newest release
+still on Gradle 8.x. Revisit the version once the toolchain itself moves to Gradle 9.
+
 ## Not yet automated
 
 Cutting the npm release and the Android release are still two separate flows. Wiring the Android
-build (with a freshly compiled engine) into `docs/RELEASE.md` is planned but not done.
+build (with a freshly compiled engine) into `docs/RELEASE.md` is planned but not done. The Play
+publish step above is unverified end-to-end — no service-account credential has been created and
+no manual first upload has happened, so no `publish*`/`upload*` task in this project has ever
+actually been run.

@@ -8,6 +8,7 @@ plugins {
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
     alias(libs.plugins.kotlinxSerialization)
+    alias(libs.plugins.gradlePlayPublisher)
 }
 
 kotlin {
@@ -83,6 +84,25 @@ val shipVulkanEngine: Boolean =
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
     ?.takeIf { it.exists() }
+
+// Google Play publishing (Gradle Play Publisher, github.com/Triple-T/gradle-play-publisher),
+// wired the same way this repo's signingConfig above is: a local, gitignored credential path in
+// local.properties, never a value baked into the build script. `serviceAccountCredentials` is
+// Google Cloud service-account JSON with "Release manager" access on this app in Play Console —
+// create it under Play Console -> Setup -> API access. Deliberately NOT bundled into git the way
+// the reference project (Scout, C:\...\AndroidStudioProjects\Scout) commits its own
+// play-account.json — a live Play publishing credential in git history is a real secret leak
+// regardless of whether the repo is private, and this project isn't repeating that.
+//
+// track defaults to "internal" (Play's internal testing track — up to 100 named testers, no
+// review, publishes in minutes), NOT Scout's "production" + COMPLETED: this is the FIRST ever
+// TurboLLM Android submission, and Play requires that first artifact on ANY track to be uploaded
+// once through the Play Console web UI by hand regardless of what this plugin is configured to
+// do — there is no API path around that for a brand-new app. Override with
+// -PturbollmPlayTrack=<track> once a track is actually being used programmatically.
+val playServiceAccountFile: File? = localProp("TURBOLLM_PLAY_SERVICE_ACCOUNT")
+    ?.let { rootProject.projectDir.resolve(it).normalize() }
+val playTrack: String = providers.gradleProperty("turbollmPlayTrack").getOrElse("internal")
 
 // versionName mirrors the npm package exactly (founder direction, 2026-09-06). versionCode has to
 // be a single ascending integer for Play, so it is derived from the same semver rather than being
@@ -234,6 +254,19 @@ android {
 
 dependencies {
     debugImplementation(compose.uiTooling)
+}
+
+// The play{} block itself is declared unconditionally (same as the reference project) — it just
+// stores config on the plugin's extension, and Gradle Play Publisher's own publish* tasks are
+// only ever added/invoked on request, so this has zero effect on a normal assembleDebug/
+// bundleRelease. Nothing here can make a build task silently turn into a live Play Store publish.
+play {
+    serviceAccountCredentials.set(playServiceAccountFile)
+    track.set(playTrack)
+    // resourcesDir/whatsNew etc. intentionally left at plugin defaults for now — this is the
+    // scaffolding for the FIRST release, not a tuned pipeline yet (see the comment above
+    // playServiceAccountFile for why the very first upload can't go through this plugin anyway).
+    defaultToAppBundles.set(true)
 }
 
 // ── The daemon that ships inside the APK ──────────────────────────────────────────────────

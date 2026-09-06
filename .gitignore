@@ -36,3 +36,10 @@ composeApp/src/androidMain/assets/daemon/
 /keystore/
 *.jks
 *.keystore
+
+# Google Play publishing service-account credential (Gradle Play Publisher). Whatever this is
+# named and wherever it lives, it must never be committed — see composeApp/build.gradle.kts's
+# playServiceAccountFile comment for why (Scout, the reference project, commits its own copy —
+# do not repeat that here).
+*play-account*.json
+*play-publish*.json
