@@ -43,3 +43,8 @@ composeApp/src/androidMain/assets/daemon/
 # do not repeat that here).
 *play-account*.json
 *play-publish*.json
+
+# Built/prepared locally at release time — never committed (large binaries/images)
+composeApp/src/androidMain/jniLibs/
+play-store-assets/**/*.png
+play-store-assets/**/*.svg

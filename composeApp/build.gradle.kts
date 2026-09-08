@@ -120,7 +120,7 @@ val playTrack: String = providers.gradleProperty("turbollmPlayTrack").getOrElse(
 // code is taken, without needing to fake-bump the actual app version to get a new number. Ordering
 // is still preserved across real version bumps: 1.12.4's whole range (1120400-1120499) sits below
 // 1.12.5's (1120500-...), so this only ever needs revisiting if one semver needs a 100th retry.
-val turbollmReleaseAttempt: Int = providers.gradleProperty("turbollmReleaseAttempt").orNull?.toIntOrNull() ?: 2
+val turbollmReleaseAttempt: Int = providers.gradleProperty("turbollmReleaseAttempt").orNull?.toIntOrNull() ?: 3
 val turbollmVersion: String = turbollmDir.resolve("package.json")
     .takeIf { it.exists() }
     ?.let { Regex("""["]version["]\s*:\s*["]([^"]+)["]""").find(it.readText())?.groupValues?.get(1) }
