@@ -48,3 +48,4 @@ composeApp/src/androidMain/assets/daemon/
 composeApp/src/androidMain/jniLibs/
 play-store-assets/**/*.png
 play-store-assets/**/*.svg
+composeApp/src/main/play/

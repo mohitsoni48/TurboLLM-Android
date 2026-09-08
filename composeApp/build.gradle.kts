@@ -95,11 +95,13 @@ val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
 // regardless of whether the repo is private, and this project isn't repeating that.
 //
 // track defaults to "internal" (Play's internal testing track — up to 100 named testers, no
-// review, publishes in minutes), NOT Scout's "production" + COMPLETED: this is the FIRST ever
-// TurboLLM Android submission, and Play requires that first artifact on ANY track to be uploaded
-// once through the Play Console web UI by hand regardless of what this plugin is configured to
-// do — there is no API path around that for a brand-new app. Override with
-// -PturbollmPlayTrack=<track> once a track is actually being used programmatically.
+// review, publishes in minutes), NOT Scout's "production" + COMPLETED. Publish a version code
+// to "internal" first, always — Google requires a strictly ascending version code across ALL
+// tracks combined, so re-running publishReleaseBundle against a second track with the same code
+// fails ("Version code is too low or has already been used"). Use promoteReleaseArtifact
+// (--from-track internal --promote-track alpha|beta) to carry that same release to closed/open
+// testing instead of re-uploading (ADR-412). Override with -PturbollmPlayTrack=<track> only for
+// the initial internal upload itself.
 val playServiceAccountFile: File? = localProp("TURBOLLM_PLAY_SERVICE_ACCOUNT")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
 val playTrack: String = providers.gradleProperty("turbollmPlayTrack").getOrElse("internal")
@@ -287,10 +289,31 @@ dependencies {
 play {
     serviceAccountCredentials.set(playServiceAccountFile)
     track.set(playTrack)
-    // resourcesDir/whatsNew etc. intentionally left at plugin defaults for now — this is the
-    // scaffolding for the FIRST release, not a tuned pipeline yet (see the comment above
-    // playServiceAccountFile for why the very first upload can't go through this plugin anyway).
+    // resourcesDir left at the plugin default (src/<sourceSet>/play) — see stagePlayListing
+    // below, which generates that directory fresh from play-store-assets/ every publish.
     defaultToAppBundles.set(true)
+}
+
+// ── Play Store listing sync (ADR-413) ─────────────────────────────────────────────────────
+//
+// GPP's publishReleaseListing (and publishReleaseApps, which runs it alongside the bundle)
+// reads title/description/graphics from src/main/play/ — generated here from this project's
+// real source of truth (play-store-assets/listing-copy.md + its images) rather than hand-kept
+// in that GPP-specific layout, so the two can never drift. Output is gitignored, same reasoning
+// as the vulkan engine .so: staged fresh locally, never committed.
+val stagePlayListing by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Generates src/main/play/ from play-store-assets/ for Gradle Play Publisher."
+    workingDir = rootProject.projectDir
+    commandLine("node", "scripts/stage-play-listing.mjs")
+    outputs.upToDateWhen { false }
+}
+
+// generateReleasePlayResources is GPP's own task that reads src/<sourceSet>/play — hooking the
+// staging task as its dependency means every publishReleaseListing/publishReleaseApps run picks
+// up whatever play-store-assets/ currently says, with no separate manual step to remember.
+tasks.matching { it.name == "generateReleasePlayResources" }.configureEach {
+    dependsOn(stagePlayListing)
 }
 
 // ── The daemon that ships inside the APK ──────────────────────────────────────────────────
