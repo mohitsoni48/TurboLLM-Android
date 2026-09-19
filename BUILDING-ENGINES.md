@@ -653,8 +653,11 @@ The options were:
 
 Option 2, via the static build. `minSdk` stays at 24 and the CPU engine remains the default;
 the Vulkan binary is a second, separately-selected executable that happens to need API 28.
-**What that leaves untested:** selecting the Vulkan engine on an API 24–27 device, where it
-cannot start. Nobody has tried it, so how the app presents that failure is unknown.
+**On an API 24–27 device the Vulkan engine is never offered.** The daemon registers a bundled engine
+only if probing it (`--version`, then `--help`) succeeds (`engines/seed.ts` → `registry.add` →
+`probe`), and the dynamic linker refuses this binary below API 28, so the probe fails, the
+registration is skipped inside its own try/catch, and the CPU engine stays the only one. This is
+established from the code, **not** from running it on an API 24–27 device.
 
 ### Also open
 

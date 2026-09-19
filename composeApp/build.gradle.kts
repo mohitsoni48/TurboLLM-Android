@@ -249,8 +249,10 @@ android {
             //
             // It does NOT raise minSdk: the app stays at 24 and the CPU engine stays the
             // default. The Vulkan binary itself is linked against API 28 (ggml-vulkan needs
-            // vkGetPhysicalDeviceFeatures2), so on Android 7.0-8.1 it simply cannot start —
-            // untested, since selecting it there has never been tried.
+            // vkGetPhysicalDeviceFeatures2), so on Android 7.0-8.1 it cannot start. It is never
+            // offered there: the daemon registers it only if a `--version` probe of the binary
+            // succeeds (engines/seed.ts -> registry.add -> probe), so those devices keep the CPU
+            // engine alone. That is from reading the code; no API 24-27 device has run it.
             //
             // Nothing else needs changing to flip this: the daemon registers the second engine
             // only if the binary is actually in the APK (engines/seed.ts), so excluding the
