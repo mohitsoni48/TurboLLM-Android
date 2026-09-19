@@ -76,8 +76,9 @@ val localProperties = Properties().apply {
 }
 fun localProp(name: String): String? = localProperties.getProperty(name)
 
-// Whether the (not yet working) Vulkan engine is packaged. Off by default — see the packaging
-// block below for what "not working" means concretely.
+// Whether the Vulkan engine is packaged. Off by default — see the packaging block below for
+// what it costs, and the requireVulkanEngineBinary guard at the end of this file, which stops
+// the flag from quietly producing a CPU-only bundle when the binary was never built.
 val shipVulkanEngine: Boolean =
     providers.gradleProperty("turbollmVulkanEngine").orNull?.toBoolean() ?: false
 
@@ -234,14 +235,26 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // The Vulkan engine is BUILT and bundleable (BUILDING-ENGINES.md Build B), but is
-            // excluded from shipping builds by default because it does not work yet: on the
-            // devices tested it either refuses to initialise (Adreno 616, "Vulkan 1.2 required")
-            // or initialises and then crashes (Mali-G78) — and there its mere presence took the
-            // working CPU engine down with it. Nothing else needs changing to flip this: the
-            // daemon registers the second engine only if the binary is actually in the APK
-            // (engines/seed.ts), so excluding the file here means users simply see one engine.
-            // Turn it on with -PturbollmVulkanEngine=true once it is proven on real hardware.
+            // The Vulkan engine is a SECOND, SELF-CONTAINED STATIC binary — one file, no
+            // sidecar .so's — built by scripts/build-static-engine.sh. That shape is forced:
+            // nativeLibraryDir is flat, so a dynamic Vulkan build would land its own
+            // libggml.so/libllama.so on top of the CPU engine's, and on the Galaxy S21 FE
+            // (Mali-G78) libggml-vulkan.so merely being present there killed the CPU engine
+            // during load_model. Static keeps a Vulkan failure contained to Vulkan.
+            //
+            // Off by default because it is not proven yet, not because it is broken: the
+            // Mali-G78 crashes were fixed in the llama.cpp fork (pin 72d4bcd) and Play build
+            // 1130603 shipped this engine, but no device has confirmed it works and it costs
+            // +38 MB. Turn it on with -PturbollmVulkanEngine=true.
+            //
+            // It does NOT raise minSdk: the app stays at 24 and the CPU engine stays the
+            // default. The Vulkan binary itself is linked against API 28 (ggml-vulkan needs
+            // vkGetPhysicalDeviceFeatures2), so on Android 7.0-8.1 it simply cannot start —
+            // untested, since selecting it there has never been tried.
+            //
+            // Nothing else needs changing to flip this: the daemon registers the second engine
+            // only if the binary is actually in the APK (engines/seed.ts), so excluding the
+            // file here means users simply see one engine.
             if (!shipVulkanEngine) {
                 excludes += "**/libllama_server_vk.so"
             }
@@ -367,5 +380,47 @@ tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") 
         if (!cli.exists()) {
             throw GradleException("Daemon payload missing: ${cli.absolutePath} — the APK would boot to a crash.")
         }
+    }
+}
+
+// ── The Vulkan engine the packaging block expects ─────────────────────────────────────────
+//
+// -PturbollmVulkanEngine=true only drops a packaging *exclude*; it cannot conjure the file.
+// jniLibs is gitignored, so any machine that has not run scripts/build-static-engine.sh has no
+// libllama_server_vk.so at all — and the flag then produces an ordinary CPU-only bundle, with
+// nothing in the log saying so. A release that is silently missing the feature it was built
+// for is worse than one that fails, so fail.
+//
+// Hooked to preBuild, the root of the Android task graph, so it trips before any compiling
+// rather than after — and only when the flag is set, so a default build's task graph is
+// exactly what it was before this existed. GPP's publish* tasks are wired directly as well,
+// so a publish cannot reach Play with an engine-less bundle even if its own dependency on
+// bundleRelease ever changes shape.
+val requireVulkanEngineBinary by tasks.registering {
+    group = "verification"
+    description = "Fails when -PturbollmVulkanEngine=true but the Vulkan engine was never built."
+    val engine = layout.projectDirectory
+        .file("src/androidMain/jniLibs/arm64-v8a/libllama_server_vk.so").asFile
+    doFirst {
+        if (!engine.exists()) {
+            throw GradleException(
+                // ASCII only: this is the one string in here that gets PRINTED, and the
+                // Windows console this project is built on renders a non-ASCII dash as a
+                // replacement character.
+                "-PturbollmVulkanEngine=true, but the Vulkan engine binary is missing:\n" +
+                    "  ${engine.absolutePath}\n" +
+                    "This build would package the CPU engine only and say nothing about it.\n" +
+                    "Build it with scripts/build-static-engine.sh (run under WSL, ~15 min). " +
+                    "That script installs the result into jniLibs itself.\n" +
+                    "See BUILDING-ENGINES.md, section 'Build B'.",
+            )
+        }
+    }
+}
+
+if (shipVulkanEngine) {
+    tasks.named("preBuild") { dependsOn(requireVulkanEngineBinary) }
+    tasks.matching { it.name.startsWith("publish") }.configureEach {
+        dependsOn(requireVulkanEngineBinary)
     }
 }

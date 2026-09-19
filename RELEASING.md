@@ -68,19 +68,36 @@ told Play it could serve 32-bit devices, where the daemon starts and then finds 
 register — an app that opens and cannot infer. Add the ABI back only alongside an armeabi-v7a
 engine build.
 
-### The Vulkan engine is built but not shipped
-`libllama_server_vk.so` is excluded from packaging. It works as a build; it does not work as a
-feature — on the two devices tested it either refuses to initialise (Adreno 616, "Vulkan 1.2
-required") or initialises and then crashes (Mali-G78), and there its mere presence took the
-working CPU engine down with it. `engines/seed.ts` registers the second engine only when the
-binary is in the APK, so excluding the file is the entire switch:
+### The Vulkan engine ships only behind a flag
+`libllama_server_vk.so` — one self-contained static binary, not a second set of `.so`s — is
+excluded from packaging unless you ask for it:
 
 ```bash
-./gradlew :composeApp:bundleRelease -PturbollmVulkanEngine=true   # once it is proven
+./gradlew :composeApp:bundleRelease -PturbollmVulkanEngine=true
 ```
 
-The intent is to ship both engines as a user choice — see BUILDING-ENGINES.md for what has to
-be true first.
+`engines/seed.ts` registers the second engine only when the binary is in the APK, so that
+exclude is the entire switch. Play build 1130603 went out with the flag on, from fork pin
+`72d4bcd` — the commit that fixed the Mali-G78 crashes. It is **not device-verified** as of
+2026-09-19, which is why it is opt-in rather than the default; it also costs +38 MB. It does
+not change `minSdk`, which stays at 24 — only the Vulkan binary itself needs API 28.
+
+**Build the engine first — it is gitignored, so it is not in a fresh clone.** Inside WSL:
+
+```bash
+wsl -d Ubuntu-24.04 -u root -- bash "/mnt/d/llama-turbo/TurboLLM Android/scripts/build-static-engine.sh"
+```
+
+That script verifies the result (AArch64, system-only `NEEDED`, embedded commit == `$SRC`
+HEAD, size, sha256) and installs it into `composeApp/src/androidMain/jniLibs/arm64-v8a/`
+itself. See [BUILDING-ENGINES.md](BUILDING-ENGINES.md#build-b--the-vulkan-gpu-engine).
+
+Skip that and the flag alone does nothing useful — it only removes a packaging exclude, and
+the bundle comes out CPU-only with nothing in the log saying so. `requireVulkanEngineBinary`
+(`composeApp/build.gradle.kts`) exists to stop exactly that: with the flag set and the binary
+missing it fails the build in seconds, before any compiling. It is wired to `preBuild` and to
+Gradle Play Publisher's `publish*` tasks, and only when the flag is set — a default build's
+task graph is untouched.
 
 ### Release lint is off
 `lintVitalAnalyzeRelease` crashes on this project (`KaCallableMemberCall` /

@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# ┌───────────────────────────────────────────────────────────────────────────────────────┐
+# │ DYNAMIC-BACKEND VARIANT — DO NOT SHIP WHAT THIS BUILDS.                               │
+# │ The engine that ships is built by scripts/build-static-engine.sh. Keep this one for    │
+# │ experiments and for the history below; never package its output.                      │
+# └───────────────────────────────────────────────────────────────────────────────────────┘
+#
+# Two independent reasons, both load-bearing:
+#   1. Android's nativeLibraryDir is FLAT. This build emits libggml.so / libllama.so /
+#      libllama-server-impl.so / libmtmd.so under exactly the names the shipping CPU engine
+#      already occupies, so the two engines cannot coexist in an APK at all — the second one
+#      in simply overwrites the first.
+#   2. Measured on the Galaxy S21 FE (Mali-G78): with libggml-vulkan.so merely PRESENT in
+#      that directory, llama-server dies during load_model even at -ngl 0. Moving that one
+#      file aside makes the identical binary load and serve in ~2 s. So this variant does not
+#      just fail to help — it takes the working CPU engine down with it.
+# See BUILDING-ENGINES.md § "Build B" for the full A/B and the device logs.
+#
 # Cross-compile llama.cpp's server for Android arm64 WITH the Vulkan backend, inside WSL.
 #
 # Why WSL and not the Windows host: the cross-compile also builds two *host* tools

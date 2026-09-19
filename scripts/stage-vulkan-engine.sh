@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ┌───────────────────────────────────────────────────────────────────────────────────────┐
+# │ DYNAMIC-BACKEND VARIANT — DO NOT SHIP WHAT THIS STAGES.                               │
+# │ It stages build-vulkan-engine.sh's output, which must never be packaged. The engine    │
+# │ that ships is built AND installed into jniLibs by scripts/build-static-engine.sh.      │
+# └───────────────────────────────────────────────────────────────────────────────────────┘
+#
+# Why not: Android's nativeLibraryDir is FLAT, and this set carries libggml.so / libllama.so
+# / libllama-server-impl.so under the same names the shipping CPU engine uses — they cannot
+# coexist. Worse, measured on the Galaxy S21 FE (Mali-G78), libggml-vulkan.so merely being
+# present in that directory kills the CPU engine during load_model even at -ngl 0. Note this
+# script also renames the executable to libllama_server.so, i.e. straight over the CPU
+# engine. See BUILDING-ENGINES.md § "Build B".
+#
 # Stage the Vulkan build's artifacts into the shape the APK wants:
 #   - strip them (the build leaves debug_info in; unstripped they are ~230 MB)
 #   - rename the executable to libllama_server.so, since Android only extracts and
