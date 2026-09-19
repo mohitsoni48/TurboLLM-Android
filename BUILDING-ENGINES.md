@@ -1,10 +1,11 @@
 # Building the llama.cpp engine binaries for TurboLLM Android
 
 How the `llama-server` binaries that ship inside the APK are produced. Two builds are
-described: **Build A**, the CPU engine that currently ships, and **Build B**, the
-Vulkan (GPU) engine, which now compiles cleanly but **crashed on both devices tested and is
-not shipped** — see [where that leaves it](#where-that-leaves-the-vulkan-engine) before
-spending time on it.
+described: **Build A**, the CPU engine that is in every build, and **Build B**, the
+Vulkan (GPU) engine, which ships **only behind `-PturbollmVulkanEngine=true`** and went out
+that way in Play build 1130603 — one static binary built from fork pin `72d4bcd`, which
+carries the fix for the crashes described below. It is **not device-verified** as of
+2026-09-19: see [where that leaves it](#where-that-leaves-the-vulkan-engine).
 
 Almost every non-obvious step below exists because something failed without it. The
 failure and its exact error string are given each time — those strings are what you will
@@ -26,9 +27,12 @@ paste into a search box in three months.
   cross-compiles and publishes it. Then copy the arm64 archive's contents into
   `composeApp/src/androidMain/jniLibs/arm64-v8a/`, renaming `llama-server` →
   `libllama_server.so`. See [Build A](#build-a--the-cpu-engine-what-currently-ships).
-- **Want the Vulkan engine?** Run the script in
-  [Build B](#build-b--the-vulkan-gpu-engine) inside WSL. Not on Windows — five Windows
-  attempts failed, and the reason is structural, not incidental.
+- **Want the Vulkan engine?** Run `scripts/build-static-engine.sh` inside WSL — not on
+  Windows, where five attempts failed for a structural reason, not an incidental one. It
+  builds, verifies and installs `libllama_server_vk.so` into `jniLibs/arm64-v8a/` itself;
+  then build with `-PturbollmVulkanEngine=true`. Skip the script and that flag fails the
+  build rather than quietly shipping a CPU-only bundle. See
+  [Build B](#build-b--the-vulkan-gpu-engine).
 - **Before you change anything about packaging**, read
   [the platform constraint](#the-platform-constraint-that-shapes-everything). It is the
   reason the binaries are bundled rather than downloaded, the reason they are named
@@ -176,7 +180,12 @@ Consequences, all of them load-bearing:
 | `libggml-cpu.so` | 868 KB | |
 | `libomp.so` | 974 KB | **from the NDK, not from the build output** — see Build A step 3 |
 
-Note there is no `libggml-vulkan.so` in that list. The Vulkan engine has not shipped.
+Plus `libllama_server_vk.so` (38.6 MB) once [Build B](#build-b--the-vulkan-gpu-engine) has been
+run — packaged only with `-PturbollmVulkanEngine=true`. Note there is still no
+`libggml-vulkan.so` anywhere: the Vulkan backend is linked *into* that single file rather than
+shipped beside it, which is the whole point of [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two).
+
+The whole directory is gitignored, so none of these are in a fresh clone.
 
 ---
 
@@ -256,8 +265,14 @@ artifact is instead unpacked into `jniLibs/` and shipped in the APK, for the rea
 
 ## Build B — the Vulkan (GPU) engine
 
-**Status: compiles and links cleanly; runs on-device; but the Vulkan backend crashes on both
-devices tested, and its mere presence breaks CPU-only operation on one of them. Not shipped.**
+**Status (2026-09-19): shipped in Play build 1130603 behind `-PturbollmVulkanEngine=true`, as a
+single STATIC binary built from fork pin `72d4bcd` — the commit that fixed the crashes described
+further down. Nobody has confirmed the fixed engine running on a device, and no speedup has been
+measured anywhere, so "it ships" and "it works" remain two separate claims.**
+
+The device evidence in this section predates both the fix and the static build. It is kept
+because it is the reason the engine has the shape it has — one self-contained file — not because
+it describes the binary that ships today.
 
 ### Why this was attempted
 
@@ -318,10 +333,51 @@ for r in Vulkan-Headers SPIRV-Headers; do
 done
 ```
 
-### The build script
+### The build script — `scripts/build-static-engine.sh`
 
-The working copy is committed at `scripts/build-vulkan-engine.sh`; it is reproduced in
-full here so this document stands alone. The staging/strip step is `scripts/stage-vulkan-engine.sh`.
+This is the one whose output ships. Run it inside WSL; it takes no arguments:
+
+```bash
+wsl -d Ubuntu-24.04 -u root -- bash "/mnt/d/llama-turbo/TurboLLM Android/scripts/build-static-engine.sh"
+
+DRY_RUN=1 bash scripts/build-static-engine.sh   # resolved paths + the commands, builds nothing
+```
+
+It is the WSL original plus the four things that original did not do, each of which exists
+because of something that went wrong:
+
+- **Builds ONE static binary** — `-DBUILD_SHARED_LIBS=OFF` with `-DGGML_BACKEND_DL=OFF`, since
+  the runtime backend loader is a shared-library mechanism and the two are incompatible. Same
+  cmake flags as the dynamic variant otherwise, including the forced `android-28`.
+- **Backs up the previous engine before deleting anything.** The original's first act was
+  `rm -rf "$OUT"`, which is how a verified engine got destroyed once. Both the build output and
+  the copy already in `jniLibs/` are saved to `/root/vk/verified-prev/<UTC timestamp>/` first —
+  outside the repo, because a backup in a gitignored tree is one `git clean -xdf` from gone.
+- **Verifies before installing, and installs nothing if a check fails**: ELF64/AArch64 from
+  `llvm-readelf -h`; every `NEEDED` entry system-only (`libm`/`libdl`/`libvulkan`/`libc`/
+  `liblog`, so a build that silently went dynamic again is caught); the commit string compiled
+  into the binary matching `git -C $SRC rev-parse --short=7 HEAD`, which is what catches a stale
+  binary being re-stamped as a fresh one; then size and sha256 for the record. It also warns if
+  `$SRC` has uncommitted changes, because then the commit it reports describes nothing.
+- **Installs it into `composeApp/src/androidMain/jniLibs/arm64-v8a/libllama_server_vk.so`**, the
+  step that did not exist before — a built engine that never reaches `jniLibs` is not in the
+  APK, and `-PturbollmVulkanEngine=true` only removes a packaging exclude, so the bundle came
+  out CPU-only with nothing anywhere saying so. `requireVulkanEngineBinary` in
+  `composeApp/build.gradle.kts` now fails that build up front instead.
+
+The repo is located from the script's own path, so it works from the WSL checkout or from this
+one mounted at `/mnt/d/...`. `NDK`, `SRC`, `KHRONOS`, `BUILD`, `OUT` and `BACKUP_DIR` are env
+overrides on the `/root/vk` defaults.
+
+### The dynamic variant — built, never shipped
+
+`scripts/build-vulkan-engine.sh` (staged by `scripts/stage-vulkan-engine.sh`) builds the
+`GGML_BACKEND_DL=ON` variant. **Its output must never be packaged** — see
+[gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two) and the S21 FE A/B below: it
+collides with the CPU engine's `.so` names in the flat `nativeLibraryDir`, and on that device
+`libggml-vulkan.so` merely being present killed the CPU engine. Both scripts carry that warning
+in their headers. It is kept, and reproduced in full here, because every measurement in the rest
+of this section came from it:
 
 ```bash
 #!/usr/bin/env bash
@@ -495,13 +551,21 @@ not whatever revision the contributor pinned — he may be on a commit that work
 hardware with a Vulkan 1.2+ driver, which is neither of the devices here. `matrix cores: none` and
 `int dot: 0` also say Mali is a weak target for this backend even when it does run.
 
-**Do not ship the Vulkan build on the strength of the compile alone.** It costs +38 MB and
-`minSdk` 24→28, and on both devices tested it delivers nothing — on one of them it is actively
-worse than the CPU-only engine. Re-test on an Adreno device reporting Vulkan 1.2+ before
-revisiting, and treat "it builds" and "it works" as two separate claims.
+**What changed after the above was written.** The three null-pointer dereferences behind the
+Mali-G78 failure were fixed in this project's llama.cpp fork —
+`mohitsoni48/TurboLLM-Android-Llama`, pin **`72d4bcd`**, *"vulkan: fix three null-pointer crashes
+on pre-1.2 devices reporting VK 1.2 features"* — and the engine was rebuilt as a single static
+binary, which also removes the second failure mode above: there is no `libggml-vulkan.so` in
+`nativeLibraryDir` any more to take the CPU engine down with it. That binary is what Play build
+1130603 shipped, behind `-PturbollmVulkanEngine=true`.
 
-**Still NOT verified:** any speedup from Vulkan on any device, and whether the engine behaves when
-bundled in the APK rather than run from `/data/local/tmp`.
+**Still NOT verified, as of 2026-09-19:** that the fixed engine runs on the S21 FE or any other
+handset; any speedup from Vulkan on any device; and how it behaves launched from
+`nativeLibraryDir` rather than `/data/local/tmp`. It still costs +38 MB, and it is still opt-in
+for exactly that reason. Note it did **not** raise `minSdk`, which is still 24 — the Vulkan
+binary alone is linked against API 28, so on Android 7.0–8.1 it cannot start while the CPU
+engine is unaffected (also untested). The next step is a device run, not another build:
+install the 1130603 bundle, switch to the Vulkan engine, and watch whether a model loads.
 
 ---
 
@@ -517,6 +581,13 @@ This is not merely convenient, it is close to forced. `nativeLibraryDir` is **fl
 ([constraint 5](#the-platform-constraint-that-shapes-everything)), so two dynamic
 llama.cpp builds in the same APK would collide on `libggml.so` and `libllama.so`. Shipping
 genuinely separate engines would require static builds (`-DBUILD_SHARED_LIBS=OFF`).
+
+That is exactly what `scripts/build-static-engine.sh` does, and why the Vulkan engine that
+ships is one 38.6 MB file with no sidecars — and why `GGML_BACKEND_DL` has to be **OFF** there:
+the runtime backend loader is a shared-library mechanism, so it cannot survive
+`BUILD_SHARED_LIBS=OFF`. Static also bounds the damage. A dynamic Vulkan build that fails takes
+the CPU engine with it; a static one that fails is one broken engine the user can switch away
+from.
 
 ### Gotcha 2 — the NDK sysroot has no `vulkan.hpp`
 
@@ -569,23 +640,32 @@ this device.**
 
 ## Open decisions
 
-### minSdk vs. the Vulkan engine
+### minSdk vs. the Vulkan engine — RESOLVED (option 2)
 
-The app is `minSdk = 24` (`composeApp/build.gradle.kts`). The Vulkan engine requires
-API 28. Unresolved. Three options:
+The app is `minSdk = 24` (`composeApp/build.gradle.kts`) and the Vulkan engine requires API 28.
+The options were:
 
 | Option | Cost |
 |---|---|
 | Raise `minSdk` to 28 | Drops Android 7.0–8.1 devices entirely |
-| Ship both engines and select at runtime | Requires static builds (`-DBUILD_SHARED_LIBS=OFF`) to dodge the flat-directory collision in [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two); roughly doubles APK native payload |
+| **Ship both engines and select at runtime** ← chosen | Requires static builds (`-DBUILD_SHARED_LIBS=OFF`) to dodge the flat-directory collision in [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two); +38 MB of native payload |
 | Vulkan-only, keep `minSdk = 24` | **Not acceptable** — the engine would simply fail to start on API 24–27 |
+
+Option 2, via the static build. `minSdk` stays at 24 and the CPU engine remains the default;
+the Vulkan binary is a second, separately-selected executable that happens to need API 28.
+**On an API 24–27 device the Vulkan engine is never offered.** The daemon registers a bundled engine
+only if probing it (`--version`, then `--help`) succeeds (`engines/seed.ts` → `registry.add` →
+`probe`), and the dynamic linker refuses this binary below API 28, so the probe fails, the
+registration is skipped inside its own try/catch, and the CPU engine stays the only one. This is
+established from the code, **not** from running it on an API 24–27 device.
 
 ### Also open
 
-- The Vulkan build has never been executed on a device. Nothing about its runtime behavior
-  or performance is known.
-- The Vulkan artifacts are unstripped and much larger than the CPU set. APK-size impact is
-  unmeasured.
-- The Vulkan build has only ever been produced by hand in WSL. There is no CI workflow for
-  it, and the script is not yet committed (see the recommendation in
-  [Build B](#the-build-script)).
+- No device has run the fixed Vulkan engine. Runtime behaviour and performance are still
+  unknown — see [where that leaves it](#where-that-leaves-the-vulkan-engine).
+- No CI workflow builds the Vulkan engine. `scripts/build-static-engine.sh` is committed and
+  reproducible, but it is still run by hand in WSL, unlike Build A's
+  [`android-llama-build.yml`](../.github/workflows/android-llama-build.yml).
+- Bumping the fork pin is manual too: nothing notices when
+  `mohitsoni48/TurboLLM-Android-Llama` moves ahead of the binary sitting in `jniLibs/`. The
+  build script's commit check catches a stale binary only on the next rebuild.
