@@ -53,6 +53,13 @@ class StorageAccess(private val activity: Activity) {
 
     fun onPause() {
         handler.removeCallbacks(tick)
+        // An activity going away must not leak its window. A dialog still unanswered is asked again on return;
+        // one already answered (Allow opened Settings, or Not now) stays answered.
+        if (dialog?.isShowing == true) {
+            dialog?.dismiss()
+            askedFor = null
+        }
+        dialog = null
     }
 
     private fun check() {
@@ -89,10 +96,14 @@ class StorageAccess(private val activity: Activity) {
 
     /** Shared storage, as opposed to this app's own private directories, which need no permission. */
     private fun isSharedStorage(path: String): Boolean {
-        val external = Environment.getExternalStorageDirectory().absolutePath
-        val own = activity.getExternalFilesDir(null)?.parentFile?.absolutePath
-        if (own != null && path.startsWith(own)) return false
-        return path.startsWith("/sdcard") || path.startsWith("/storage/") || path.startsWith("/mnt/") || path.startsWith(external)
+        // Canonical forms: /sdcard is a link to /storage/emulated/0 (via /storage/self/primary), so the app's own
+        // /sdcard/Android/data/<pkg> must be recognised whichever spelling the folder was added with.
+        val canonical = runCatching { File(path).canonicalPath }.getOrDefault(path)
+        val own = activity.getExternalFilesDir(null)?.parentFile?.let { runCatching { it.canonicalPath }.getOrNull() }
+        if (own != null && (canonical == own || canonical.startsWith("$own/"))) return false
+        val external = runCatching { Environment.getExternalStorageDirectory().canonicalPath }.getOrDefault("/storage/emulated/0")
+        return canonical.startsWith("/storage/") || canonical.startsWith("/mnt/") || canonical.startsWith(external) ||
+            path.startsWith("/sdcard")
     }
 
     private fun hasAccess(): Boolean =

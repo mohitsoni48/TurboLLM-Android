@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -303,7 +304,14 @@ std::string FallbackCacheDir(const std::string& model_path) {
   auto slash = model_path.find_last_of('/');
   std::string dir = slash == std::string::npos ? "." : model_path.substr(0, slash == 0 ? 1 : slash);
   if (access(dir.c_str(), W_OK) == 0) return "";
-  const std::string target = fallback;
+  // One subdirectory per model: the runtime names cache files after the model's file name, and Hugging Face folders
+  // often all call it model.litertlm, so a shared directory would mix different models' caches. FNV-1a of the
+  // path, stable across runs.
+  uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : model_path) h = (h ^ c) * 1099511628211ULL;
+  char sub[17];
+  std::snprintf(sub, sizeof sub, "%016llx", static_cast<unsigned long long>(h));
+  const std::string target = std::string(fallback) + "/" + sub;
   for (auto pos = target.find('/', 1);; pos = target.find('/', pos + 1)) {  // mkdir -p
     mkdir(target.substr(0, pos).c_str(), 0700);
     if (pos == std::string::npos) break;
@@ -624,6 +632,38 @@ struct StreamQueue {
   std::mutex mu;
   std::condition_variable cv;
   std::deque<StreamItem> items;
+};
+
+// Keeps a generation's StreamQueue alive until the runtime has delivered its final chunk. The runtime calls
+// StreamCallback from its own thread with a pointer to the queue, so a request that leaves early (an exception while
+// tokens are still arriving: a malformed tool call, a JSON error) must not free the queue under it. On such an exit
+// this cancels the generation and waits for the final chunk; if none comes in 30 s the queue is deliberately leaked,
+// a few bytes, rather than freed while it may still be written to.
+class StreamGuard {
+ public:
+  StreamGuard(std::unique_ptr<StreamQueue>& q, LiteRtLmConversation* conv) : q_(q), conv_(conv) {}
+  void Finished() { finished_ = true; }
+  ~StreamGuard() {
+    if (finished_ || !q_) return;
+    L.litert_lm_conversation_cancel_process(conv_);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::unique_lock<std::mutex> lock(q_->mu);
+    for (;;) {
+      for (const auto& item : q_->items) {
+        if (item.final) return;
+      }
+      q_->items.clear();
+      if (q_->cv.wait_until(lock, deadline) == std::cv_status::timeout) break;
+    }
+    lock.unlock();
+    Log("generation did not stop after cancel; leaking its stream queue");
+    q_.release();
+  }
+
+ private:
+  std::unique_ptr<StreamQueue>& q_;
+  LiteRtLmConversation* conv_;
+  bool finished_ = false;
 };
 
 void StreamCallback(void* data, const LiteRtLmStreamChunk* chunk) {
@@ -959,12 +999,16 @@ void HandleChatCompletions(int fd, const Request& req) {
       return p;
     };
 
-    StreamQueue q;
+    auto q_owner = std::make_unique<StreamQueue>();
+    StreamQueue& q = *q_owner;
     std::string msg_str = prompt.dump();
     L.litert_lm_clear_last_error();
     int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), "{}", oa, StreamCallback, &q);
     L.litert_lm_conversation_optional_args_delete(oa);
+    // Declared after the queue and the conversation, so it runs before either is destroyed.
+    StreamGuard guard(q_owner, conv.get());
     if (rc != 0) {
+      guard.Finished(); // nothing was started
       std::string why = LastRuntimeError();
       throw HttpError(500, "RuntimeError: litert_lm_conversation_send_message_stream failed" + (why.empty() ? "" : ": " + why));
     }
@@ -984,22 +1028,37 @@ void HandleChatCompletions(int fd, const Request& req) {
     bool client_gone = false;
     bool cancelled = false;
 
-    // Drain the callback queue until the final chunk. While waiting, watch the client: a closed
-    // connection cancels the generation (the Python server only noticed on its next write).
+    // Drain the callback queue until the final chunk. Meanwhile watch the client, at most every 200 ms: a closed
+    // connection cancels the generation (the Python server only noticed on its next write). Checked between chunks
+    // too, not only while idle, because during decode chunks arrive faster than that and a non-streaming client has
+    // no write that would fail.
+    auto next_peer_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto watch_peer = [&] {
+      auto now = std::chrono::steady_clock::now();
+      if (cancelled || now < next_peer_check) return;
+      next_peer_check = now + std::chrono::milliseconds(200);
+      if (PeerGone(fd)) {
+        client_gone = cancelled = true;
+        L.litert_lm_conversation_cancel_process(conv.get());
+      }
+    };
     for (bool done = false; !done;) {
       StreamItem item;
       {
         std::unique_lock<std::mutex> lock(q.mu);
         while (q.items.empty()) {
           q.cv.wait_for(lock, std::chrono::milliseconds(200));
-          if (q.items.empty() && !cancelled && PeerGone(fd)) {
-            client_gone = cancelled = true;
-            L.litert_lm_conversation_cancel_process(conv.get());
+          if (q.items.empty()) {
+            lock.unlock(); // cancel_process may call back into the queue
+            watch_peer();
+            lock.lock();
           }
         }
         item = std::move(q.items.front());
         q.items.pop_front();
       }
+      if (item.final) guard.Finished();
+      watch_peer();
       if (item.is_error) {
         if (item.text.find("CANCELLED") != std::string::npos) {
           // a cancelled turn ends quietly, as in the Python client
@@ -1243,10 +1302,16 @@ int main(int argc, char** argv) {
       if (g_stop) break;
       if (errno == EINTR) continue;
       Log(std::string("accept: ") + std::strerror(errno));
+      // EMFILE/ENFILE persist until connections close; retrying at once would spin a core.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // A client that connects and never sends a request must not hold a thread forever. Applies to reads only;
+    // a long generation's writes and the disconnect poll are unaffected.
+    timeval rcv_timeout{60, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
     std::thread(HandleConnection, fd).detach();
   }
   Log("Shutting down server...");
@@ -1256,5 +1321,8 @@ int main(int argc, char** argv) {
     g_engine_mu.unlock();
   }
   ::close(g_listen_fd);
-  return 0;
+  // _exit, not return: connection threads are detached and may still be inside the runtime, which static destructors
+  // running under them would crash.
+  std::fflush(nullptr);
+  _exit(0);
 }

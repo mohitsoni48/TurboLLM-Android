@@ -16,6 +16,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -111,6 +112,9 @@ class EngineService : Service() {
     private fun pollActivity() {
         while (running) {
             val nowBusy = queryBusy()
+            // The query can take seconds; if the service was destroyed meanwhile, touch neither the lock nor the
+            // notification, or a released lock is re-taken and a removed notification posted again.
+            if (!running) return
             if (nowBusy != busy) {
                 busy = nowBusy
                 if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
@@ -135,8 +139,10 @@ class EngineService : Service() {
             if (conn.responseCode != 200) {
                 false
             } else {
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                body.contains("\"engineGenerating\":true") || !body.contains("\"items\":[]")
+                // Parsed, not string-matched: any shape this does not recognise reads as idle, so a format change
+                // can never pin the wake lock on with the screen off.
+                val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                json.optBoolean("engineGenerating", false) || (json.optJSONArray("items")?.length() ?: 0) > 0
             }
         } finally {
             conn.disconnect()
@@ -172,7 +178,7 @@ class EngineService : Service() {
             else -> "Running in the background"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_engine)
             .setContentTitle("TurboLLM")
             .setContentText(text)
             .setOngoing(true)

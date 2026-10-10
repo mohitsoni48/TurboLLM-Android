@@ -499,8 +499,10 @@ if (shipLitertLmEngine) {
         dependsOn(stageLitertLmEngine)
     }
     // Same reasoning as the daemon payload check: an APK that silently lacks the engine it was
-    // built for is worse than a failed build.
-    tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }.configureEach {
+    // built for is worse than a failed build. Only the APK/AAB tasks themselves: AGP also has
+    // bundle*ClassesToJar and assemble*UnitTest, which run without merging native libs at all.
+    val packagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
+    tasks.matching { packagingTask.matches(it.name) }.configureEach {
         doLast {
             for (abi in shippedAbis) {
                 for (file in listOf("liblitert-lm.so", "liblitertlm_server.so")) {
