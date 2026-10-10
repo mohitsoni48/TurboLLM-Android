@@ -27,6 +27,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        recordCrashes()
 
         // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
         // nothing pushed to the device. Synchronous on purpose: the Node thread started below
@@ -117,6 +118,27 @@ class MainActivity : ComponentActivity() {
             // half-written tree that would fail in a far more confusing way.
             Log.e(TAG, "Failed to extract daemon assets", e)
             runCatching { stamp.delete() }
+        }
+    }
+
+    /** Keep the last uncaught exception's stack trace in `files/last-crash.txt`, then crash exactly as before.
+     *  Logging is off on many user ROMs and Android's own crash stores often keep no trace, so without this a crash
+     *  on a tester's phone leaves nothing to diagnose. Process-wide and installed once. */
+    private fun recordCrashes() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        if (previous is CrashRecorder) return
+        Thread.setDefaultUncaughtExceptionHandler(CrashRecorder(File(filesDir, "last-crash.txt"), previous))
+    }
+
+    private class CrashRecorder(
+        private val file: File,
+        private val next: Thread.UncaughtExceptionHandler?,
+    ) : Thread.UncaughtExceptionHandler {
+        override fun uncaughtException(thread: Thread, error: Throwable) {
+            runCatching {
+                file.writeText("${java.util.Date()} thread=${thread.name}\n${Log.getStackTraceString(error)}")
+            }
+            next?.uncaughtException(thread, error)
         }
     }
 
