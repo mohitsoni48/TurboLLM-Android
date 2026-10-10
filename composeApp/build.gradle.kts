@@ -185,6 +185,9 @@ android {
             cmake {
                 cppFlags += ""
                 arguments += "-DANDROID_STL=c++_shared"
+                // 16 KB-aligned LOAD segments (the default only from NDK r28). Without it Android 16 flags
+                // libnative-lib.so on every launch of a debug build and 16 KB-page devices cannot load it.
+                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
         }
         ndk {
@@ -513,3 +516,16 @@ if (shipLitertLmEngine) {
         }
     }
 }
+
+// ── The embedded Node runtime ─────────────────────────────────────────────────────────────
+//
+// cpp/libnode is gitignored build input that native-lib's CMake links and jniLibs packages, so it
+// is fetched — pinned by sha256, 16 KB-aligned — rather than expected on disk. preBuild runs before
+// any CMake configure step. A no-op when the pinned copy is already there.
+val fetchLibnode by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Fetches nodejs-mobile's libnode.so + headers into src/androidMain/cpp/libnode."
+    workingDir = rootProject.projectDir
+    commandLine("node", "scripts/fetch-libnode.mjs")
+}
+tasks.named("preBuild") { dependsOn(fetchLibnode) }
