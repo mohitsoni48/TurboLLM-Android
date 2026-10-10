@@ -82,6 +82,20 @@ fun localProp(name: String): String? = localProperties.getProperty(name)
 val shipVulkanEngine: Boolean =
     providers.gradleProperty("turbollmVulkanEngine").orNull?.toBoolean() ?: false
 
+// Whether the LiteRT-LM engine is packaged. On by default: it is the engine Termux users get their
+// best speed from, and the app cannot provision it any other way (no Python, no executing files it
+// downloads). Costs ~14 MB compressed per ABI. -PturbollmLitertLmEngine=false builds without it;
+// the daemon then simply registers no LiteRT-LM engine (engines/seed.ts only registers what exists).
+val shipLitertLmEngine: Boolean =
+    providers.gradleProperty("turbollmLitertLmEngine").orNull?.toBoolean() ?: true
+
+// The ABIs the APK carries. Shared by abiFilters and the LiteRT-LM staging task so the two can
+// never disagree about which engine builds exist.
+val shippedAbis = listOf("arm64-v8a", "x86_64")
+
+// Where stageLitertLmEngine puts <abi>/{liblitert-lm.so, liblitertlm_server.so}.
+val litertLmJniLibs = layout.buildDirectory.dir("generated/litert-lm/jniLibs")
+
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
     ?.takeIf { it.exists() }
@@ -177,7 +191,7 @@ android {
             // engine (engines/seed.ts): an app that opens and cannot infer. Listing the ABI is
             // what tells Play it may serve those devices, so the honest fix is to not claim it.
             // Add it back only alongside an armeabi-v7a engine build.
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += shippedAbis
         }
     }
 
@@ -195,6 +209,9 @@ android {
         // (BLUEPRINT.md §7 Spike D). Files here land in the installed APK's own
         // nativeLibraryDir, which Android explicitly exempts from that restriction.
         jniLibs.srcDirs("src/androidMain/cpp/libnode/bin", "src/androidMain/jniLibs")
+        // The LiteRT-LM engine, staged into the build dir by stageLitertLmEngine (below) rather
+        // than src/: it is fetched and compiled on every machine, never committed.
+        if (shipLitertLmEngine) jniLibs.srcDir(litertLmJniLibs)
     }
 
     // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
@@ -424,5 +441,63 @@ if (shipVulkanEngine) {
     tasks.named("preBuild") { dependsOn(requireVulkanEngineBinary) }
     tasks.matching { it.name.startsWith("publish") }.configureEach {
         dependsOn(requireVulkanEngineBinary)
+    }
+}
+
+// ── The LiteRT-LM engine ──────────────────────────────────────────────────────────────────
+//
+// Two files per ABI: liblitert-lm.so — Google's runtime, the same file the litert-lm-api wheel
+// installs under Termux, fetched from PyPI against a pinned sha256 — and liblitertlm_server.so,
+// the native OpenAI-compatible server in engines/litert-lm-server that replaces the Python
+// `litert-lm serve` the app cannot run. scripts/stage-litert-lm-engine.mjs does both, then checks
+// each file's ELF architecture and 16 KB alignment. See BUILDING-ENGINES.md, "The LiteRT-LM engine".
+//
+// The NDK is the one AGP itself resolves for native-lib, and CMake is the SDK copy that
+// externalNativeBuild above pins, so this needs nothing a plain `assembleDebug` didn't already.
+// Hooked to merge*JniLibFolders — what consumes jniLibs — for the same reason stageDaemonAssets
+// is hooked to merge*Assets rather than preBuild. The script caches the wheel and CMake builds
+// incrementally, so a repeat run costs about a second.
+val stageLitertLmEngine by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Fetches liblitert-lm.so and builds liblitertlm_server.so into the APK's jniLibs."
+    workingDir = rootProject.projectDir
+    val ndkDir = androidComponents.sdkComponents.ndkDirectory
+    val sdkDir = androidComponents.sdkComponents.sdkDirectory
+    val outDir = litertLmJniLibs
+    outputs.upToDateWhen { false }
+    doFirst {
+        val exe = if (System.getProperty("os.name").lowercase().contains("windows")) ".exe" else ""
+        val cmakeBin = sdkDir.get().asFile.resolve("cmake/3.22.1/bin")
+        commandLine(
+            "node", "scripts/stage-litert-lm-engine.mjs",
+            "--ndk", ndkDir.get().asFile.absolutePath,
+            "--out", outDir.get().asFile.absolutePath,
+            "--abis", shippedAbis.joinToString(","),
+            "--cmake", cmakeBin.resolve("cmake$exe").absolutePath,
+            "--ninja", cmakeBin.resolve("ninja$exe").absolutePath,
+        )
+    }
+}
+
+if (shipLitertLmEngine) {
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+        dependsOn(stageLitertLmEngine)
+    }
+    // Same reasoning as the daemon payload check: an APK that silently lacks the engine it was
+    // built for is worse than a failed build.
+    tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }.configureEach {
+        doLast {
+            for (abi in shippedAbis) {
+                for (file in listOf("liblitert-lm.so", "liblitertlm_server.so")) {
+                    val f = litertLmJniLibs.get().file("$abi/$file").asFile
+                    if (!f.exists()) {
+                        throw GradleException(
+                            "LiteRT-LM engine missing: ${f.absolutePath}\n" +
+                                "Build with -PturbollmLitertLmEngine=false to leave it out on purpose.",
+                        )
+                    }
+                }
+            }
+        }
     }
 }

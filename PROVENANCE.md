@@ -32,3 +32,23 @@ legitimate, but it isn't proof of exact origin. **Before this goes further than 
 spike**, replace this with a real, scripted, checksummed fetch from
 `nodejs-mobile`'s official GitHub releases (`github.com/nodejs-mobile/nodejs-mobile`) so
 the dependency is reproducible and auditable rather than "already present, trust it."
+
+---
+
+# LiteRT-LM runtime (`liblitert-lm.so`)
+
+Not vendored: `scripts/stage-litert-lm-engine.mjs` fetches it at build time from Google's
+`litert-lm-api` wheel on PyPI and refuses any file whose SHA-256 differs from the pinned value.
+
+| ABI | Wheel | SHA-256 (wheel) |
+|---|---|---|
+| arm64-v8a | `litert_lm_api-0.18.0-py3-none-android_23_arm64_v8a.whl` | `a045af401dc199c35b1f44c29e8899cecbf2712a8194c9e35489ab5e2a95d47d` |
+| x86_64 | `litert_lm_api-0.18.0-py3-none-android_23_x86_64.whl` | `db5268c5eb8e60f5a7cdecea310f8084426ae174fdbe8efe2991c47f54d74889` |
+
+The extracted arm64 `liblitert-lm.so` (39.9 MB, sha256 `3d591b09…dfd9`) is byte-identical to the
+one the Termux path installs. License: Apache-2.0 (google-ai-edge/LiteRT-LM).
+
+Vendored in `engines/litert-lm-server/third_party/`: LiteRT-LM's C API headers from tag
+`v0.18.0` (`c/engine.h`, `c/conversation.h`, `c/error_reporter.h`, `c/api_export.h`;
+Apache-2.0, LICENSE alongside) and nlohmann/json 3.11.3 (`json.hpp`, sha256 `9bea4c80…3ea6`; MIT,
+LICENSE.MIT alongside).
