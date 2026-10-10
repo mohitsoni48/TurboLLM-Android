@@ -69,6 +69,8 @@ class MainActivity : ComponentActivity() {
                             // instead of depending on a manual one-time registration that goes
                             // stale the next time the app is reinstalled.
                             "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
+                            // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
+                            "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
                         ) + gpuEnv(),
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),

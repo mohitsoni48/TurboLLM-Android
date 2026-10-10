@@ -1,6 +1,8 @@
 #include <jni.h>
 #include <string>
 #include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 #include "node.h"
 
 // Sets a process environment variable before Node starts — needed because an Android app
@@ -57,6 +59,18 @@ Java_com_turbollm_app_NodeRuntimeLauncher_startNodeWithArguments(
         argv[i] = current_args_position;
         // Increment to the next argument's expected position.
         current_args_position += strlen(current_args_position) + 1;
+    }
+
+    // Send Node's stdout/stderr to a file when asked (TURBOLLM_DAEMON_LOG, set by MainActivity). In an app process
+    // both go nowhere, so the daemon's own messages — engine registration failures, uncaught exceptions — were
+    // invisible on a real phone. Truncated per launch.
+    if (const char *log_path = getenv("TURBOLLM_DAEMON_LOG")) {
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
     }
 
     // Start node, with argc and argv.
