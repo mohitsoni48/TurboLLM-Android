@@ -159,6 +159,9 @@ android {
     // is a Google Play policy floor (bumped roughly yearly for new/updated apps), not a choice.
     // compileSdk raised alongside targetSdk since it can never be lower.
     compileSdk = 36
+    // Pinned (it was AGP 8.7's implicit default) so native-lib and the LiteRT-LM server are always built by the same
+    // NDK, and so stageLitertLmEngine can ask AGP where it is (sdkComponents.ndkDirectory has no value otherwise).
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         // The Play Console app entry (created before this repo's applicationId was chosen) was
@@ -239,6 +242,13 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            // -PturbollmApplicationIdSuffix=.test installs a test build NEXT TO the Play Store app instead of over
+            // it: same applicationId means a signature clash, and the only way past that is uninstalling the Play
+            // build — which deletes its models and chats. A suffixed build has its own data directory.
+            providers.gradleProperty("turbollmApplicationIdSuffix").orNull?.let {
+                applicationIdSuffix = it
+                versionNameSuffix = "-test"
+            }
         }
     }
 
@@ -461,16 +471,18 @@ val stageLitertLmEngine by tasks.registering(Exec::class) {
     group = "build"
     description = "Fetches liblitert-lm.so and builds liblitertlm_server.so into the APK's jniLibs."
     workingDir = rootProject.projectDir
-    val ndkDir = androidComponents.sdkComponents.ndkDirectory
-    val sdkDir = androidComponents.sdkComponents.sdkDirectory
+    // BaseExtension resolves both from local.properties / ANDROID_HOME and the pinned ndkVersion. (The
+    // androidComponents.sdkComponents providers carry no value at execution time in AGP 8.7.)
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
     val outDir = litertLmJniLibs
     outputs.upToDateWhen { false }
     doFirst {
         val exe = if (System.getProperty("os.name").lowercase().contains("windows")) ".exe" else ""
-        val cmakeBin = sdkDir.get().asFile.resolve("cmake/3.22.1/bin")
+        val cmakeBin = androidExt.sdkDirectory.resolve("cmake/3.22.1/bin")
+        val ndk = androidExt.ndkDirectory
         commandLine(
             "node", "scripts/stage-litert-lm-engine.mjs",
-            "--ndk", ndkDir.get().asFile.absolutePath,
+            "--ndk", ndk.absolutePath,
             "--out", outDir.get().asFile.absolutePath,
             "--abis", shippedAbis.joinToString(","),
             "--cmake", cmakeBin.resolve("cmake$exe").absolutePath,
