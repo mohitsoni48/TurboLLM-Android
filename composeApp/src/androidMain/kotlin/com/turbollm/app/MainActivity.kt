@@ -32,6 +32,7 @@ const val ANDROID_DAEMON_PORT = 7000
 private val nodeStarted = AtomicBoolean(false)
 
 class MainActivity : ComponentActivity() {
+    private lateinit var storageAccess: StorageAccess
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Edge-to-edge on every Android version, not just the 15+ that targetSdk 36 forces it on, so one layout path
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
 
         EngineService.start(this)
         requestNotificationPermission()
+        storageAccess = StorageAccess(this)
 
         if (nodeStarted.compareAndSet(false, true)) {
             val nodeRuntime = NodeRuntimeLauncher()
@@ -80,7 +82,7 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
                             // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
-                        ) + gpuEnv(),
+                        ) + gpuEnv() + socEnv(),
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
                     )
@@ -99,6 +101,26 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent { DaemonWebViewScreen() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        storageAccess.onResume()
+    }
+
+    override fun onPause() {
+        storageAccess.onPause()
+        super.onPause()
+    }
+
+    /** The chip's name for the daemon's hardware panel ("Google Tensor G4"): arm64 /proc/cpuinfo names none, and
+     *  an app may not read it anyway. Android 12+ only; older versions keep showing the CPU as unknown. */
+    private fun socEnv(): Map<String, String> {
+        if (Build.VERSION.SDK_INT < 31) return emptyMap()
+        val model = Build.SOC_MODEL.takeIf { it.isNotBlank() && it != Build.UNKNOWN } ?: return emptyMap()
+        val maker = Build.SOC_MANUFACTURER.takeIf { it.isNotBlank() && it != Build.UNKNOWN }
+        val name = if (maker != null && !model.startsWith(maker, ignoreCase = true)) "$maker $model" else model
+        return mapOf("TURBOLLM_ANDROID_SOC" to name)
     }
 
     /** The engine notification carries the Quit action and the "phone is hot" warning. Asked once; Android stops
