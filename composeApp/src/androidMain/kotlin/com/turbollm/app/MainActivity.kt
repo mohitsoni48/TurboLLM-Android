@@ -1,8 +1,11 @@
 package com.turbollm.app
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.GLES20
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -13,6 +16,7 @@ import androidx.activity.compose.setContent
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
 
@@ -23,9 +27,11 @@ private const val TAG = "TurboLLM"
  *  (below) and for the WebView's own URL (DaemonWebView.kt). */
 const val ANDROID_DAEMON_PORT = 7000
 
+/** Node can start once per process: a second node::Start aborts it. The process outlives the activity (EngineService
+ *  keeps it running after Back), so a flag on the activity instance let a reopened app start Node again and crash. */
+private val nodeStarted = AtomicBoolean(false)
+
 class MainActivity : ComponentActivity() {
-    private var startedNodeAlready = false
-    private val nodeRuntime = NodeRuntimeLauncher()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Edge-to-edge on every Android version, not just the 15+ that targetSdk 36 forces it on, so one layout path
@@ -43,8 +49,11 @@ class MainActivity : ComponentActivity() {
         // runs files/daemon/dist/cli.js, which has to exist by then.
         extractDaemonFromAssets()
 
-        if (!startedNodeAlready) {
-            startedNodeAlready = true
+        EngineService.start(this)
+        requestNotificationPermission()
+
+        if (nodeStarted.compareAndSet(false, true)) {
+            val nodeRuntime = NodeRuntimeLauncher()
             Thread {
                 try {
                     // Spike D: the real daemon, manually staged onto the device for this
@@ -90,6 +99,14 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent { DaemonWebViewScreen() }
+    }
+
+    /** The engine notification carries the Quit action and the "phone is hot" warning. Asked once; Android stops
+     *  prompting on its own after the user declines, and the service runs either way. */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
     }
 
     /** Unpack the daemon that ships inside the APK into `files/daemon/`, so a Play Store

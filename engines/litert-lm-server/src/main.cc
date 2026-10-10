@@ -294,6 +294,23 @@ std::string CacheDirValue(const std::optional<std::string>& cache) {
   throw HttpError(500, "Failed to load engine: ValueError('Invalid cache mode: " + *cache + "')");
 }
 
+// "disk" caching puts the compiled-model cache beside the model. Where that folder is read-only (a model the app was
+// pointed at in shared storage), the cache would silently be skipped and every load would pay full compilation again;
+// TURBOLLM_LITERT_CACHE_DIR, set by the daemon, is used instead. Empty = the runtime's own default.
+std::string FallbackCacheDir(const std::string& model_path) {
+  const char* fallback = std::getenv("TURBOLLM_LITERT_CACHE_DIR");
+  if (!fallback || !*fallback) return "";
+  auto slash = model_path.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "." : model_path.substr(0, slash == 0 ? 1 : slash);
+  if (access(dir.c_str(), W_OK) == 0) return "";
+  const std::string target = fallback;
+  for (auto pos = target.find('/', 1);; pos = target.find('/', pos + 1)) {  // mkdir -p
+    mkdir(target.substr(0, pos).c_str(), 0700);
+    if (pos == std::string::npos) break;
+  }
+  return access(target.c_str(), W_OK) == 0 ? target : "";
+}
+
 void ReleaseEngine() {
   if (g_engine.engine) {
     L.litert_lm_engine_delete(g_engine.engine);
@@ -311,6 +328,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   key.gpu_steps = mc.gpu_decode_steps_per_sync ? *mc.gpu_decode_steps_per_sync : -1;
   key.spec = mc.speculative_decoding ? (*mc.speculative_decoding ? 1 : 0) : -1;
   key.cache = CacheDirValue(mc.cache);
+  if (key.cache.empty()) key.cache = FallbackCacheDir(ref.path);
   if (key.backend != "cpu" && key.backend != "gpu" && key.backend != "npu") {
     throw HttpError(500, "Failed to load engine: ValueError(\"Unsupported backend: '" + key.backend + "'\")");
   }
