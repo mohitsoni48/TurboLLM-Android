@@ -142,7 +142,10 @@ class MainActivity : ComponentActivity() {
         if (display == EGL14.EGL_NO_DISPLAY) return null
         val version = IntArray(2)
         if (!EGL14.eglInitialize(display, version, 0, version, 1)) return null
-        try {
+        // Deliberately NO eglTerminate: EGL_DEFAULT_DISPLAY is the process-wide display the UI renderer (HWUI)
+        // also draws through, and terminating it under the renderer aborts the app at launch — which is exactly
+        // what the first build with this code did. Our context and surface are destroyed; the display stays up.
+        return run {
             val configs = arrayOfNulls<EGLConfig>(1)
             val count = IntArray(1)
             val attribs = intArrayOf(
@@ -168,8 +171,6 @@ class MainActivity : ComponentActivity() {
                 if (surface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, surface)
                 EGL14.eglDestroyContext(display, context)
             }
-        } finally {
-            EGL14.eglTerminate(display)
         }
     }
 
