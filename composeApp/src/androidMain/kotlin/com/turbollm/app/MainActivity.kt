@@ -7,6 +7,8 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import java.io.File
 import java.io.FileInputStream
@@ -26,6 +28,13 @@ class MainActivity : ComponentActivity() {
     private val nodeRuntime = NodeRuntimeLauncher()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Edge-to-edge on every Android version, not just the 15+ that targetSdk 36 forces it on, so one layout path
+        // (the WebView's window-inset padding in DaemonWebView.kt) is right everywhere. Light icons: the strips
+        // behind the bars are always the app's dark color.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
         recordCrashes()
 
