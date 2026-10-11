@@ -139,6 +139,11 @@ val turbollmVersionCode: Int = turbollmVersion
     .map { it.takeWhile(Char::isDigit).ifEmpty { "0" }.toInt() }
     .let { (major, minor, patch) -> (major * 10000 + minor * 100 + patch) * 100 + turbollmReleaseAttempt }
 
+// CI override (.github/workflows/play-alpha.yml): every PR push uploads a fresh bundle, and Play
+// never accepts a reused code, so CI passes a strictly increasing number (offset + run number)
+// instead of the semver-derived one. Unset for local/manual releases, which are unchanged.
+val versionCodeOverride: Int? = providers.gradleProperty("turbollmVersionCode").orNull?.toIntOrNull()
+
 android {
     namespace = "com.turbollm.app"
     // Play Console rejected the first upload at 35: "must target at least API level 36" — this
@@ -161,7 +166,7 @@ android {
         // Single source of truth: the npm package's version. The Android app is a shell around
         // that daemon, so two independently-bumped version lines would only ever disagree — and
         // "which version is this?" during a beta bug report has to have one answer.
-        versionCode = turbollmVersionCode
+        versionCode = versionCodeOverride ?: turbollmVersionCode
         versionName = turbollmVersion
 
         externalNativeBuild {

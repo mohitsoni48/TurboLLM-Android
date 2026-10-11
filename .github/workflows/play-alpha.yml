@@ -1,0 +1,126 @@
+name: Play alpha build
+
+# Every PR open/update uploads a signed AAB to the Play "alpha" (closed testing) track.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A newer push to the same PR supersedes the one still building.
+concurrency:
+  group: play-alpha-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_MOBILE_VERSION: 18.20.4
+  # Added to the run number so CI codes stay above every code already used on Play
+  # (manual releases are ~1.1M). Must stay below Play's 2.1B ceiling.
+  VERSION_CODE_OFFSET: 100000000
+
+jobs:
+  publish-alpha:
+    # Fork PRs get no secrets, so there is nothing to sign or upload with.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+
+      # The daemon that ships inside the APK is built from the sibling turbollm repo.
+      - name: Checkout turbollm (daemon source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TURBOLLM_REPO || 'mohitsoni48/turbollm' }}
+          ref: ${{ vars.TURBOLLM_REF || 'main' }}
+          token: ${{ secrets.TURBOLLM_REPO_TOKEN || github.token }}
+          path: turbollm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            turbollm/package-lock.json
+            turbollm/web/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build turbollm deps + web UI
+        working-directory: turbollm
+        run: |
+          npm ci
+          npm --prefix web ci
+          npm --prefix web run build
+
+      # libnode is gitignored (~190 MB), so fetch the official nodejs-mobile release and check
+      # every .so against the hashes recorded in PROVENANCE.md.
+      - name: Cache libnode
+        id: libnode-cache
+        uses: actions/cache@v4
+        with:
+          path: composeApp/src/androidMain/cpp/libnode
+          key: libnode-${{ env.NODE_MOBILE_VERSION }}-v1
+
+      - name: Fetch libnode
+        if: steps.libnode-cache.outputs.cache-hit != 'true'
+        run: |
+          dest=composeApp/src/androidMain/cpp/libnode
+          mkdir -p "$dest"
+          curl -fsSL -o "$RUNNER_TEMP/nm.zip" \
+            "https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v${NODE_MOBILE_VERSION}/nodejs-mobile-v${NODE_MOBILE_VERSION}-android.zip"
+          unzip -q "$RUNNER_TEMP/nm.zip" -d "$dest"
+
+      - name: Verify libnode checksums
+        run: |
+          cd composeApp/src/androidMain/cpp/libnode
+          sha256sum -c - <<'SUMS'
+          7c907316beb6e78e34495926c9ac1befe079369b14650d508ea812929258250c  bin/arm64-v8a/libnode.so
+          d60451f64718354b1a3d4857d20fbe56cc3a3dbe2c319c2911342aea2bbef92d  bin/armeabi-v7a/libnode.so
+          9acba7e26a1e864f13b78f1b7121773643f3f33a4c6a2fe7d4f63eb06d4d3af1  bin/x86_64/libnode.so
+          SUMS
+
+      # build.gradle.kts reads signing + Play credentials from the gitignored local.properties.
+      - name: Write signing + Play credentials
+        env:
+          UPLOAD_KEYSTORE_B64: ${{ secrets.TURBOLLM_UPLOAD_KEYSTORE_BASE64 }}
+          UPLOAD_STORE_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_STORE_PASSWORD }}
+          UPLOAD_KEY_ALIAS: ${{ secrets.TURBOLLM_UPLOAD_KEY_ALIAS }}
+          UPLOAD_KEY_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_KEY_PASSWORD }}
+          PLAY_SA_JSON: ${{ secrets.TURBOLLM_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          for v in UPLOAD_KEYSTORE_B64 UPLOAD_STORE_PASSWORD UPLOAD_KEY_ALIAS UPLOAD_KEY_PASSWORD PLAY_SA_JSON; do
+            [ -n "${!v}" ] || { echo "::error::missing secret for $v"; exit 1; }
+          done
+          mkdir -p keystore
+          echo "$UPLOAD_KEYSTORE_B64" | base64 -d > keystore/turbollm-upload.jks
+          printf '%s' "$PLAY_SA_JSON" > "$RUNNER_TEMP/play-sa.json"
+          {
+            echo "TURBOLLM_UPLOAD_STORE_FILE=keystore/turbollm-upload.jks"
+            echo "TURBOLLM_UPLOAD_STORE_PASSWORD=$UPLOAD_STORE_PASSWORD"
+            echo "TURBOLLM_UPLOAD_KEY_ALIAS=$UPLOAD_KEY_ALIAS"
+            echo "TURBOLLM_UPLOAD_KEY_PASSWORD=$UPLOAD_KEY_PASSWORD"
+            echo "TURBOLLM_PLAY_SERVICE_ACCOUNT=$RUNNER_TEMP/play-sa.json"
+          } >> local.properties
+
+      - name: Publish to Play alpha
+        run: >-
+          ./gradlew :composeApp:publishReleaseBundle
+          -Pturbollm.dir=$GITHUB_WORKSPACE/turbollm
+          -PturbollmPlayTrack=alpha
+          -PturbollmVersionCode=$((VERSION_CODE_OFFSET + GITHUB_RUN_NUMBER))
+          --no-daemon --stacktrace
+
+      - name: Remove credentials
+        if: always()
+        run: rm -rf keystore local.properties "$RUNNER_TEMP/play-sa.json"
