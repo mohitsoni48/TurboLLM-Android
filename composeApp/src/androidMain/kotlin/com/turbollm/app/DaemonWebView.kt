@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -304,6 +305,17 @@ private fun TurboLLMWebView() {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 webViewClient = object : WebViewClient() {
+                    // Native actions the web UI asks for by navigating to turbollm-app://<action> (web/src/lib/
+                    // android-app.ts). Main frame only: a chat artifact runs in a sandboxed iframe and must not be
+                    // able to open the file picker.
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        if (request.url.scheme != "turbollm-app") return false
+                        if (request.isForMainFrame && request.url.host == "import-model") {
+                            (view.context as? MainActivity)?.startModelImport()
+                        }
+                        return true // never let the WebView try to load this scheme
+                    }
+
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
                         view.evaluateJavascript(HEIGHT_FIX_JS, null)

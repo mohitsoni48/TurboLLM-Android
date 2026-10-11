@@ -3,14 +3,11 @@ package com.turbollm.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
@@ -20,16 +17,17 @@ import java.net.URL
 private const val TAG = "TurboLLM"
 private const val CHECK_MS = 2000L
 
-/** Asks for shared-storage access when a model folder in it is configured, then has the daemon rescan.
+/** Explains, and offers a way out, when a model folder in shared storage is configured that the app cannot read.
  *
- *  A model folder such as /sdcard/AI is added in the web UI, which cannot ask Android for anything. Without access
- *  the folder is not unreadable but quietly empty: Android 11+ shows an app only media files in shared storage, so
- *  the scan finds no models and reports no error. So the activity watches the daemon's config while it is on screen.
- *  When a shared-storage folder appears and access is missing, it explains and offers the system screen ("All files
- *  access" on 11+, the storage permission before that). When access arrives, it triggers the rescan the user would
- *  otherwise have to find.
+ *  A model folder such as /sdcard/AI is added in the web UI, which cannot ask Android for anything. Without access the
+ *  folder is not unreadable but quietly empty: Android 11+ shows an app only media files in shared storage, so the scan
+ *  finds no models and reports no error. The Play build does not request All files access (a restricted permission),
+ *  so on Android 11+ the way in is importing: the dialog opens the system file picker and ModelImport copies the chosen
+ *  models into the app. Android 10 and older still have the ordinary storage permission, which is asked for instead,
+ *  followed by the rescan the user would otherwise have to find.
  *
- *  It asks at most once per folder set per launch, so "Not now" sticks until the folders change or the app restarts. */
+ *  The activity watches the daemon's config while it is on screen, and asks at most once per folder set per launch,
+ *  so "Not now" sticks until the folders change or the app restarts. */
 class StorageAccess(private val activity: Activity) {
     private val handler = Handler(Looper.getMainLooper())
     private val config = File(activity.filesDir, ".turbollm/config.json")
@@ -54,7 +52,7 @@ class StorageAccess(private val activity: Activity) {
     fun onPause() {
         handler.removeCallbacks(tick)
         // An activity going away must not leak its window. A dialog still unanswered is asked again on return;
-        // one already answered (Allow opened Settings, or Not now) stays answered.
+        // one already answered (Import, Allow or Not now) stays answered.
         if (dialog?.isShowing == true) {
             dialog?.dismiss()
             askedFor = null
@@ -72,16 +70,25 @@ class StorageAccess(private val activity: Activity) {
         refreshDirs()
         if (access || sharedDirs.isEmpty() || askedFor == sharedDirs || dialog?.isShowing == true) return
         askedFor = sharedDirs
-        dialog = AlertDialog.Builder(activity)
-            .setTitle("Allow access to your model folder")
-            .setMessage(
-                "TurboLLM can't see the models in ${sharedDirs.joinToString(", ")}. Android hides files in shared " +
-                    "storage from apps until you allow it." +
-                    (if (Build.VERSION.SDK_INT >= 30) "\n\nOn the next screen, turn on \"Allow access to manage all files\"." else ""),
-            )
-            .setPositiveButton("Allow") { _, _ -> request() }
-            .setNegativeButton("Not now", null)
-            .show()
+        val folders = sharedDirs.joinToString(", ")
+        dialog = if (Build.VERSION.SDK_INT >= 30) {
+            AlertDialog.Builder(activity)
+                .setTitle("Import your models")
+                .setMessage(
+                    "Android doesn't let TurboLLM read the model files in $folders, so that folder will look empty. " +
+                        "Import the models instead: pick the .gguf or .litertlm files, and they're copied into the app.",
+                )
+                .setPositiveButton("Import models") { _, _ -> (activity as? MainActivity)?.startModelImport() }
+                .setNegativeButton("Not now", null)
+                .show()
+        } else {
+            AlertDialog.Builder(activity)
+                .setTitle("Allow access to your model folder")
+                .setMessage("TurboLLM can't see the models in $folders until you allow access to your files.")
+                .setPositiveButton("Allow") { _, _ -> request() }
+                .setNegativeButton("Not now", null)
+                .show()
+        }
     }
 
     private fun refreshDirs() {
@@ -106,24 +113,13 @@ class StorageAccess(private val activity: Activity) {
             path.startsWith("/sdcard")
     }
 
+    /** Android 10 and older: the storage runtime permission. 11+: never, since All files access is not requested. */
     private fun hasAccess(): Boolean =
-        if (Build.VERSION.SDK_INT >= 30) {
-            Environment.isExternalStorageManager()
-        } else {
+        Build.VERSION.SDK_INT < 30 &&
             activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        }
 
     private fun request() {
-        if (Build.VERSION.SDK_INT >= 30) {
-            val forApp = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${activity.packageName}"))
-            runCatching { activity.startActivity(forApp) }
-                .recoverCatching { activity.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
-                .onFailure { Log.w(TAG, "no all-files-access settings screen", it) }
-        } else {
-            activity.requestPermissions(
-                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 2,
-            )
-        }
+        activity.requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 2)
     }
 
     private fun rescan() {

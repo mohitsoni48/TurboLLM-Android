@@ -53,6 +53,11 @@ beta build); Play takes the `.aab`.
 
 ### Before you upload
 
+- **First upload with `EngineService`:** file the foreground-service declaration in Play Console
+  (App content → Foreground service permissions). The text and a demo-video script are in
+  [PLAY-FGS-DECLARATION.md](PLAY-FGS-DECLARATION.md). The Play build does **not** request
+  `MANAGE_EXTERNAL_STORAGE`: models in shared storage are imported with the file picker instead.
+
 - **Bump the version in `turbollm/package.json`.** `versionName` is read from it, and
   `versionCode` is derived from the same semver (`1.12.4` → `11204`). There is no version to
   edit in `build.gradle.kts`, on purpose — the app is a shell around that daemon, and two

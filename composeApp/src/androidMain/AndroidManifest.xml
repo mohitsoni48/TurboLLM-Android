@@ -8,11 +8,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Model folders in shared storage (/sdcard/AI…). Android 11+ shows an app nothing but media there without
-         "All files access"; Android 10 and older use the plain read/write permissions. See StorageAccess.kt. -->
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <!-- Model folders in shared storage (/sdcard/AI…) on Android 10 and older, where the ordinary storage permission
+         still reaches them. Android 11+ needs All files access (MANAGE_EXTERNAL_STORAGE), a restricted Play permission
+         this build does not request: there, models are imported with the system file picker (ModelImport.kt,
+         StorageAccess.kt). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
     <application
         android:allowBackup="true"

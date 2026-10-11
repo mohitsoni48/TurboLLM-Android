@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -33,6 +34,18 @@ private val nodeStarted = AtomicBoolean(false)
 
 class MainActivity : ComponentActivity() {
     private lateinit var storageAccess: StorageAccess
+
+    /** The system file picker for importing models (ModelImport). Any type: .gguf and .litertlm have no MIME type
+     *  providers agree on, so ModelImport checks the name instead. */
+    private val importPicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        ModelImport.copy(this, uris)
+    }
+
+    /** Asked for by the web UI's "Import model file" (DaemonWebView.kt) and by StorageAccess's dialog. */
+    fun startModelImport() {
+        runCatching { importPicker.launch(arrayOf("*/*")) }
+            .onFailure { Toast.makeText(this, "No file picker is available", Toast.LENGTH_LONG).show() }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Edge-to-edge on every Android version, not just the 15+ that targetSdk 36 forces it on, so one layout path

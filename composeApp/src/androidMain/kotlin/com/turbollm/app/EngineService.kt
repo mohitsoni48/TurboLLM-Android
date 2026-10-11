@@ -18,6 +18,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -50,6 +51,11 @@ class EngineService : Service() {
     @Volatile private var thermal = 0
     /** Set when the app was closed with notifications off: stop as soon as nothing is generating (see onStartCommand). */
     @Volatile private var stopWhenIdle = false
+    /** The newest start request, so a stop only takes effect if no start arrived after it (stopSelfResult). Without
+     *  this, Back then a quick reopen could stop the service under a pending startForegroundService, which Android
+     *  answers by crashing the app ("did not then call Service.startForeground()"). */
+    @Volatile private var lastStartId = 0
+    private val stopping = AtomicBoolean(false)
     /** Guards `running` against the poll thread: with it held, a check of `running` and the wake-lock or
      *  notification call after it are one step, so onDestroy cannot slip between them. */
     private val stateLock = Any()
@@ -79,22 +85,17 @@ class EngineService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         if (intent?.action == ACTION_QUIT) {
             quit()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_ACTIVITY_FINISHED) {
             if (!running) {
-                stopSelf() // this intent created the service; it was not running in the foreground, nothing to keep
+                stopSelf(startId) // this intent created the service; it was not running in the foreground
                 return START_NOT_STICKY
             }
-            // The user backed out of the app. With notifications allowed, the notification's Quit is how they free the
-            // model, so the service stays. Without them (Android 13+ denied, or the channel turned off) there is no
-            // Quit to reach, so it stops once idle and Android may reclaim the process like any closed app's.
-            if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
-                stopWhenIdle = true
-                if (!busy) stopNow()
-            }
+            appClosed()
             return START_NOT_STICKY
         }
         stopWhenIdle = false
@@ -135,14 +136,61 @@ class EngineService : Service() {
         Process.killProcess(Process.myPid())
     }
 
-    /** Stop the service without killing the process: the model stays loaded until Android reclaims the process. */
-    private fun stopNow() {
-        synchronized(stateLock) {
-            running = false
-            releaseWakeLock()
+    /** Swiped away from Recents: the same as backing out of the app. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (running) appClosed()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    /** The user left the app (Back, or swiped from Recents). With the notification visible, its Quit is how they free
+     *  the model, so the service stays. Without it there is nothing to reach, so the service unloads the model and
+     *  stops once nothing is generating, and the process becomes an ordinary closed app Android can reclaim. */
+    private fun appClosed() {
+        if (quitReachable()) return
+        stopWhenIdle = true
+        if (!busy) stopNow()
+    }
+
+    /** Whether the notification, and its Quit, can be seen: notifications on for the app (Android 13+ asks) and the
+     *  Engine channel not turned off on its own. */
+    private fun quitReachable(): Boolean {
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return false
+        if (Build.VERSION.SDK_INT >= 26) {
+            val channel = getSystemService(NotificationManager::class.java).getNotificationChannel(CHANNEL_ID)
+            if (channel?.importance == NotificationManager.IMPORTANCE_NONE) return false
         }
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        return true
+    }
+
+    /** Unload the model, then stop, unless the app came back or a newer start request arrived in the meantime.
+     *  Unloading first matters: a stopped service alone leaves the model resident until Android reclaims the process,
+     *  and with no notification there would be no other way to free it. */
+    private fun stopNow() {
+        if (!stopping.compareAndSet(false, true)) return
+        val startId = lastStartId
+        Thread({
+            if (stopWhenIdle && !busy) unloadModel()
+            ContextCompat.getMainExecutor(this).execute {
+                stopping.set(false)
+                // onDestroy releases the wake lock and clears `running` once the stop takes effect.
+                if (stopWhenIdle && !busy) stopSelfResult(startId)
+            }
+        }, "turbollm-stop").start()
+    }
+
+    /** Stop the primary model through the daemon (POST /api/v1/engine/stop), freeing its memory. Best-effort. */
+    private fun unloadModel() {
+        runCatching {
+            val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/engine/stop").openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.connectTimeout = 1000
+            conn.readTimeout = 5000
+            conn.outputStream.use { it.write("{}".toByteArray()) }
+            conn.responseCode
+            conn.disconnect()
+        }.onFailure { Log.w(TAG, "could not unload the model before stopping", it) }
     }
 
     private fun pollActivity() {
