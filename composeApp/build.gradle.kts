@@ -133,7 +133,10 @@ val turbollmVersion: String = turbollmDir.resolve("package.json")
             "-Pturbollm.dir=<path>.",
     )
 
-val turbollmVersionCode: Int = turbollmVersion
+// CI (.github/workflows/closed-testing.yml) passes -PturbollmVersionCode=<n> so each pull-request
+// build gets its own ascending code; the semver*100+attempt scheme below tops out at 99 retries.
+val turbollmVersionCode: Int = providers.gradleProperty("turbollmVersionCode").orNull?.toIntOrNull()
+    ?: turbollmVersion
     .removeSuffix("-SNAPSHOT")
     .split(".", limit = 3)
     .map { it.takeWhile(Char::isDigit).ifEmpty { "0" }.toInt() }

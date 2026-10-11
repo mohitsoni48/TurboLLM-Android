@@ -1,0 +1,97 @@
+# Builds a signed release bundle for every pull request and publishes it to the Play Store
+# closed-testing track (GPP track "alpha").
+#
+# Required repo configuration (Settings -> Secrets and variables -> Actions), stored on the
+# `play-closed-testing` Environment so required reviewers can be added there later:
+#   secrets:   PLAY_SERVICE_ACCOUNT_JSON       service-account key JSON (Release manager on the app)
+#              UPLOAD_KEYSTORE_BASE64          base64 of keystore/turbollm-upload.jks
+#              UPLOAD_STORE_PASSWORD, UPLOAD_KEY_ALIAS, UPLOAD_KEY_PASSWORD
+#              TURBOLLM_REPO_TOKEN             PAT / deploy-key token with read access to turbollm
+#   variables: TURBOLLM_REPO                   owner/name of the private turbollm repo
+name: Closed testing release
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# One publish at a time per PR; a newer push queues behind the running one instead of
+# cancelling it mid-upload.
+concurrency:
+  group: closed-testing-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Fork PRs get no secrets and must never ship to testers.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: play-closed-testing
+    timeout-minutes: 90
+    steps:
+      - name: Check out app
+        uses: actions/checkout@v4
+
+      - name: Check out turbollm (daemon source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TURBOLLM_REPO }}
+          token: ${{ secrets.TURBOLLM_REPO_TOKEN }}
+          path: turbollm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "ndk;27.0.12077973" "cmake;3.22.1"
+
+      - name: Install turbollm dependencies
+        working-directory: turbollm
+        run: npm ci
+
+      - name: Write signing and publishing credentials
+        env:
+          KEYSTORE_B64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          STORE_PASSWORD: ${{ secrets.UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+        run: |
+          mkdir -p keystore
+          printf '%s' "$KEYSTORE_B64" | base64 -d > keystore/turbollm-upload.jks
+          printf '%s' "$PLAY_JSON" > "$RUNNER_TEMP/play-account.json"
+          {
+            echo "TURBOLLM_UPLOAD_STORE_FILE=keystore/turbollm-upload.jks"
+            echo "TURBOLLM_UPLOAD_STORE_PASSWORD=$STORE_PASSWORD"
+            echo "TURBOLLM_UPLOAD_KEY_ALIAS=$KEY_ALIAS"
+            echo "TURBOLLM_UPLOAD_KEY_PASSWORD=$KEY_PASSWORD"
+            echo "TURBOLLM_PLAY_SERVICE_ACCOUNT=$RUNNER_TEMP/play-account.json"
+          } > local.properties
+
+      - name: Build and publish to closed testing
+        # 100_000_000 + run number: strictly ascending across runs and above every code from the
+        # semver*100+attempt scheme (~1.1M). Manual releases after this must pass the same
+        # -PturbollmVersionCode or Play rejects them as too low.
+        run: >
+          ./gradlew :composeApp:publishReleaseBundle
+          -Pturbollm.dir="$GITHUB_WORKSPACE/turbollm"
+          -PturbollmPlayTrack=alpha
+          -PturbollmVersionCode=$((100000000 + GITHUB_RUN_NUMBER))
+          --no-daemon
+
+      - name: Remove credentials
+        if: always()
+        run: rm -rf keystore local.properties "$RUNNER_TEMP/play-account.json"

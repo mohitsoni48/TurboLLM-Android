@@ -155,6 +155,17 @@ version is at least Gradle 9.1.0 and yours is Gradle 8.13." This project's whole
 was judged a much bigger, untested change than this task asked for. 3.13.0 is the newest release
 still on Gradle 8.x. Revisit the version once the toolchain itself moves to Gradle 9.
 
+## Automatic closed-testing releases (CI)
+
+`.github/workflows/closed-testing.yml` builds the signed bundle and publishes it to the Play
+closed-testing track (`alpha`) for every same-repo pull request on open, push and reopen. Fork
+PRs are skipped. Configure the secrets and the `TURBOLLM_REPO` variable listed at the top of the
+workflow, on a `play-closed-testing` GitHub Environment. The first Play upload and the service
+account (above) are still prerequisites.
+
+CI passes `-PturbollmVersionCode=100000000+run_number`, which sits above every manual code. A
+later manual release must pass a higher `-PturbollmVersionCode` too, or Play rejects it as too low.
+
 ## Not yet automated
 
 Cutting the npm release and the Android release are still two separate flows. Wiring the Android
