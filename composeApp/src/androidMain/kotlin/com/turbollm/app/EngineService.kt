@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.os.Process
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
@@ -24,6 +25,7 @@ private const val TAG = "TurboLLM"
 private const val CHANNEL_ID = "engine"
 private const val NOTIFICATION_ID = 1
 private const val ACTION_QUIT = "com.turbollm.app.QUIT"
+private const val ACTION_ACTIVITY_FINISHED = "com.turbollm.app.ACTIVITY_FINISHED"
 private const val POLL_MS = 3000L
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
@@ -46,6 +48,11 @@ class EngineService : Service() {
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
     @Volatile private var busy = false
     @Volatile private var thermal = 0
+    /** Set when the app was closed with notifications off: stop as soon as nothing is generating (see onStartCommand). */
+    @Volatile private var stopWhenIdle = false
+    /** Guards `running` against the poll thread: with it held, a check of `running` and the wake-lock or
+     *  notification call after it are one step, so onDestroy cannot slip between them. */
+    private val stateLock = Any()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -76,6 +83,21 @@ class EngineService : Service() {
             quit()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_ACTIVITY_FINISHED) {
+            if (!running) {
+                stopSelf() // this intent created the service; it was not running in the foreground, nothing to keep
+                return START_NOT_STICKY
+            }
+            // The user backed out of the app. With notifications allowed, the notification's Quit is how they free the
+            // model, so the service stays. Without them (Android 13+ denied, or the channel turned off) there is no
+            // Quit to reach, so it stops once idle and Android may reclaim the process like any closed app's.
+            if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+                stopWhenIdle = true
+                if (!busy) stopNow()
+            }
+            return START_NOT_STICKY
+        }
+        stopWhenIdle = false
         ServiceCompat.startForeground(
             this, NOTIFICATION_ID, buildNotification(),
             if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
@@ -89,8 +111,10 @@ class EngineService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
-        releaseWakeLock()
+        synchronized(stateLock) {
+            running = false
+            releaseWakeLock()
+        }
         if (Build.VERSION.SDK_INT >= 29) {
             thermalListener?.let { getSystemService(PowerManager::class.java).removeThermalStatusListener(it) }
         }
@@ -102,26 +126,45 @@ class EngineService : Service() {
      *  the app's whole process group). */
     private fun quit() {
         Log.i(TAG, "quit from the notification")
-        running = false
-        releaseWakeLock()
+        synchronized(stateLock) {
+            running = false
+            releaseWakeLock()
+        }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
         Process.killProcess(Process.myPid())
     }
 
+    /** Stop the service without killing the process: the model stays loaded until Android reclaims the process. */
+    private fun stopNow() {
+        synchronized(stateLock) {
+            running = false
+            releaseWakeLock()
+        }
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     private fun pollActivity() {
+        var polls = 0
         while (running) {
             val nowBusy = queryBusy()
-            // The query can take seconds; if the service was destroyed meanwhile, touch neither the lock nor the
-            // notification, or a released lock is re-taken and a removed notification posted again.
-            if (!running) return
-            if (nowBusy != busy) {
-                busy = nowBusy
-                if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
-                updateNotification()
-            } else if (nowBusy) {
-                wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for a generation that is still going
+            // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
+            // wake lock is re-taken or a removed notification is posted again.
+            synchronized(stateLock) {
+                if (!running) return
+                if (nowBusy != busy) {
+                    busy = nowBusy
+                    if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
+                    updateNotification()
+                } else if (nowBusy) {
+                    wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for a generation that is still going
+                }
             }
+            if (stopWhenIdle && !nowBusy) {
+                ContextCompat.getMainExecutor(this).execute { if (stopWhenIdle && !busy) stopNow() }
+            }
+            if (++polls % 20 == 0) DaemonLog.rotateIfLarge(filesDir) // about once a minute
             try {
                 Thread.sleep(POLL_MS)
             } catch (_: InterruptedException) {
@@ -192,6 +235,13 @@ class EngineService : Service() {
     }
 
     companion object {
+        /** The activity is finishing (Back): see ACTION_ACTIVITY_FINISHED. */
+        fun activityFinished(context: Context) {
+            runCatching {
+                context.startService(Intent(context, EngineService::class.java).setAction(ACTION_ACTIVITY_FINISHED))
+            }.onFailure { Log.w(TAG, "could not reach the engine service", it) }
+        }
+
         fun start(context: Context) {
             runCatching {
                 ContextCompat.startForegroundService(context, Intent(context, EngineService::class.java))

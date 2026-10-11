@@ -29,7 +29,8 @@
 //     shared resource, exactly as in the Python server, which serialized everything).
 //
 // Not translated: /v1/responses, /v1/embeddings and the Gemini API (TurboLLM uses none of them
-// with this engine), and fetching http(s) image URLs (data: URLs and local paths are supported).
+// with this engine), and image URLs other than base64 data: URLs (remote URLs, and local paths, which the Python
+// server opens but a loopback server any app can reach must not).
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -455,11 +456,11 @@ json TranslateMessage(const json& msg, const std::map<std::string, std::string>&
           throw HttpError(400, "Invalid messages: Unsupported data URL format (only base64 is supported)");
         }
         parts.push_back({{"type", "image"}, {"blob", url.substr(comma + 1)}});
-      } else if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
-        throw HttpError(400, "Invalid messages: remote image URLs are not supported by this server; send the image as a base64 data: URL");
       } else {
-        std::string path = url.rfind("file://", 0) == 0 ? url.substr(7) : url;
-        parts.push_back({{"type", "image"}, {"path", path}});
+        // Only inline images. The Python server also opens a local path here; this one does not, because it
+        // listens on loopback where any app on the phone can reach it, and a path would let that app have the
+        // model read any file this app can (models in shared storage, once All files access is granted).
+        throw HttpError(400, "Invalid messages: only base64 data: image URLs are supported by this server");
       }
     } else if (type == "input_audio") {
       std::string data = part.contains("input_audio") && part["input_audio"].is_object() ? part["input_audio"].value("data", "") : "";
@@ -637,8 +638,7 @@ struct StreamQueue {
 // Keeps a generation's StreamQueue alive until the runtime has delivered its final chunk. The runtime calls
 // StreamCallback from its own thread with a pointer to the queue, so a request that leaves early (an exception while
 // tokens are still arriving: a malformed tool call, a JSON error) must not free the queue under it. On such an exit
-// this cancels the generation and waits for the final chunk; if none comes in 30 s the queue is deliberately leaked,
-// a few bytes, rather than freed while it may still be written to.
+// this cancels the generation and waits for the final chunk; if none comes in 30 s the server exits (see below).
 class StreamGuard {
  public:
   StreamGuard(std::unique_ptr<StreamQueue>& q, LiteRtLmConversation* conv) : q_(q), conv_(conv) {}
@@ -656,8 +656,12 @@ class StreamGuard {
       if (q_->cv.wait_until(lock, deadline) == std::cv_status::timeout) break;
     }
     lock.unlock();
-    Log("generation did not stop after cancel; leaking its stream queue");
-    q_.release();
+    // The runtime is still generating into this request's conversation, which the caller is about to delete, while
+    // holding no engine lock that would stop the next request from releasing the engine under it. Nothing in this
+    // process can be trusted after that, so exit: the daemon sees the engine stop and reloads it on demand.
+    Log("generation did not stop 30 s after cancel; exiting so the engine restarts clean");
+    std::fflush(nullptr);
+    _exit(70);
   }
 
  private:

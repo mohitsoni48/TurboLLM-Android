@@ -63,9 +63,10 @@ Java_com_turbollm_app_NodeRuntimeLauncher_startNodeWithArguments(
 
     // Send Node's stdout/stderr to a file when asked (TURBOLLM_DAEMON_LOG, set by MainActivity). In an app process
     // both go nowhere, so the daemon's own messages — engine registration failures, uncaught exceptions — were
-    // invisible on a real phone. Truncated per launch.
+    // invisible on a real phone. Truncated per launch, and O_APPEND so DaemonLog.kt can rotate it while the process
+    // lives (EngineService keeps it alive indefinitely): a truncate then puts the next write at the new end.
     if (const char *log_path = getenv("TURBOLLM_DAEMON_LOG")) {
-        int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
         if (fd >= 0) {
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);

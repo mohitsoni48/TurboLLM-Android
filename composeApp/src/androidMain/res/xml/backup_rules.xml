@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older (fullBackupContent). Diagnostics logs are per-device and can be large; nothing to restore. -->
+<full-backup-content>
+    <exclude domain="file" path="daemon.log" />
+    <exclude domain="file" path="daemon.log.1" />
+    <exclude domain="file" path="last-crash.txt" />
+</full-backup-content>

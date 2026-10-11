@@ -84,7 +84,9 @@ async function fetchWheel(abi, cacheDir) {
 
   // Resolve the download URL from PyPI's JSON API rather than hardcoding a CDN path; the hash
   // pinned above is what makes the result trustworthy, not the URL.
-  const meta = await (await fetch(`https://pypi.org/pypi/litert-lm-api/${LITERT_LM_VERSION}/json`)).json()
+  const metaRes = await fetch(`https://pypi.org/pypi/litert-lm-api/${LITERT_LM_VERSION}/json`)
+  if (!metaRes.ok) fail(`PyPI metadata for litert-lm-api ${LITERT_LM_VERSION}: HTTP ${metaRes.status}`)
+  const meta = await metaRes.json()
   const entry = (meta.urls ?? []).find((u) => u.filename === w.file)
   if (!entry) fail(`PyPI has no ${w.file}`)
   console.log(`downloading ${w.file} (${(entry.size / 1e6).toFixed(1)} MB)…`)

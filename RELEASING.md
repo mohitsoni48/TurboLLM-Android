@@ -5,6 +5,21 @@ Build steps and the decisions baked into them. For the engine binaries themselve
 [daemon payload](BUILDING-ENGINES.md#the-daemon-payload--what-makes-the-apk-self-sufficient)
 section.
 
+## What a clean build needs
+
+A fresh checkout downloads two pinned, SHA-256-checked inputs during the build, so the first build needs network
+access to GitHub and PyPI (later builds use the cached copies under `composeApp/src/androidMain/cpp/libnode` and
+`composeApp/build/generated/litert-lm/cache`):
+
+- **libnode** (`scripts/fetch-libnode.mjs`, run by `preBuild`): digidem nodejs-mobile v18.20.4 from GitHub releases.
+  On Linux it is unpacked with `unzip`, which must be on `PATH`.
+- **LiteRT-LM** (`scripts/stage-litert-lm-engine.mjs`, run before native libs are merged): the `litert-lm-api` wheel
+  from PyPI; its native server is then compiled per ABI.
+
+And from the Android SDK: **NDK 27.0.12077973** (pinned as `ndkVersion`) and **CMake 3.22.1** (the server is built
+with its `cmake` and `ninja`), plus Node on `PATH` for the scripts. Build with `-PturbollmLitertLmEngine=false` to
+leave LiteRT-LM out, which also drops the PyPI and CMake requirements.
+
 ## One-time: the upload keystore
 
 ```bash

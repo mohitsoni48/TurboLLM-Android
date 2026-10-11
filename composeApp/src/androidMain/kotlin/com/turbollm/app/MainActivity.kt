@@ -106,11 +106,18 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         storageAccess.onResume()
+        DaemonLog.rotateIfLarge(filesDir)
     }
 
     override fun onPause() {
         storageAccess.onPause()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        // Back, not a configuration change (those no longer recreate the activity, see the manifest).
+        if (isFinishing) EngineService.activityFinished(this)
+        super.onDestroy()
     }
 
     /** The chip's name for the daemon's hardware panel ("Google Tensor G4"): arm64 /proc/cpuinfo names none, and
