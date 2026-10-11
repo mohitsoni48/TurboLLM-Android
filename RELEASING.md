@@ -155,7 +155,7 @@ version is at least Gradle 9.1.0 and yours is Gradle 8.13." This project's whole
 was judged a much bigger, untested change than this task asked for. 3.13.0 is the newest release
 still on Gradle 8.x. Revisit the version once the toolchain itself moves to Gradle 9.
 
-## CI: PR builds to the Play alpha track
+## CI: Play publishing (PR → alpha, main → open testing)
 
 `.github/workflows/pr-alpha.yml` builds a signed release bundle and runs `publishReleaseBundle`
 against the **alpha** track on every PR open / push / reopen (markdown-only changes and fork PRs
@@ -174,6 +174,12 @@ Secrets live in the **`play-alpha` environment** (Settings → Environments), no
 
 `build.gradle.kts` reads these as environment variables of the same name (env wins over
 `local.properties`), so nothing is written into the checkout.
+
+**Merges to `main`** publish to the **beta** (open testing) track from the same workflow, through the
+`play-beta` environment. It has its own copy of the five secrets, needs no approval (`main` is
+already owner-gated), and is restricted to the `main` branch — a PR branch cannot use it, so a
+modified workflow on a branch can never read those secrets. PR and main builds share one run-number
+sequence, which keeps their version codes unique.
 
 Things to know:
 - **versionCode.** CI passes `-PturbollmReleaseAttempt=<github run number>`. The scheme is now
