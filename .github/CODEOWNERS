@@ -1,0 +1,3 @@
+# Every change needs the owner to approve it. Combined with the branch protection on main and the
+# play-alpha environment approval, this stops anyone else from altering the release pipeline.
+* @mohitsoni48
