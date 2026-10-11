@@ -1,0 +1,159 @@
+name: PR build → Play alpha
+
+# Every PR push uploads a signed release bundle to the Play "alpha" (closed testing) track, so
+# testers can install what the PR does. See RELEASING.md § "CI: PR builds to alpha".
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+
+# A newer push supersedes an in-flight build for the same PR. Distinct PRs run independently;
+# note that the alpha track only holds ONE current release, so whichever upload lands last is
+# what testers get.
+concurrency:
+  group: pr-alpha-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODEJS_MOBILE_VERSION: v18.20.4
+
+jobs:
+  publish-alpha:
+    # Secrets are not exposed to PRs from forks, and a fork PR must never reach the signing key
+    # in any case — only PRs from branches of this repo publish.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # The signing + Play secrets live in this environment, which requires the owner's approval for
+    # every run. That approval is what stops a PR that edits this workflow or the build scripts
+    # from reading them — review such PRs' diffs before approving.
+    environment: play-alpha
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check required secrets
+        env:
+          HAVE_KEYSTORE: ${{ secrets.TURBOLLM_UPLOAD_KEYSTORE_BASE64 != '' }}
+          HAVE_STORE_PW: ${{ secrets.TURBOLLM_UPLOAD_STORE_PASSWORD != '' }}
+          HAVE_ALIAS: ${{ secrets.TURBOLLM_UPLOAD_KEY_ALIAS != '' }}
+          HAVE_KEY_PW: ${{ secrets.TURBOLLM_UPLOAD_KEY_PASSWORD != '' }}
+          HAVE_PLAY: ${{ secrets.TURBOLLM_PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          missing=0
+          for v in KEYSTORE:TURBOLLM_UPLOAD_KEYSTORE_BASE64 STORE_PW:TURBOLLM_UPLOAD_STORE_PASSWORD \
+                   ALIAS:TURBOLLM_UPLOAD_KEY_ALIAS KEY_PW:TURBOLLM_UPLOAD_KEY_PASSWORD \
+                   PLAY:TURBOLLM_PLAY_SERVICE_ACCOUNT_JSON; do
+            flag="HAVE_${v%%:*}"
+            if [ "${!flag}" != "true" ]; then
+              echo "::error::Repository secret ${v#*:} is not set"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - uses: actions/checkout@v4
+
+      # The Android app is a shell around the TurboLLM daemon, which lives in its own repo and is
+      # bundled into the APK (scripts/stage-daemon-assets.mjs). Public repo, so no token needed.
+      - uses: actions/checkout@v4
+        with:
+          repository: mohitsoni48/TurboLLM
+          ref: main
+          path: turbollm-src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # SDK pieces the build asks for. ubuntu-latest ships the SDK itself; these make the
+      # cmake/NDK/platform versions deterministic instead of relying on AGP's auto-download.
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "cmake;3.22.1" "ndk;27.0.12077973" > /dev/null
+
+      # libnode.so is a gitignored build input (~190 MB), so it is fetched from the official
+      # nodejs-mobile release and pinned by the SHA-256s recorded in PROVENANCE.md. A mismatch
+      # fails the build rather than shipping an unverified runtime.
+      - name: Fetch libnode (nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          libnode=composeApp/src/androidMain/cpp/libnode
+          mkdir -p "$RUNNER_TEMP/nodejs-mobile"
+          gh release download "$NODEJS_MOBILE_VERSION" -R nodejs-mobile/nodejs-mobile \
+            -p "nodejs-mobile-${NODEJS_MOBILE_VERSION}-android.zip" -D "$RUNNER_TEMP/nodejs-mobile"
+          mkdir -p "$libnode"
+          unzip -q "$RUNNER_TEMP/nodejs-mobile/nodejs-mobile-${NODEJS_MOBILE_VERSION}-android.zip" -d "$libnode"
+          cat > "$RUNNER_TEMP/libnode.sha256" <<'EOF'
+          7c907316beb6e78e34495926c9ac1befe079369b14650d508ea812929258250c  bin/arm64-v8a/libnode.so
+          9acba7e26a1e864f13b78f1b7121773643f3f33a4c6a2fe7d4f63eb06d4d3af1  bin/x86_64/libnode.so
+          EOF
+          (cd "$libnode" && sed 's/^ *//' "$RUNNER_TEMP/libnode.sha256" | sha256sum -c -)
+          rm -rf "$RUNNER_TEMP/nodejs-mobile"
+
+      # Daemon + web UI. stage-daemon-assets.mjs rebuilds the Android daemon bundle itself but
+      # deliberately not the web UI, so that is built here first (into turbollm/src/webdist).
+      - name: Build the TurboLLM web UI and install daemon deps
+        working-directory: turbollm-src/turbollm
+        run: |
+          npm ci
+          (cd web && npm ci && npm run build)
+
+      - name: Materialise signing + Play credentials
+        env:
+          KEYSTORE_B64: ${{ secrets.TURBOLLM_UPLOAD_KEYSTORE_BASE64 }}
+          PLAY_JSON: ${{ secrets.TURBOLLM_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          printf '%s' "$PLAY_JSON" > "$RUNNER_TEMP/play-account.json"
+          # Picked up by composeApp/build.gradle.kts (env vars override local.properties).
+          {
+            echo "TURBOLLM_UPLOAD_STORE_FILE=$RUNNER_TEMP/upload.jks"
+            echo "TURBOLLM_PLAY_SERVICE_ACCOUNT=$RUNNER_TEMP/play-account.json"
+          } >> "$GITHUB_ENV"
+
+      # -x stagePlayListing: the store listing's screenshots/icon are gitignored, and a PR build
+      # only uploads the bundle — it must not rewrite the store listing anyway.
+      # The run number is the versionCode "attempt" (build.gradle.kts): unique and ascending, so
+      # Play accepts every push. Re-running a job that already uploaded reuses its run number
+      # and Play will reject the duplicate code — push a new commit instead.
+      - name: Build and publish to the alpha track
+        env:
+          TURBOLLM_UPLOAD_STORE_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_STORE_PASSWORD }}
+          TURBOLLM_UPLOAD_KEY_ALIAS: ${{ secrets.TURBOLLM_UPLOAD_KEY_ALIAS }}
+          TURBOLLM_UPLOAD_KEY_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:publishReleaseBundle \
+            -x stagePlayListing \
+            -PturbollmPlayTrack=alpha \
+            -PturbollmReleaseAttempt="${{ github.run_number }}" \
+            -Pturbollm.dir="$GITHUB_WORKSPACE/turbollm-src/turbollm" \
+            --stacktrace
+
+      - name: Summary
+        if: success()
+        run: |
+          version=$(node -p "require('./turbollm-src/turbollm/package.json').version")
+          {
+            echo "### Published to Play alpha"
+            echo "- versionName: \`$version\`"
+            echo "- build: run #${{ github.run_number }} (PR #${{ github.event.pull_request.number }}, \`${GITHUB_SHA::7}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks" "$RUNNER_TEMP/play-account.json"
