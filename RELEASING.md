@@ -59,7 +59,7 @@ beta build); Play takes the `.aab`.
   `MANAGE_EXTERNAL_STORAGE`: models in shared storage are imported with the file picker instead.
 
 - **Bump the version in `turbollm/package.json`.** `versionName` is read from it, and
-  `versionCode` is derived from the same semver (`1.12.4` → `11204`). There is no version to
+  `versionCode` is derived from the same semver (`1.12.4` → `112040003` — see CI section). There is no version to
   edit in `build.gradle.kts`, on purpose — the app is a shell around that daemon, and two
   independently-bumped version lines would only ever disagree.
 - **Run lint yourself:** `./gradlew :composeApp:lintDebug`. Release lint is disabled (see below),
@@ -79,8 +79,8 @@ beta build); Play takes the `.aab`.
 ## Decisions baked into the release build
 
 ### Version comes from the npm package
-`versionName` = `turbollm/package.json`'s version; `versionCode` = `major*10000 + minor*100 +
-patch`. Two digits each for minor and patch, so they cap at 99 — far past anything used so far.
+`versionName` = `turbollm/package.json`'s version; `versionCode` = `(major*10000 + minor*100 +
+patch) * 10000 + attempt`. Two digits each for minor and patch, so they cap at 99 — far past anything used so far.
 
 ### armeabi-v7a is not shipped
 `jniLibs` only carries arm64-v8a and x86_64 engine builds. Listing armeabi-v7a in `abiFilters`
@@ -174,6 +174,38 @@ version is at least Gradle 9.1.0 and yours is Gradle 8.13." This project's whole
 8.7.3, Kotlin 2.2.20) is still on the Gradle 8.x line; bumping to Gradle 9 to satisfy one plugin
 was judged a much bigger, untested change than this task asked for. 3.13.0 is the newest release
 still on Gradle 8.x. Revisit the version once the toolchain itself moves to Gradle 9.
+
+## CI: PR builds to the Play alpha track
+
+`.github/workflows/pr-alpha.yml` builds a signed release bundle and runs `publishReleaseBundle`
+against the **alpha** track on every PR open / push / reopen (markdown-only changes and fork PRs
+are skipped; a newer push cancels an in-flight build for the same PR). It fetches the TurboLLM
+daemon from `mohitsoni48/TurboLLM@main`, builds its web UI, pulls `libnode.so` from the official
+nodejs-mobile release (verified against the SHA-256s in PROVENANCE.md), and uses the tracked CPU
+engine in `jniLibs/`. The Vulkan engine is not built in CI, so those bundles are CPU-only.
+
+Secrets live in the **`play-alpha` environment** (Settings → Environments), not as repo secrets. That environment requires the owner's approval for every run, `main` requires an owner-approved PR (`.github/CODEOWNERS`), and fork PRs never get secrets. Already created:
+
+| Secret | Value |
+|---|---|
+| `TURBOLLM_UPLOAD_KEYSTORE_BASE64` | `base64 -w0 keystore/turbollm-upload.jks` (PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("keystore\turbollm-upload.jks"))`) |
+| `TURBOLLM_UPLOAD_STORE_PASSWORD` / `TURBOLLM_UPLOAD_KEY_ALIAS` / `TURBOLLM_UPLOAD_KEY_PASSWORD` | the matching `TURBOLLM_UPLOAD_*` lines of `local.properties` |
+| `TURBOLLM_PLAY_SERVICE_ACCOUNT_JSON` | full contents of the Play service-account JSON key |
+
+`build.gradle.kts` reads these as environment variables of the same name (env wins over
+`local.properties`), so nothing is written into the checkout.
+
+Things to know:
+- **versionCode.** CI passes `-PturbollmReleaseAttempt=<github run number>`. The scheme is now
+  `(major*10000 + minor*100 + patch) * 10000 + attempt` (attempt 0–9999, enforced), i.e. `1.13.6`
+  attempt 3 → `113060003`. It was `*100`, which only had 100 slots per semver. This is a one-time
+  jump above everything shipped under the old scheme.
+- **Re-running** a job that already uploaded reuses its run number, so Play rejects the duplicate
+  code. Push a new commit instead.
+- **One release per track.** Alpha holds a single current release, so with several open PRs the
+  last upload wins.
+- `-x stagePlayListing`: the listing images are gitignored, and a PR build must not rewrite the
+  store listing anyway.
 
 ## Not yet automated
 

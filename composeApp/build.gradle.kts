@@ -70,11 +70,14 @@ val turbollmDir: File = rootProject.projectDir
 
 // local.properties is gitignored, which is why the signing credentials live there rather than in
 // this file. Read defensively: a fresh clone has only sdk.dir, and debug builds must still work.
+// An environment variable of the same name wins, which is how CI (.github/workflows/) supplies
+// the signing and Play credentials without ever writing them to a file in the checkout.
 val localProperties = Properties().apply {
     rootProject.projectDir.resolve("local.properties").takeIf { it.exists() }
         ?.inputStream()?.use { load(it) }
 }
-fun localProp(name: String): String? = localProperties.getProperty(name)
+fun localProp(name: String): String? =
+    System.getenv(name)?.takeIf { it.isNotBlank() } ?: localProperties.getProperty(name)
 
 // Whether the Vulkan engine is packaged. Off by default — see the packaging block below for
 // what it costs, and the requireVulkanEngineBinary guard at the end of this file, which stops
@@ -135,9 +138,19 @@ val playTrack: String = providers.gradleProperty("turbollmPlayTrack").getOrElse(
 // multiplied by 100 and a small release-attempt counter is added on top — bump
 // `-PturbollmReleaseAttempt=<n>` (or just the default below) each time Play claims the current
 // code is taken, without needing to fake-bump the actual app version to get a new number. Ordering
-// is still preserved across real version bumps: 1.12.4's whole range (1120400-1120499) sits below
-// 1.12.5's (1120500-...), so this only ever needs revisiting if one semver needs a 100th retry.
+// is still preserved across real version bumps: each semver owns a whole 10000-wide block, so
+// 1.12.4's range sits below 1.12.5's.
+//
+// The block is 10000 wide (it was 100) because CI uploads a build to the alpha track on every PR
+// push, using the GitHub run number as the attempt — 100 slots per semver ran out after a few
+// dozen pushes. 1.13.6 attempt 3 -> 113060003, a one-time jump above every code shipped under
+// the old *100 scheme (1130603), and the top of the scheme (9.99.99 -> ~1B) stays under
+// Play's 2,100,000,000 versionCode ceiling.
 val turbollmReleaseAttempt: Int = providers.gradleProperty("turbollmReleaseAttempt").orNull?.toIntOrNull() ?: 3
+check(turbollmReleaseAttempt in 0..9999) {
+    "turbollmReleaseAttempt=$turbollmReleaseAttempt is outside 0..9999 — it would spill into the " +
+        "next patch version's versionCode block. Widen the scheme in composeApp/build.gradle.kts."
+}
 val turbollmVersion: String = turbollmDir.resolve("package.json")
     .takeIf { it.exists() }
     ?.let { Regex("""["]version["]\s*:\s*["]([^"]+)["]""").find(it.readText())?.groupValues?.get(1) }
@@ -151,7 +164,7 @@ val turbollmVersionCode: Int = turbollmVersion
     .removeSuffix("-SNAPSHOT")
     .split(".", limit = 3)
     .map { it.takeWhile(Char::isDigit).ifEmpty { "0" }.toInt() }
-    .let { (major, minor, patch) -> (major * 10000 + minor * 100 + patch) * 100 + turbollmReleaseAttempt }
+    .let { (major, minor, patch) -> (major * 10000 + minor * 100 + patch) * 10000 + turbollmReleaseAttempt }
 
 android {
     namespace = "com.turbollm.app"
