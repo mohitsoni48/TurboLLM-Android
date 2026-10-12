@@ -19,6 +19,13 @@ import { fileURLToPath } from 'node:url'
 
 const URL_ = 'https://github.com/digidem/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip'
 const SHA256 = '16f70c90946f24c45858fdc0943b8b8d1c0a70c153d7fd19f9a55442d1f38e26'
+// Each extracted libnode.so, pinned on its own too (PROVENANCE.md): the archive hash proves the download, these prove
+// the files the APK actually ships, so CI and a local build verify the same binaries.
+const LIBNODE_SHA256 = {
+  'arm64-v8a': '8ce0cc6d1753afbd92fc0e3656789f8af50f786a162c2f157b2b61d5e742b7a1',
+  'armeabi-v7a': '182b5227b4beb7c5fd30c00f23e8432a890e66d8b8a21aa9ae23f4467f6306fc',
+  x86_64: 'd0a5acb6d6deddd71d8414d89fd1cebf500c2cbedee5bed2587faeb50bbf04c5',
+}
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const dest = join(appRoot, 'composeApp', 'src', 'androidMain', 'cpp', 'libnode')
@@ -63,10 +70,12 @@ try {
 } finally {
   rmSync(tmp, { force: true })
 }
-for (const abi of ['arm64-v8a', 'x86_64']) {
+for (const [abi, want] of Object.entries(LIBNODE_SHA256)) {
   const so = join(dest, 'bin', abi, 'libnode.so')
   if (!existsSync(so)) fail(`archive has no bin/${abi}/libnode.so`)
-  if (!loadAlignOk(so)) fail(`${so} is not 16 KB-aligned`)
+  const got = createHash('sha256').update(readFileSync(so)).digest('hex')
+  if (got !== want) fail(`bin/${abi}/libnode.so: sha256 ${got} does not match the pinned ${want}`)
+  if (abi !== 'armeabi-v7a' && !loadAlignOk(so)) fail(`${so} is not 16 KB-aligned`)
 }
 writeFileSync(stamp, `${SHA256}\n`)
 console.log(`libnode installed into ${dest}`)

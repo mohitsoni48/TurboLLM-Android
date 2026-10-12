@@ -3,6 +3,7 @@ package com.turbollm.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.webkit.ValueCallback
@@ -44,6 +45,9 @@ import com.airbnb.lottie.compose.rememberLottieComposition
 import kotlinx.coroutines.delay
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
+
+/** The daemon UI's origin, with the trailing slash so a look-alike host cannot match. */
+private val DAEMON_ORIGIN = DAEMON_URL
 
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
@@ -309,11 +313,24 @@ private fun TurboLLMWebView() {
                     // android-app.ts). Main frame only: a chat artifact runs in a sandboxed iframe and must not be
                     // able to open the file picker.
                     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                        if (request.url.scheme != "turbollm-app") return false
-                        if (request.isForMainFrame && request.url.host == "import-model") {
-                            (view.context as? MainActivity)?.startModelImport()
+                        val url = request.url
+                        val onDaemonPage = view.url?.startsWith(DAEMON_ORIGIN) == true
+                        if (url.scheme == "turbollm-app") {
+                            // Honoured only from the daemon's own page, in the main frame.
+                            if (request.isForMainFrame && onDaemonPage && url.host == "import-model") {
+                                (view.context as? MainActivity)?.startModelImport()
+                            }
+                            return true // never let the WebView try to load this scheme
                         }
-                        return true // never let the WebView try to load this scheme
+                        // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
+                        // replacing the app's UI inside its own WebView, where Back would be the only way out.
+                        val external = (url.scheme == "http" || url.scheme == "https") &&
+                            url.host != "127.0.0.1" && url.host != "localhost"
+                        if (request.isForMainFrame && external) {
+                            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            return true
+                        }
+                        return false
                     }
 
                     override fun onPageFinished(view: WebView, url: String?) {

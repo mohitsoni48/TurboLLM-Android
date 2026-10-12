@@ -24,34 +24,40 @@ it for the form.
 
 ## Declaration text
 
+The answers describe what the code does (`EngineService.kt`). The service starts when the app is opened and stays
+in the foreground, also while idle, until the user quits, so the text says so rather than suggesting it runs only
+during generation.
+
 **Which feature uses the foreground service?**
 
-> On-device AI chat. TurboLLM runs large language models locally on the phone, with no server
-> and no account. While the app is open, a model is loaded into memory and served by a local
-> inference process that the app starts.
+> On-device AI chat. TurboLLM runs large language models locally on the phone, with no server and no account. The
+> app starts a local inference server and loads the user's chosen model into memory (often several GB).
 
 **Why does it need to run in the foreground, and what would happen without it?**
 
-> Generating a reply takes from a few seconds to several minutes on a phone. The user often
-> switches to another app while waiting. Without a foreground service, Android freezes the app as
-> soon as it leaves the screen. The reply stops mid-sentence and is lost, and the loaded model
-> (often several GB) is reclaimed, so the next message has to reload it. The service keeps the
-> local inference server running only so that work the user started can finish.
+> The service keeps that local server and the loaded model available while the user is in another app. Without it,
+> Android freezes the app as soon as it leaves the screen: a reply being written stops mid-sentence and is lost, and
+> the model is reclaimed, so the next message waits for it to load again. Replies on a phone take from seconds to
+> minutes, and users switch apps while they wait. The service also keeps a model import (a multi-GB file copy) from
+> being frozen halfway.
 
 **What does the user see, and how do they stop it?**
 
-> A low-importance ongoing notification, "TurboLLM — Running in the background" ("Generating"
-> while a reply is being written), with a Quit action that stops the service and frees the
-> model's memory. If notifications are turned off, leaving the app (Back, or swiping it away from
-> Recents) unloads the model and stops the service as soon as nothing is generating. A partial
-> wake lock is held only while a reply is being generated, never while idle.
+> From the moment the app is opened, a low-importance ongoing notification titled "TurboLLM", with a **Quit** action
+> that stops the service, unloads the model and closes the app. Its text says what is happening: "Running in the
+> background" while idle, "Generating" while a reply is being written, "Importing models" during an import, and,
+> when the phone is thermally throttled, "Running. The phone is hot, so generation will be slower" or "Generating.
+> The phone is hot, so it is throttling speed". If the user has turned notifications off, so Quit cannot be reached,
+> leaving the app (Back, or swiping it away from Recents) unloads the model and stops the service as soon as nothing
+> is generating or importing. A partial wake lock is held only while a reply is being generated or a model imported,
+> never while idle.
 
 **Why does no other foreground service type fit?**
 
-> The work is local, user-initiated AI inference. It is not data sync, media playback or
-> processing, location, a phone call, health or connected-device work, and it can last longer
-> than shortService allows. The other candidate types are capped at 6 hours on Android 15 and
-> describe different work.
+> The work is a local, user-started AI inference server. It is not data sync, media playback or processing,
+> location, a phone call, health or connected-device work, and it lasts as long as the user keeps the app in use,
+> longer than shortService allows. The other candidate types are capped at 6 hours on Android 15 and describe
+> different work.
 
 ## Video script (about 45 seconds, screen recording on a phone)
 
@@ -67,7 +73,8 @@ a small model, so the first load is quick and the reply visibly continues.
 4. **0:20** Press Home and open another app (for example Settings) for about 10 seconds.
 5. **0:30** Return to TurboLLM. The reply has kept growing while the app was in the background,
    and is complete or nearly so.
-6. **0:38** Pull down the shade again. The notification now reads "Running in the background".
+6. **0:38** Pull down the shade again. The notification now reads "Running in the background":
+   the model stays loaded, ready for the next message, which is what the service is for.
    Tap **Quit**. The notification disappears and the app closes, freeing the model.
 
 Upload the video unlisted (for example on YouTube) and paste the link into the declaration.

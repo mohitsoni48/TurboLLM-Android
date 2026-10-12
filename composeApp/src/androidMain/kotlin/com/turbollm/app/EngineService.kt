@@ -48,6 +48,7 @@ class EngineService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
     @Volatile private var busy = false
+    @Volatile private var importing = false
     @Volatile private var thermal = 0
     /** Set when the app was closed with notifications off: stop as soon as nothing is generating (see onStartCommand). */
     @Volatile private var stopWhenIdle = false
@@ -169,18 +170,22 @@ class EngineService : Service() {
         if (!stopping.compareAndSet(false, true)) return
         val startId = lastStartId
         Thread({
-            if (stopWhenIdle && !busy) unloadModel()
+            // `busy` is the poll's view, up to 3 s old: a reply sent just before Back would not be in it yet. Ask the
+            // daemon now, and again right before unloading, so a generation that has just started is never aborted.
+            val idle = !queryBusy() && !ModelImport.isRunning()
+            if (idle) unloadModel { stopWhenIdle && !queryBusy() && !ModelImport.isRunning() }
             ContextCompat.getMainExecutor(this).execute {
                 stopping.set(false)
                 // onDestroy releases the wake lock and clears `running` once the stop takes effect.
-                if (stopWhenIdle && !busy) stopSelfResult(startId)
+                if (idle && stopWhenIdle && !busy) stopSelfResult(startId)
             }
         }, "turbollm-stop").start()
     }
 
     /** Stop the primary model through the daemon (POST /api/v1/engine/stop), freeing its memory. Best-effort. */
-    private fun unloadModel() {
+    private fun unloadModel(stillWanted: () -> Boolean) {
         runCatching {
+            if (!stillWanted()) return
             val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/engine/stop").openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
@@ -196,7 +201,13 @@ class EngineService : Service() {
     private fun pollActivity() {
         var polls = 0
         while (running) {
-            val nowBusy = queryBusy()
+            // A model import counts as work too: the service must neither stop nor let the CPU sleep under the copy.
+            val importing = ModelImport.isRunning()
+            if (importing != this.importing) {
+                this.importing = importing
+                updateNotification()
+            }
+            val nowBusy = queryBusy() || importing
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
             synchronized(stateLock) {
@@ -263,6 +274,7 @@ class EngineService : Service() {
         )
         val hot = thermal >= PowerManager.THERMAL_STATUS_SEVERE
         val text = when {
+            importing -> "Importing models"
             hot && busy -> "Generating. The phone is hot, so it is throttling speed"
             hot -> "Running. The phone is hot, so generation will be slower"
             busy -> "Generating"

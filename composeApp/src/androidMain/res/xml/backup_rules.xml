@@ -4,4 +4,7 @@
     <exclude domain="file" path="daemon.log" />
     <exclude domain="file" path="daemon.log.1" />
     <exclude domain="file" path="last-crash.txt" />
+        <!-- Imported models: multi-GB files exceed the backup quota, which makes Android skip the whole backup,
+             chat history included. They can be imported again. -->
+        <exclude domain="file" path="models/" />
 </full-backup-content>

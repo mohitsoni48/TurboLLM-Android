@@ -1,37 +1,33 @@
 # Vendored binary provenance
 
-`composeApp/src/androidMain/cpp/libnode/` holds `nodejs-mobile`'s prebuilt `libnode.so` for
-three ABIs, plus its Node headers — real build input the Gradle/CMake config expects on
-disk, gitignored (never committed — see `.gitignore`).
+## Embedded Node runtime (`libnode.so`)
 
-## What's confirmed
+`composeApp/src/androidMain/cpp/libnode/` holds nodejs-mobile's prebuilt `libnode.so` per ABI plus its Node headers.
+It is gitignored and never committed: `scripts/fetch-libnode.mjs` installs it, run by Gradle's `preBuild` and by the
+Play alpha workflow, and refuses anything that does not match the hashes below.
 
-- **Node version: 18.20.4**, verified directly from the vendored
-  `libnode/include/node/node_version.h` (`NODE_MAJOR_VERSION 18`, `NODE_MINOR_VERSION 20`,
-  `NODE_PATCH_VERSION 4`, `NODE_VERSION_IS_RELEASE 1`) — not read off a label or assumed.
-  This is `nodejs-mobile`'s actual last-published Node line (the project is
-  community-maintained now; Node 18 is what it ships).
-- **This is below `turbollm`'s `node:sqlite` floor** (`>=22.13.0`) — confirms BLUEPRINT.md
-  Spike C's risk as real, not hypothetical: the daemon's chat store needs a platform-gated
-  fallback (WASM SQLite) for Android, exactly as that spike already anticipated.
-- File sizes/hashes recorded below, so a future re-fetch (or the eventual real
-  provenance-tracked download step) can confirm it's fetching the identical artifact:
+**Source:** the digidem fork's nodejs-mobile **v18.20.4** release,
+`https://github.com/digidem/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip`.
+It is the same Node 18.20.4 the app has always embedded (`include/node/node_version.h`: 18 / 20 / 4, release),
+rebuilt with 16 KB-aligned LOAD segments. The upstream nodejs-mobile build is 4 KB-aligned: Android 15+ shows a
+compatibility warning for it on every launch of a debuggable build, 16 KB-page devices cannot load it at all, and
+Play requires 16 KB alignment for apps targeting Android 15+. Upstream's 16 KB re-release
+(nodejs-mobile/nodejs-mobile#155) has not shipped.
 
-  | ABI | Size | SHA-256 |
-  |---|---|---|
-  | arm64-v8a | 62,475,584 bytes | `7c907316beb6e78e34495926c9ac1befe079369b14650d508ea812929258250c` |
-  | armeabi-v7a | 58,720,948 bytes | `d60451f64718354b1a3d4857d20fbe56cc3a3dbe2c319c2911342aea2bbef92d` |
-  | x86_64 | 65,361,944 bytes | `9acba7e26a1e864f13b78f1b7121773643f3f33a4c6a2fe7d4f63eb06d4d3af1` |
+| File | SHA-256 |
+|---|---|
+| archive `nodejs-mobile-v18.20.4-android.zip` | `16f70c90946f24c45858fdc0943b8b8d1c0a70c153d7fd19f9a55442d1f38e26` |
+| `bin/arm64-v8a/libnode.so` | `8ce0cc6d1753afbd92fc0e3656789f8af50f786a162c2f157b2b61d5e742b7a1` |
+| `bin/armeabi-v7a/libnode.so` (not shipped) | `182b5227b4beb7c5fd30c00f23e8432a890e66d8b8a21aa9ae23f4467f6306fc` |
+| `bin/x86_64/libnode.so` | `d0a5acb6d6deddd71d8414d89fd1cebf500c2cbedee5bed2587faeb50bbf04c5` |
 
-## What's NOT confirmed
+The script also checks that the 64-bit libraries' LOAD segments are 16 KB-aligned.
 
-No download URL, fetch script, or checksum was recorded when these first landed in the
-project — they simply appeared as untracked files with no audit trail. The Node-version
-match against `nodejs-mobile`'s real, known release line is real evidence they're
-legitimate, but it isn't proof of exact origin. **Before this goes further than a local
-spike**, replace this with a real, scripted, checksummed fetch from
-`nodejs-mobile`'s official GitHub releases (`github.com/nodejs-mobile/nodejs-mobile`) so
-the dependency is reproducible and auditable rather than "already present, trust it."
+Node 18 is below `turbollm`'s `node:sqlite` floor (`>=22.13.0`), so the daemon's chat store uses its WASM SQLite
+fallback on Android (BLUEPRINT.md Spike C).
+
+For reference, the upstream 4 KB build these replace had `libnode.so` SHA-256s
+`7c907316…250c` (arm64-v8a), `d60451f6…f92d` (armeabi-v7a) and `9acba7e2…3af1` (x86_64).
 
 ---
 

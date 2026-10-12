@@ -16,6 +16,7 @@ import java.net.URL
 
 private const val TAG = "TurboLLM"
 private const val CHECK_MS = 2000L
+private const val PREF_ANSWERED = "answered_for_folders"
 
 /** Explains, and offers a way out, when a model folder in shared storage is configured that the app cannot read.
  *
@@ -34,6 +35,7 @@ class StorageAccess(private val activity: Activity) {
     private var configStamp = -1L
     private var sharedDirs: List<String> = emptyList()
     private var askedFor: List<String>? = null
+    private val prefs = activity.getSharedPreferences("storage_access", Activity.MODE_PRIVATE)
     private var dialog: AlertDialog? = null
     private var hadAccess = hasAccess()
 
@@ -69,7 +71,12 @@ class StorageAccess(private val activity: Activity) {
         hadAccess = access
         refreshDirs()
         if (access || sharedDirs.isEmpty() || askedFor == sharedDirs || dialog?.isShowing == true) return
+        // An answer (Import, Allow or Not now) is kept across launches for this set of folders, so the dialog does not
+        // come back on every cold start; adding or removing a shared folder asks again.
+        val key = sharedDirs.sorted().joinToString("\n")
+        if (prefs.getString(PREF_ANSWERED, null) == key) return
         askedFor = sharedDirs
+        val answered = { prefs.edit().putString(PREF_ANSWERED, key).apply() }
         val folders = sharedDirs.joinToString(", ")
         dialog = if (Build.VERSION.SDK_INT >= 30) {
             AlertDialog.Builder(activity)
@@ -78,15 +85,15 @@ class StorageAccess(private val activity: Activity) {
                     "Android doesn't let TurboLLM read the model files in $folders, so that folder will look empty. " +
                         "Import the models instead: pick the .gguf or .litertlm files, and they're copied into the app.",
                 )
-                .setPositiveButton("Import models") { _, _ -> (activity as? MainActivity)?.startModelImport() }
-                .setNegativeButton("Not now", null)
+                .setPositiveButton("Import models") { _, _ -> answered(); (activity as? MainActivity)?.startModelImport() }
+                .setNegativeButton("Not now") { _, _ -> answered() }
                 .show()
         } else {
             AlertDialog.Builder(activity)
                 .setTitle("Allow access to your model folder")
                 .setMessage("TurboLLM can't see the models in $folders until you allow access to your files.")
-                .setPositiveButton("Allow") { _, _ -> request() }
-                .setNegativeButton("Not now", null)
+                .setPositiveButton("Allow") { _, _ -> answered(); request() }
+                .setNegativeButton("Not now") { _, _ -> answered() }
                 .show()
         }
     }
@@ -113,13 +120,17 @@ class StorageAccess(private val activity: Activity) {
             path.startsWith("/sdcard")
     }
 
-    /** Android 10 and older: the storage runtime permission. 11+: never, since All files access is not requested. */
+    /** Android 10 and older: the storage runtime permissions. 11+: never, since All files access is not requested. */
     private fun hasAccess(): Boolean =
         Build.VERSION.SDK_INT < 30 &&
             activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
 
+    /** Read for scanning and loading; write too, because the daemon downloads into the primary model folder, which
+     *  may be one of these. */
     private fun request() {
-        activity.requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 2)
+        activity.requestPermissions(
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 2,
+        )
     }
 
     private fun rescan() {

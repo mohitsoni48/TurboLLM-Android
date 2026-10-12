@@ -8,11 +8,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Model folders in shared storage (/sdcard/AI…) on Android 10 and older, where the ordinary storage permission
-         still reaches them. Android 11+ needs All files access (MANAGE_EXTERNAL_STORAGE), a restricted Play permission
-         this build does not request: there, models are imported with the system file picker (ModelImport.kt,
-         StorageAccess.kt). -->
+    <!-- Model folders in shared storage (/sdcard/AI…), Android 10 and older only: the ordinary storage permissions,
+         read to scan and load, write because the daemon downloads into the primary model folder. On Android 11+ the
+         app does not read shared storage at all: models are imported with the system file picker, which needs no
+         permission (ModelImport.kt, StorageAccess.kt). -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
     <application
         android:allowBackup="true"

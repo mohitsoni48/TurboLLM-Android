@@ -66,6 +66,8 @@ class MainActivity : ComponentActivity() {
         EngineService.start(this)
         requestNotificationPermission()
         storageAccess = StorageAccess(this)
+        // A model import interrupted by the process dying leaves a multi-GB <name>.part behind; nothing else removes it.
+        Thread { ModelImport.sweepPartialFiles(this) }.start()
 
         if (nodeStarted.compareAndSet(false, true)) {
             val nodeRuntime = NodeRuntimeLauncher()

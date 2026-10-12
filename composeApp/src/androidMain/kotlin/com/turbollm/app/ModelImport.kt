@@ -2,9 +2,11 @@ package com.turbollm.app
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.StatFs
 import android.provider.OpenableColumns
 import android.util.Log
@@ -24,16 +26,36 @@ private const val TAG = "TurboLLM"
  *
  *  Android shows an app nothing but media in shared storage (/sdcard/…) unless it holds All files access, which the
  *  Play build does not request. So a model already on the phone reaches the library by being imported: picked through
- *  the Storage Access Framework, which needs no permission, and copied to [modelsDir], which the daemon scans and the
- *  engines can open by path. The cost is the file's size again until the user deletes the original.
+ *  the Storage Access Framework, which needs no permission, and copied to [modelsDir], which the daemon scans (it adds
+ *  that folder itself in the app, see TurboLLM engines/seed.ts) and the engines can open by path. The cost is the
+ *  file's size again until the user deletes the original.
  *
- *  Each file is written to `<name>.part` and renamed only when complete, so an interrupted copy never shows up in the
- *  library as a model. Free space is checked first. The folder is then registered with the daemon (which rescans). */
+ *  - Each file is written to `<name>.part` and renamed only when complete, so an interrupted copy never shows up in the
+ *    library. A `.part` left by a process that died mid-copy is swept at the next app start or import.
+ *  - Free space is checked first; a name already in use by a different file gets a numbered suffix, never overwritten.
+ *  - A partial wake lock is held for the copy, and EngineService counts a running import as busy, so leaving the app
+ *    neither freezes the copy nor stops the service under it.
+ *  - Every failure is caught and reported; none can take the app down. */
 object ModelImport {
     private val MODEL_FILE = Regex("""\.(gguf|litertlm)$""", RegexOption.IGNORE_CASE)
+    private val SPLIT_PART = Regex("""^(.*)-(\d{5})-of-(\d{5})\.gguf$""", RegexOption.IGNORE_CASE)
     private val running = AtomicBoolean(false)
 
-    fun modelsDir(activity: Activity) = File(activity.filesDir, "models")
+    fun isRunning(): Boolean = running.get()
+
+    fun modelsDir(context: Context) = File(context.filesDir, "models")
+
+    /** Delete `*.part` files: only ever left behind by a copy whose process died, since a live import renames or
+     *  deletes its own. Safe whenever no import is running. */
+    fun sweepPartialFiles(context: Context) {
+        if (!running.get()) sweep(modelsDir(context))
+    }
+
+    private fun sweep(dir: File) {
+        dir.listFiles { f -> f.isFile && f.name.endsWith(".part") }?.forEach { f ->
+            if (f.delete()) Log.i(TAG, "removed an interrupted import: ${f.name}")
+        }
+    }
 
     fun copy(activity: Activity, uris: List<Uri>) {
         if (uris.isEmpty()) return
@@ -57,104 +79,162 @@ object ModelImport {
             .setCancelable(false)
             .setNegativeButton("Cancel") { _, _ -> cancelled.set(true) }
             .show()
+        val wakeLock = app.getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TurboLLM:import")
+            .apply { setReferenceCounted(false) }
 
         Thread({
-            val dest = modelsDir(activity).apply { mkdirs() }
             val done = mutableListOf<String>()
             val problems = mutableListOf<String>()
+            var refreshed = true
             try {
+                wakeLock.acquire(3 * 60 * 60 * 1000L)
+                val dest = modelsDir(app).apply { mkdirs() }
+                sweep(dest) // this import has written nothing yet, so any .part here is a dead one
                 for ((i, uri) in uris.withIndex()) {
                     if (cancelled.get()) break
-                    val (name, size) = describe(activity, uri)
-                    if (!MODEL_FILE.containsMatchIn(name)) {
-                        problems += "$name is not a .gguf or .litertlm file"
-                        continue
-                    }
-                    val target = File(dest, name)
-                    if (target.exists() && size > 0 && target.length() == size) {
-                        done += name // already imported, identical size
-                        continue
-                    }
-                    val free = StatFs(dest.path).availableBytes
-                    if (size > 0 && size > free - 200L * 1024 * 1024) {
-                        problems += "$name needs ${gb(size)}, only ${gb(free)} free"
-                        continue
-                    }
-                    main.post { status.text = "${i + 1} of ${uris.size}: $name"; bar.progress = 0 }
-                    val part = File(dest, "$name.part")
+                    var label = uri.lastPathSegment ?: "file ${i + 1}"
+                    var part: File? = null
                     try {
-                        activity.contentResolver.openInputStream(uri)!!.use { input ->
-                            part.outputStream().use { output ->
-                                val buf = ByteArray(1 shl 20)
-                                var copied = 0L
-                                var lastShown = 0L
-                                while (true) {
-                                    if (cancelled.get()) throw InterruptedException()
-                                    val n = input.read(buf)
-                                    if (n < 0) break
-                                    output.write(buf, 0, n)
-                                    copied += n
-                                    if (size > 0 && copied - lastShown > 8L * 1024 * 1024) {
-                                        lastShown = copied
-                                        val p = (copied * 1000 / size).toInt()
-                                        main.post { bar.progress = p }
-                                    }
-                                }
-                            }
+                        val (name, size) = describe(app, uri)
+                        label = name
+                        if (!MODEL_FILE.containsMatchIn(name)) {
+                            problems += "$name is not a .gguf or .litertlm file"
+                            continue
                         }
-                        if (!part.renameTo(target)) throw IllegalStateException("could not finish writing $name")
-                        done += name
+                        val existing = File(dest, name)
+                        if (existing.exists() && size > 0 && existing.length() == size) {
+                            done += name // already imported
+                            continue
+                        }
+                        val free = StatFs(dest.path).availableBytes
+                        if (size > 0 && size > free - 200L * 1024 * 1024) {
+                            problems += "$name needs ${gb(size)}, only ${gb(free)} free"
+                            continue
+                        }
+                        val target = freeName(dest, name)
+                        main.post { status.text = "${i + 1} of ${uris.size}: $name"; bar.progress = 0 }
+                        part = File(dest, "${target.name}.part")
+                        copyStream(app, uri, part, size, cancelled) { p -> main.post { bar.progress = p } }
+                        if (!part.renameTo(target)) throw IllegalStateException("could not finish writing the file")
+                        part = null
+                        done += target.name
                     } catch (e: InterruptedException) {
-                        part.delete()
                         break
                     } catch (e: Exception) {
-                        part.delete()
-                        Log.w(TAG, "import of $name failed", e)
-                        problems += "$name: ${e.message ?: "copy failed"}"
+                        Log.w(TAG, "import of $label failed", e)
+                        problems += "$label: ${e.message ?: e.javaClass.simpleName}"
+                    } finally {
+                        part?.delete()
                     }
                 }
-                if (done.isNotEmpty()) registerWithDaemon(dest)
+                problems += missingSplitParts(dest, done)
+                if (done.isNotEmpty()) refreshed = registerWithDaemon(dest)
+            } catch (e: Exception) {
+                Log.w(TAG, "import failed", e)
+                problems += e.message ?: "the import failed"
             } finally {
                 running.set(false)
+                if (wakeLock.isHeld) wakeLock.release()
                 main.post {
                     runCatching { dialog.dismiss() }
-                    val msg = when {
-                        cancelled.get() -> "Import cancelled"
-                        problems.isEmpty() -> "Imported ${done.size} model${if (done.size == 1) "" else "s"}"
-                        else -> (if (done.isNotEmpty()) "Imported ${done.size}. " else "") + problems.joinToString("; ")
-                    }
-                    Toast.makeText(app, msg, Toast.LENGTH_LONG).show()
+                    Toast.makeText(app, summary(done.size, problems, cancelled.get(), refreshed), Toast.LENGTH_LONG).show()
                 }
             }
         }, "turbollm-import").start()
     }
 
+    private fun summary(imported: Int, problems: List<String>, cancelled: Boolean, refreshed: Boolean): String {
+        val parts = mutableListOf<String>()
+        if (cancelled) parts += "Import cancelled"
+        if (imported > 0) {
+            parts += "Imported $imported model${if (imported == 1) "" else "s"}" +
+                if (refreshed) "" else ", but the library could not be refreshed: tap Rescan on the Models screen"
+        }
+        parts += problems
+        return parts.joinToString(". ").ifEmpty { "Nothing was imported" }
+    }
+
+    private fun copyStream(context: Context, uri: Uri, part: File, size: Long, cancelled: AtomicBoolean, progress: (Int) -> Unit) {
+        val input = context.contentResolver.openInputStream(uri) ?: throw IllegalStateException("the file could not be opened")
+        input.use { inp ->
+            part.outputStream().use { out ->
+                val buf = ByteArray(1 shl 20)
+                var copied = 0L
+                var lastShown = 0L
+                while (true) {
+                    if (cancelled.get()) throw InterruptedException()
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    copied += n
+                    if (size > 0 && copied - lastShown > 8L * 1024 * 1024) {
+                        lastShown = copied
+                        progress((copied * 1000 / size).toInt())
+                    }
+                }
+                if (size > 0 && copied != size) throw IllegalStateException("copied $copied of $size bytes")
+            }
+        }
+    }
+
+    /** `name`, or `name-2.ext`, `name-3.ext`… when a different file already has it. A split GGUF part keeps its name,
+     *  because llama.cpp finds the other parts by it. */
+    private fun freeName(dir: File, name: String): File {
+        val first = File(dir, name)
+        if (!first.exists() || SPLIT_PART.matches(name)) return first
+        val dot = name.lastIndexOf('.')
+        val stem = name.substring(0, dot)
+        val ext = name.substring(dot)
+        var n = 2
+        while (true) {
+            val candidate = File(dir, "$stem-$n$ext")
+            if (!candidate.exists()) return candidate
+            n++
+        }
+    }
+
+    /** A split GGUF (`name-00001-of-00003.gguf`) loads only with every part present. */
+    private fun missingSplitParts(dir: File, imported: List<String>): List<String> {
+        val sets = imported.mapNotNull { SPLIT_PART.matchEntire(it) }.associate { m ->
+            m.groupValues[1] to m.groupValues[3].toInt()
+        }
+        return sets.mapNotNull { (stem, total) ->
+            val missing = (1..total).filter { !File(dir, "$stem-%05d-of-%05d.gguf".format(it, total)).exists() }
+            if (missing.isEmpty()) null
+            else "$stem is split into $total parts and part${if (missing.size == 1) "" else "s"} " +
+                "${missing.joinToString(", ")} ${if (missing.size == 1) "is" else "are"} missing: import all of them"
+        }
+    }
+
     /** Display name and size from the provider; the size is -1 when it does not say. */
-    private fun describe(activity: Activity, uri: Uri): Pair<String, Long> {
-        activity.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+    private fun describe(context: Context, uri: Uri): Pair<String, Long> {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
             if (c.moveToFirst()) {
-                val name = c.getString(0)?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "model"
-                val size = if (c.isNull(1)) -1L else c.getLong(1)
+                val name = c.getString(0)?.substringAfterLast('/')?.takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "model"
+                val size = if (c.columnCount < 2 || c.isNull(1)) -1L else c.getLong(1)
                 return name to size
             }
         }
-        return (uri.lastPathSegment?.substringAfterLast('/') ?: "model") to -1L
+        return (uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "model") to -1L
     }
 
-    /** Add the folder to the daemon's model folders (a no-op when it is there already); that request also rescans. */
-    private fun registerWithDaemon(dir: File) {
-        runCatching {
-            val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/modeldirs").openConnection() as HttpURLConnection
+    /** Add the folder to the daemon's model folders (a no-op when it is there already); that request also rescans.
+     *  False when the daemon did not accept it, so the caller says so instead of reporting a silent success. */
+    private fun registerWithDaemon(dir: File): Boolean = runCatching {
+        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/modeldirs").openConnection() as HttpURLConnection
+        try {
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.connectTimeout = 2000
             conn.readTimeout = 10_000
             conn.outputStream.use { it.write(JSONObject().put("dir", dir.absolutePath).toString().toByteArray()) }
-            conn.responseCode
+            conn.responseCode in 200..299
+        } finally {
             conn.disconnect()
-        }.onFailure { Log.w(TAG, "could not register the imported-models folder", it) }
-    }
+        }
+    }.onFailure { Log.w(TAG, "could not register the imported-models folder", it) }.getOrDefault(false)
 
     private fun gb(bytes: Long) = String.format("%.1f GB", bytes / 1e9)
 }

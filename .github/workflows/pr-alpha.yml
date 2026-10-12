@@ -83,25 +83,14 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-36" "cmake;3.22.1" "ndk;27.0.12077973" > /dev/null
 
-      # libnode.so is a gitignored build input (~190 MB), so it is fetched from the official
-      # nodejs-mobile release and pinned by the SHA-256s recorded in PROVENANCE.md. A mismatch
-      # fails the build rather than shipping an unverified runtime.
-      - name: Fetch libnode (nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }})
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          libnode=composeApp/src/androidMain/cpp/libnode
-          mkdir -p "$RUNNER_TEMP/nodejs-mobile"
-          gh release download "$NODEJS_MOBILE_VERSION" -R nodejs-mobile/nodejs-mobile \
-            -p "nodejs-mobile-${NODEJS_MOBILE_VERSION}-android.zip" -D "$RUNNER_TEMP/nodejs-mobile"
-          mkdir -p "$libnode"
-          unzip -q "$RUNNER_TEMP/nodejs-mobile/nodejs-mobile-${NODEJS_MOBILE_VERSION}-android.zip" -d "$libnode"
-          cat > "$RUNNER_TEMP/libnode.sha256" <<'EOF'
-          7c907316beb6e78e34495926c9ac1befe079369b14650d508ea812929258250c  bin/arm64-v8a/libnode.so
-          9acba7e26a1e864f13b78f1b7121773643f3f33a4c6a2fe7d4f63eb06d4d3af1  bin/x86_64/libnode.so
-          EOF
-          (cd "$libnode" && sed 's/^ *//' "$RUNNER_TEMP/libnode.sha256" | sha256sum -c -)
-          rm -rf "$RUNNER_TEMP/nodejs-mobile"
+      # libnode.so is a gitignored build input (~190 MB). scripts/fetch-libnode.mjs downloads the
+      # 16 KB-aligned nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }} build from the digidem fork (the
+      # upstream release is 4 KB-aligned, which Android 15+ 16 KB-page devices cannot load) and checks
+      # the archive and each extracted libnode.so against the SHA-256s pinned in the script and
+      # recorded in PROVENANCE.md. The build's preBuild runs the same script, so this step only makes
+      # the fetch, and any mismatch, visible on its own; it is the binary CI verified that ships.
+      - name: Fetch libnode (nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }}, digidem 16 KB build)
+        run: node scripts/fetch-libnode.mjs
 
       # Daemon + web UI. stage-daemon-assets.mjs rebuilds the Android daemon bundle itself but
       # deliberately not the web UI, so that is built here first (into turbollm/src/webdist).
