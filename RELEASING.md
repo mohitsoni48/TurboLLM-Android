@@ -155,7 +155,7 @@ version is at least Gradle 9.1.0 and yours is Gradle 8.13." This project's whole
 was judged a much bigger, untested change than this task asked for. 3.13.0 is the newest release
 still on Gradle 8.x. Revisit the version once the toolchain itself moves to Gradle 9.
 
-## CI: PR builds to the Play alpha track
+## CI: Play publishing (PR → alpha, main → open testing)
 
 `.github/workflows/pr-alpha.yml` builds a signed release bundle and runs `publishReleaseBundle`
 against the **alpha** track on every PR open / push / reopen (markdown-only changes and fork PRs
@@ -175,6 +175,25 @@ Secrets live in the **`play-alpha` environment** (Settings → Environments), no
 `build.gradle.kts` reads these as environment variables of the same name (env wins over
 `local.properties`), so nothing is written into the checkout.
 
+**Merges to `main`** publish to the **beta** (open testing) track from the same workflow, through the
+`play-beta` environment. It has its own copy of the five secrets, needs no approval (`main` is
+already owner-gated), and is restricted to the `main` branch — a PR branch cannot use it, so a
+modified workflow on a branch can never read those secrets. PR and main builds share one run-number
+sequence, which keeps their version codes unique.
+
+**Isolation caveat.** `play-beta` holds the *same* keystore and service-account key as `play-alpha`,
+and that key can publish to any track it is allowed on. Branch-restricting `play-beta` only stops
+a branch from using that environment directly; if a malicious PR's `play-alpha` run were approved,
+its code could still read the alpha copy of the same credentials. **The alpha approval is the real
+gate — read the diff of any PR touching `.github/`, `composeApp/build.gradle.kts` or `scripts/`
+before approving.** Giving CI a dedicated service account limited to testing tracks would shrink
+the blast radius.
+
+**Concurrent uploads.** An alpha and a beta upload can overlap and Play invalidates an open edit
+when another commits; the publish step retries (up to 3 times) on that specific conflict only.
+**Re-running** a failed job reuses its run number — use "Run workflow" (`workflow_dispatch`, beta,
+`main` only) for a fresh number instead.
+
 Things to know:
 - **versionCode.** CI passes `-PturbollmReleaseAttempt=<github run number>`. The scheme is now
   `(major*10000 + minor*100 + patch) * 10000 + attempt` (attempt 0–9999, enforced), i.e. `1.13.6`
@@ -191,6 +210,4 @@ Things to know:
 
 Cutting the npm release and the Android release are still two separate flows. Wiring the Android
 build (with a freshly compiled engine) into `docs/RELEASE.md` is planned but not done. The Play
-publish step above is unverified end-to-end — no service-account credential has been created and
-no manual first upload has happened, so no `publish*`/`upload*` task in this project has ever
-actually been run.
+publish step itself is no longer unverified: CI ran `publishReleaseBundle` end to end for PR #6.

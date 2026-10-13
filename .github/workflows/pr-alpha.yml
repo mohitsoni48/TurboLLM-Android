@@ -1,19 +1,30 @@
-name: PR build → Play alpha
+name: Publish to Play (PR → alpha, main → open testing)
 
 # Every PR push uploads a signed release bundle to the Play "alpha" (closed testing) track, so
-# testers can install what the PR does. See RELEASING.md § "CI: PR builds to alpha".
+# testers can install what the PR does; every merge to main uploads one to "beta" (open testing).
+# See RELEASING.md § "CI: Play publishing".
+#
+# One workflow on purpose (hence the file name no longer matching): its run number is the
+# versionCode "attempt", and two workflows would each count from 1 and collide on codes.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '**/*.md'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+  # Re-running a failed job reuses its run number, which Play rejects if the bundle already went
+  # up. Dispatching a fresh run gets a new number. Publishes to beta, and only works from main
+  # (the play-beta environment is restricted to that branch).
+  workflow_dispatch:
 
-# A newer push supersedes an in-flight build for the same PR. Distinct PRs run independently;
-# note that the alpha track only holds ONE current release, so whichever upload lands last is
-# what testers get.
+# A newer push supersedes an in-flight PR build. A main build is never cancelled mid-upload.
+# Each track only holds ONE current release, so whichever upload lands last is what testers get.
 concurrency:
-  group: pr-alpha-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: play-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -25,11 +36,13 @@ jobs:
   publish-alpha:
     # Secrets are not exposed to PRs from forks, and a fork PR must never reach the signing key
     # in any case — only PRs from branches of this repo publish.
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    # The signing + Play secrets live in this environment, which requires the owner's approval for
-    # every run. That approval is what stops a PR that edits this workflow or the build scripts
-    # from reading them — review such PRs' diffs before approving.
-    environment: play-alpha
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Each environment holds its own copy of the signing + Play secrets.
+    #  - play-alpha (PRs): needs the owner's approval for every run. That approval is what stops a
+    #    PR that edits this workflow or the build scripts from reading them — review the diff.
+    #  - play-beta (main): no approval, but restricted to the main branch, which only the owner can
+    #    change (PR + code-owner review). A PR branch cannot use this environment at all.
+    environment: ${{ github.event_name == 'pull_request' && 'play-alpha' || 'play-beta' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -54,26 +67,26 @@ jobs:
           done
           exit $missing
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The Android app is a shell around the TurboLLM daemon, which lives in its own repo and is
       # bundled into the APK (scripts/stage-daemon-assets.mjs). Public repo, so no token needed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: mohitsoni48/TurboLLM
           ref: main
           path: turbollm-src
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
 
       # SDK pieces the build asks for. ubuntu-latest ships the SDK itself; these make the
       # cmake/NDK/platform versions deterministic instead of relying on AGP's auto-download.
@@ -130,28 +143,41 @@ jobs:
       # The run number is the versionCode "attempt" (build.gradle.kts): unique and ascending, so
       # Play accepts every push. Re-running a job that already uploaded reuses its run number
       # and Play will reject the duplicate code — push a new commit instead.
-      - name: Build and publish to the alpha track
+      - name: Build and publish to the ${{ github.event_name == 'pull_request' && 'alpha' || 'beta (open testing)' }} track
         env:
           TURBOLLM_UPLOAD_STORE_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_STORE_PASSWORD }}
           TURBOLLM_UPLOAD_KEY_ALIAS: ${{ secrets.TURBOLLM_UPLOAD_KEY_ALIAS }}
           TURBOLLM_UPLOAD_KEY_PASSWORD: ${{ secrets.TURBOLLM_UPLOAD_KEY_PASSWORD }}
         run: |
+          set -o pipefail   # the default run shell has none, and `| tee` would mask a Gradle failure
           chmod +x gradlew
-          ./gradlew :composeApp:publishReleaseBundle \
-            -x stagePlayListing \
-            -PturbollmPlayTrack=alpha \
-            -PturbollmReleaseAttempt="${{ github.run_number }}" \
-            -Pturbollm.dir="$GITHUB_WORKSPACE/turbollm-src/turbollm" \
-            --stacktrace
+          # An alpha and a beta upload can overlap, and the Play API invalidates an open edit when
+          # another edit commits. A failed edit is not persisted, so retrying is safe — but only
+          # retry that specific conflict; a real build failure should fail straight away.
+          for attempt in 1 2 3; do
+            if ./gradlew :composeApp:publishReleaseBundle \
+                -x stagePlayListing \
+                -PturbollmPlayTrack=${{ github.event_name == 'pull_request' && 'alpha' || 'beta' }} \
+                -PturbollmReleaseAttempt="${{ github.run_number }}" \
+                -Pturbollm.dir="$GITHUB_WORKSPACE/turbollm-src/turbollm" \
+                --stacktrace 2>&1 | tee "$RUNNER_TEMP/publish.log"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ] && grep -qiE 'edit.*(invalid|expired|no longer|not found|conflict)|concurrent' "$RUNNER_TEMP/publish.log"; then
+              echo "::warning::Play edit conflict, retrying ($attempt/3)"; sleep 45
+            else
+              exit 1
+            fi
+          done
 
       - name: Summary
         if: success()
         run: |
           version=$(node -p "require('./turbollm-src/turbollm/package.json').version")
           {
-            echo "### Published to Play alpha"
+            echo "### Published to Play ${{ github.event_name == 'pull_request' && 'alpha' || 'beta (open testing)' }}"
             echo "- versionName: \`$version\`"
-            echo "- build: run #${{ github.run_number }} (PR #${{ github.event.pull_request.number }}, \`${GITHUB_SHA::7}\`)"
+            echo "- build: run #${{ github.run_number }} (${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || 'main' }}, \`${GITHUB_SHA::7}\`)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove credentials
