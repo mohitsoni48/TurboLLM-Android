@@ -3,11 +3,25 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- EngineService: keeps the daemon and engines alive while the app is in the background. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Model folders in shared storage (/sdcard/AI…), Android 10 and older only: the ordinary storage permissions,
+         read to scan and load, write because the daemon downloads into the primary model folder. On Android 11+ the
+         app does not read shared storage at all: models are imported with the system file picker, which needs no
+         permission (ModelImport.kt, StorageAccess.kt). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
     <application
         android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:requestLegacyExternalStorage="true"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.TurboLLM"
@@ -16,15 +30,28 @@
              the bottom of the viewport, so the window has to actually shrink when the soft
              keyboard opens or the keyboard simply covers the text field. Resizing is enough on
              its own here because HEIGHT_FIX_JS (DaemonWebView.kt) re-applies window.innerHeight
-             to the shell on every resize event, so the web layout follows the new height. -->
+             to the shell on every resize event, so the web layout follows the new height.
+             configChanges: rotating, folding, or switching dark mode must not recreate the activity. A recreation
+             reloads the WebView, dropping a half-typed message and the open chat's stream. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".EngineService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device LLM inference server: keeps a loaded model and in-progress generations alive while the user is in another app" />
+        </service>
     </application>
 </manifest>

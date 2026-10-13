@@ -3,24 +3,25 @@ package com.turbollm.app
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
-import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
-import android.view.View
-import android.view.WindowManager
-import android.view.WindowInsets
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -44,6 +45,9 @@ import com.airbnb.lottie.compose.rememberLottieComposition
 import kotlinx.coroutines.delay
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
+
+/** The daemon UI's origin, with the trailing slash so a look-alike host cannot match. */
+private val DAEMON_ORIGIN = DAEMON_URL
 
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
@@ -171,38 +175,6 @@ private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
     evaluateJavascript(js, null)
 }
 
-/** How much of the status bar / navigation bar actually OVERLAPS [view] on screen, in physical
- *  pixels — NOT the raw system-bar insets.
- *
- *  The distinction is the whole point. This app doesn't opt into edge-to-edge (no
- *  `setDecorFitsSystemWindows(false)`, and themes.xml sets `windowTranslucentStatus=false`), so
- *  the system already lays the window out BELOW the status bar and ABOVE the navigation bar —
- *  the WebView never extends under either one, and needs no CSS padding to clear them. Feeding
- *  it the raw insets anyway double-counted them: founder-reported live as content clipped at
- *  the top and the nav bar colliding with the hardware stats row, and confirmed by zeroing the
- *  CSS variables at runtime, which made every screen lay out correctly.
- *
- *  Measuring the real overlap instead of assuming either state keeps this correct both ways: it
- *  returns 0 in the current (window-inset) configuration, and real values automatically if the
- *  app ever does go edge-to-edge — which is what BUG-03/04's original padding was written for. */
-private fun readBarOverlap(view: View, windowManager: WindowManager): Pair<Int, Int> {
-    val insets = windowManager.currentWindowMetrics.windowInsets
-    val statusBarBottom = insets.getInsets(WindowInsets.Type.statusBars()).top
-    val navBarHeight = if (insets.isVisible(WindowInsets.Type.navigationBars()))
-        insets.getInsets(WindowInsets.Type.navigationBars()).bottom
-    else 0
-
-    val loc = IntArray(2)
-    view.getLocationOnScreen(loc)
-    val viewTop = loc[1]
-    val viewBottom = viewTop + view.height
-    val screenBottom = windowManager.currentWindowMetrics.bounds.bottom
-
-    val topOverlap = (statusBarBottom - viewTop).coerceAtLeast(0)
-    val bottomOverlap = (viewBottom - (screenBottom - navBarHeight)).coerceAtLeast(0)
-    return topOverlap to bottomOverlap
-}
-
 /** Android's real product UI (BLUEPRINT.md §6): the daemon already serves its own full web UI
  *  at DAEMON_URL, identical to the desktop/LAN case — this just hosts it in a full-screen
  *  WebView once the daemon is actually listening, instead of reimplementing any of that UI
@@ -232,7 +204,10 @@ fun DaemonWebViewScreen() {
         // once `ready` — this only fixes the splash's own brief window.
         Surface(
             modifier = Modifier.fillMaxSize(),
-            color = if (!ready) Color(0xFF0E0E10) else MaterialTheme.colorScheme.background,
+            // Always the app's dark color: once the WebView is up, this Surface is only visible as the strips behind
+            // the status/navigation bars (the WebView is inset away from them, see TurboLLMWebView), and those carry
+            // light icons (MainActivity.enableEdgeToEdge) — a system-light-mode background there would hide them.
+            color = Color(0xFF0E0E10),
         ) {
             if (!ready) {
                 // Real splash screen (BLUEPRINT.md §6 Phase 2, themes.xml's own note — this was
@@ -316,7 +291,12 @@ private fun TurboLLMWebView() {
     }
 
     AndroidView(
-        modifier = Modifier.fillMaxSize(),
+        // The WebView gets exactly the area nothing draws over: system bars, display cutout and the keyboard.
+        // targetSdk 36 makes the window edge-to-edge on Android 15+ whatever the theme says, and the web-side
+        // CSS-variable padding this replaces measured that wrong — header under the status bar, tab bar squeezed
+        // under the gesture/nav bar. Padding natively is exact on every version and follows the keyboard too
+        // (adjustResize no longer resizes an edge-to-edge window), so the web UI needs no insets of its own.
+        modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
         factory = { context ->
             WebView.setWebContentsDebuggingEnabled(true)
             // QA_BUGS.md BUG-13: by default the Android System WebView renders as a single
@@ -329,16 +309,37 @@ private fun TurboLLMWebView() {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 webViewClient = object : WebViewClient() {
+                    // Native actions the web UI asks for by navigating to turbollm-app://<action> (web/src/lib/
+                    // android-app.ts). Main frame only: a chat artifact runs in a sandboxed iframe and must not be
+                    // able to open the file picker.
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        val url = request.url
+                        val onDaemonPage = view.url?.startsWith(DAEMON_ORIGIN) == true
+                        if (url.scheme == "turbollm-app") {
+                            // Honoured only from the daemon's own page, in the main frame.
+                            if (request.isForMainFrame && onDaemonPage && url.host == "import-model") {
+                                (view.context as? MainActivity)?.startModelImport()
+                            }
+                            return true // never let the WebView try to load this scheme
+                        }
+                        // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
+                        // replacing the app's UI inside its own WebView, where Back would be the only way out.
+                        val external = (url.scheme == "http" || url.scheme == "https") &&
+                            url.host != "127.0.0.1" && url.host != "localhost"
+                        if (request.isForMainFrame && external) {
+                            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            return true
+                        }
+                        return false
+                    }
+
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
                         view.evaluateJavascript(HEIGHT_FIX_JS, null)
-                        // QA_BUGS.md BUG-03/04/06/07: publish however much of the system bars
-                        // actually overlaps this WebView as CSS custom props, so the web UI can
-                        // pad for them. Zero in this app's current (non-edge-to-edge) window —
-                        // see readBarOverlap for why measuring the overlap beats trusting the
-                        // raw insets.
-                        val overlap = readBarOverlap(view, context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
-                        view.injectSafeAreaInsets(overlap.first, overlap.second)
+                        // The WebView is already inset away from every system bar (the modifier above), so the
+                        // web UI's own safe-area padding (Shell.tsx --tllm-safe-top/bottom) must be zero —
+                        // anything else would pad twice.
+                        view.injectSafeAreaInsets(0, 0)
                     }
                 }
                 webChromeClient = object : WebChromeClient() {

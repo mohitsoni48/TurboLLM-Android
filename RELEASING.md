@@ -5,6 +5,21 @@ Build steps and the decisions baked into them. For the engine binaries themselve
 [daemon payload](BUILDING-ENGINES.md#the-daemon-payload--what-makes-the-apk-self-sufficient)
 section.
 
+## What a clean build needs
+
+A fresh checkout downloads two pinned, SHA-256-checked inputs during the build, so the first build needs network
+access to GitHub and PyPI (later builds use the cached copies under `composeApp/src/androidMain/cpp/libnode` and
+`composeApp/build/generated/litert-lm/cache`):
+
+- **libnode** (`scripts/fetch-libnode.mjs`, run by `preBuild`): digidem nodejs-mobile v18.20.4 from GitHub releases.
+  On Linux it is unpacked with `unzip`, which must be on `PATH`.
+- **LiteRT-LM** (`scripts/stage-litert-lm-engine.mjs`, run before native libs are merged): the `litert-lm-api` wheel
+  from PyPI; its native server is then compiled per ABI.
+
+And from the Android SDK: **NDK 27.0.12077973** (pinned as `ndkVersion`) and **CMake 3.22.1** (the server is built
+with its `cmake` and `ninja`), plus Node on `PATH` for the scripts. Build with `-PturbollmLitertLmEngine=false` to
+leave LiteRT-LM out, which also drops the PyPI and CMake requirements.
+
 ## One-time: the upload keystore
 
 ```bash
@@ -37,6 +52,11 @@ Use `:composeApp:assembleRelease` instead if you want an installable `.apk` (for
 beta build); Play takes the `.aab`.
 
 ### Before you upload
+
+- **First upload with `EngineService`:** file the foreground-service declaration in Play Console
+  (App content → Foreground service permissions). The text and a demo-video script are in
+  [PLAY-FGS-DECLARATION.md](PLAY-FGS-DECLARATION.md). The Play build does **not** request
+  `MANAGE_EXTERNAL_STORAGE`: models in shared storage are imported with the file picker instead.
 
 - **Bump the version in `turbollm/package.json`.** `versionName` is read from it, and
   `versionCode` is derived from the same semver (`1.12.4` → `112040003` — see CI section). There is no version to
@@ -160,9 +180,12 @@ still on Gradle 8.x. Revisit the version once the toolchain itself moves to Grad
 `.github/workflows/pr-alpha.yml` builds a signed release bundle and runs `publishReleaseBundle`
 against the **alpha** track on every PR open / push / reopen (markdown-only changes and fork PRs
 are skipped; a newer push cancels an in-flight build for the same PR). It fetches the TurboLLM
-daemon from `mohitsoni48/TurboLLM@main`, builds its web UI, pulls `libnode.so` from the official
-nodejs-mobile release (verified against the SHA-256s in PROVENANCE.md), and uses the tracked CPU
-engine in `jniLibs/`. The Vulkan engine is not built in CI, so those bundles are CPU-only.
+daemon from `mohitsoni48/TurboLLM@main`, builds its web UI, fetches `libnode.so` with
+`scripts/fetch-libnode.mjs` (the digidem 16 KB-aligned nodejs-mobile build, verified against the
+SHA-256s in the script and PROVENANCE.md), stages the LiteRT-LM engine from PyPI, and uses the
+tracked CPU llama.cpp engine in `jniLibs/`. The Vulkan engine is not built in CI. Because the daemon
+comes from TurboLLM `main`, a PR here that needs daemon changes builds a working alpha only once
+those daemon changes are merged.
 
 Secrets live in the **`play-alpha` environment** (Settings → Environments), not as repo secrets. That environment requires the owner's approval for every run, `main` requires an owner-approved PR (`.github/CODEOWNERS`), and fork PRs never get secrets. Already created:
 

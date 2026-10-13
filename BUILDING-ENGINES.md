@@ -33,6 +33,10 @@ paste into a search box in three months.
   then build with `-PturbollmVulkanEngine=true`. Skip the script and that flag fails the
   build rather than quietly shipping a CPU-only bundle. See
   [Build B](#build-b--the-vulkan-gpu-engine).
+- **LiteRT-LM?** Nothing to do — `assembleDebug`/`bundleRelease` fetch the pinned runtime and
+  build its server with the NDK AGP already uses (`stageLitertLmEngine`, needs network on the
+  first build). `-PturbollmLitertLmEngine=false` leaves it out. See
+  [the LiteRT-LM engine](#the-litert-lm-engine).
 - **Before you change anything about packaging**, read
   [the platform constraint](#the-platform-constraint-that-shapes-everything). It is the
   reason the binaries are bundled rather than downloaded, the reason they are named
@@ -186,6 +190,80 @@ run — packaged only with `-PturbollmVulkanEngine=true`. Note there is still no
 shipped beside it, which is the whole point of [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two).
 
 The whole directory is gitignored, so none of these are in a fresh clone.
+
+---
+
+## The LiteRT-LM engine
+
+Termux users get their best speed from LiteRT-LM, which TurboLLM runs there as
+`python -m litert_lm_cli.main serve`. The app can't: it has no Python, and it may only execute
+files that shipped in its APK. But that Python server is a thin layer — every inference call
+goes through ctypes into **one** native library, `liblitert-lm.so`, the only binary in Google's
+`litert-lm-api` wheel. So the app ships that same library unchanged and replaces only the layer
+above it:
+
+| File (jniLibs/&lt;abi&gt;/) | What it is | Where it comes from |
+|---|---|---|
+| `liblitert-lm.so` | Google's LiteRT-LM runtime (CPU + GPU) | Extracted from the `litert-lm-api` 0.18.0 Android wheel on PyPI, **sha256-pinned** in `scripts/stage-litert-lm-engine.mjs`. Byte-identical to what Termux runs. Apache-2.0. |
+| `liblitertlm_server.so` | Native port of `litert-lm serve` — an executable named like a library so Android installs it | Built from `engines/litert-lm-server/` with the NDK on every build |
+
+`stageLitertLmEngine` (`composeApp/build.gradle.kts`) does both, then checks each file's ELF
+architecture and that every LOAD segment is 16 KB-aligned (the wheel's library already is).
+Output goes to `composeApp/build/generated/litert-lm/jniLibs/`, never into `src/`. Cost: about
+14 MB compressed per ABI.
+
+### What the server is, and why it is shaped this way
+
+`engines/litert-lm-server/src/main.cc` is a translation of the Python serve modules
+(`litert_lm_cli/commands/serve/*`), keeping the contract the daemon already speaks:
+`serve --config <json> --host <h> --port <p>`, the model path in each request's `model` field,
+lazy engine creation on the first chat request, and the runtime's error in the HTTP status line
+(where the daemon's warm-up reads it). The daemon registers it as kind `litert-lm`
+(`engines/seed.ts`, name `litert-lm-android`), so its config file, warm-up and request handling
+apply unchanged; only the launch command, the absent Python preflight and the absent PyPI
+updates differ (`isNativeLitertLm` in `engines/litert-lm.ts`).
+
+It was checked against the real Python server on Linux x86-64 with the manylinux build of the
+same library and LiteRT-LM's own `runtime/testdata/test_lm.litertlm`: identical generated text
+and token counts (streaming and not, multi-turn, content parts, `,cpu` suffixes,
+`reasoning_effort`), and the same status codes and messages for every error case tried. It
+adds `/health`, llama.cpp-style `timings` from the runtime's own counters, `reasoning_content`
+for thinking-channel text, `finish_reason: "length"` when the token budget runs out, and
+cancels a generation when its client disconnects. Not ported: `/v1/responses`,
+`/v1/embeddings` and http(s) image URLs (TurboLLM uses none of them with this engine).
+
+**The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
+runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
+runtime and *exports* it; when the server was linked against the library, the linker
+satisfied the server's `std::runtime_error`/`__cxa_*` references from those exports, and
+AddressSanitizer caught an exception being destroyed by the other runtime. See
+`src/litert_lm_api.h`.
+
+### GPU
+
+The app reads the GPU's name from a throwaway GL context (`MainActivity.gpuEnv`) and passes it
+as `TURBOLLM_ANDROID_GPU`. That is the counterpart of `vulkaninfo` under Termux — the one fact
+that makes LiteRT-LM's default "auto" backend choose the GPU (`litertLmProfileToConfig`). The
+server is spawned from `nativeLibraryDir` exactly like the llama.cpp engines, i.e. the same
+kind of `/data` executable Termux's Python is, so it gets the same linker namespace for the
+system Vulkan/OpenCL/GL libraries.
+
+### Bumping LiteRT-LM
+
+Change `LITERT_LM_VERSION` and both wheel hashes in `scripts/stage-litert-lm-engine.mjs`
+(PyPI publishes them at `https://pypi.org/pypi/litert-lm-api/<version>/json`), refresh
+`engines/litert-lm-server/third_party/litert_lm/c/*.h` from the matching
+`google-ai-edge/LiteRT-LM` tag, and check that every function listed in
+`src/litert_lm_api.h` still exists — the server refuses to start, naming the missing ones, if
+it doesn't.
+
+### Not yet verified
+
+- **No device has run it.** The NDK cross-compile itself was not run while writing it (no NDK
+  was available); the first `assembleDebug` is that check. The code uses only POSIX/bionic
+  APIs available at API 24.
+- GPU speed versus Termux on the same phone, and whether every GPU path (OpenCL, WebGPU/Vulkan)
+  loads from an app-spawned process the way it does from Termux.
 
 ---
 
