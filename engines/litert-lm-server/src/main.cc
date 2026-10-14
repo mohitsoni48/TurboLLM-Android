@@ -343,6 +343,25 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   }
 
   if (g_engine.engine && g_engine.key == key) return g_engine.engine;
+  // A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end
+  // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates from that offset unchecked,
+  // and the std::bad_alloc a bogus one raises crosses the C API into std::terminate, killing the whole server, so the
+  // offset is bounded here first. Checked before the loaded engine is released, which a bad file then leaves in place.
+  // A file that can't be read or lacks the magic is left to the runtime, which reports it cleanly and more precisely
+  // (e.g. "Permission denied").
+  {
+    struct stat st {};
+    unsigned char h[32] = {};
+    std::ifstream in(ref.path, std::ios::binary);
+    bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
+              std::memcmp(h, "LITERTLM", 8) == 0;
+    uint64_t header_end = 0;
+    for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
+    if (ok && (header_end <= 32 || header_end > static_cast<uint64_t>(st.st_size))) {
+      throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
+                               ": invalid .litertlm header')");
+    }
+  }
   if (g_engine.engine) {
     Log("Re-initializing engine (model: " + ref.id + ", backend: " + key.backend + ")");
     ReleaseEngine();
