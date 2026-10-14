@@ -190,6 +190,7 @@ class EngineService : Service() {
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
             conn.connectTimeout = 1000
             conn.readTimeout = 5000
             conn.outputStream.use { it.write("{}".toByteArray()) }
@@ -235,6 +236,7 @@ class EngineService : Service() {
     /** True while a chat, Code run, routine or API generation is in flight. Any failure (daemon still booting) = idle. */
     private fun queryBusy(): Boolean = try {
         val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/activity").openConnection() as HttpURLConnection
+        conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
         try {

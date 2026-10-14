@@ -137,6 +137,7 @@ class StorageAccess(private val activity: Activity) {
         runCatching {
             val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/models/rescan").openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
+            conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
             conn.connectTimeout = 2000
             conn.readTimeout = 5000
             conn.responseCode

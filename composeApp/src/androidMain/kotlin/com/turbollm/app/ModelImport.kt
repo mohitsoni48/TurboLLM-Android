@@ -227,6 +227,7 @@ object ModelImport {
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
             conn.connectTimeout = 2000
             conn.readTimeout = 10_000
             conn.outputStream.use { it.write(JSONObject().put("dir", dir.absolutePath).toString().toByteArray()) }

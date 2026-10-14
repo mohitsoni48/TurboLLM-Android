@@ -6,9 +6,11 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -43,6 +45,7 @@ import com.airbnb.lottie.compose.LottieConstants
 import com.airbnb.lottie.compose.animateLottieCompositionAsState
 import com.airbnb.lottie.compose.rememberLottieComposition
 import kotlinx.coroutines.delay
+import java.io.ByteArrayInputStream
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
@@ -186,7 +189,7 @@ fun DaemonWebViewScreen() {
 
     LaunchedEffect(Unit) {
         while (!ready) {
-            ready = client.isDaemonReachable(ANDROID_DAEMON_PORT)
+            ready = client.isDaemonReachable(ANDROID_DAEMON_PORT, DAEMON_APP_SECRET)
             if (!ready) delay(500)
         }
     }
@@ -323,14 +326,36 @@ private fun TurboLLMWebView() {
                             return true // never let the WebView try to load this scheme
                         }
                         // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
-                        // replacing the app's UI inside its own WebView, where Back would be the only way out.
-                        val external = (url.scheme == "http" || url.scheme == "https") &&
-                            url.host != "127.0.0.1" && url.host != "localhost"
+                        // replacing the app's UI inside its own WebView, where Back would be the only way out. So does
+                        // localhost on any port but the daemon's: that is some other app's server, not ours.
+                        val external = (url.scheme == "http" || url.scheme == "https") && url.host != "127.0.0.1" &&
+                            !(url.host == "localhost" && url.port == ANDROID_DAEMON_PORT)
                         if (request.isForMainFrame && external) {
                             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
                             return true
                         }
+                        // Another 127.0.0.1 port would be sent the app-secret cookie (see shouldInterceptRequest
+                        // below). Unlike that callback, this one runs again for each redirect hop of a main-frame
+                        // navigation, so a link that 302s to 127.0.0.1:<other port> is stopped here, before that
+                        // request (and the cookie) goes out.
+                        if (url.host == "127.0.0.1" && url.port != ANDROID_DAEMON_PORT) return true
                         return false
+                    }
+
+                    // The app-secret cookie (below) is scoped to 127.0.0.1, and cookies ignore ports: anything on the
+                    // page pointing at another loopback port (an image in a model card or a reply, a link) would hand
+                    // it to whichever app listens there. Nothing the UI needs is on another port, so a request that
+                    // starts there is refused here. This only sees a request's FIRST URL, not its redirect hops: an
+                    // https image that 302s to 127.0.0.1:<other port> gets past it. Those hops are covered elsewhere:
+                    // for images and media by the daemon's CSP on the UI's HTML (APP_SECRET_CSP, daemon server.ts),
+                    // which is checked on every redirect; for main-frame navigations by shouldOverrideUrlLoading above.
+                    // Runs on a WebView thread, so it touches nothing but the request.
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val url = request.url
+                        if (url.host != "127.0.0.1" || url.port == ANDROID_DAEMON_PORT) return null
+                        return WebResourceResponse(
+                            "text/plain", "utf-8", 403, "Forbidden", emptyMap(), ByteArrayInputStream(ByteArray(0)),
+                        )
                     }
 
                     override fun onPageFinished(view: WebView, url: String?) {
@@ -362,6 +387,14 @@ private fun TurboLLMWebView() {
                             false
                         }
                     }
+                }
+                // The daemon trusts only loopback requests that carry the app secret (DAEMON_APP_SECRET); this cookie is
+                // how every request the page makes carries it, WebSocket handshakes included. HttpOnly: page scripts
+                // (a chat artifact included) cannot read it. Set before the first load, every launch, since the secret
+                // changes with each process.
+                CookieManager.getInstance().apply {
+                    setCookie(DAEMON_URL, "turbollm_app=$DAEMON_APP_SECRET; Path=/; HttpOnly; SameSite=Strict")
+                    flush()
                 }
                 loadUrl(DAEMON_URL)
                 webViewRef = this

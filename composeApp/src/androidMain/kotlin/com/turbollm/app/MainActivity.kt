@@ -17,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
@@ -27,6 +28,14 @@ private const val TAG = "TurboLLM"
  *  testing and the app alike; used both for the --port flag the daemon is launched with
  *  (below) and for the WebView's own URL (DaemonWebView.kt). */
 const val ANDROID_DAEMON_PORT = 7000
+
+/** Every app on the phone shares 127.0.0.1, and the daemon trusts loopback callers, so any installed app could use
+ *  its whole API. The daemon is started with this random secret (TURBOLLM_APP_SECRET, see the daemon's auth.ts) and
+ *  then trusts only loopback requests carrying it: the WebView as the `turbollm_app` cookie (DaemonWebView.kt), native
+ *  calls as the X-TurboLLM-App header. One per process, like Node itself (nodeStarted below), so every component in
+ *  this process holds the value the running daemon was given. */
+val DAEMON_APP_SECRET: String = ByteArray(32).also { SecureRandom().nextBytes(it) }
+    .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
 
 /** Node can start once per process: a second node::Start aborts it. The process outlives the activity (EngineService
  *  keeps it running after Back), so a flag on the activity instance let a reopened app start Node again and crash. */
@@ -97,6 +106,8 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
                             // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
+                            // Loopback callers must present it (DAEMON_APP_SECRET).
+                            "TURBOLLM_APP_SECRET" to DAEMON_APP_SECRET,
                         ) + gpuEnv() + socEnv(),
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
