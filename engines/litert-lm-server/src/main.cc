@@ -572,10 +572,12 @@ bool SendJson(int fd, const Request& req, int status, const json& j) {
 }
 
 // Python's send_error: the message is the status line's reason phrase. The body is an
-// OpenAI-style error object rather than Python's HTML page.
+// OpenAI-style error object rather than Python's HTML page. The message is often the runtime's own text, which need
+// not be UTF-8 (a bad model file's magic bytes), and this runs inside catch handlers, so dump must not throw.
 bool SendError(int fd, const Request& req, int status, const std::string& message) {
   json body = {{"error", {{"message", message}, {"type", status >= 500 ? "server_error" : "invalid_request_error"}, {"code", status}}}};
-  return SendResponse(fd, req, status, message, "application/json", body.dump() + "\n");
+  return SendResponse(fd, req, status, message, "application/json",
+                      body.dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
 }
 
 bool ReadRequest(int fd, Request& req) {
@@ -683,10 +685,9 @@ void StreamCallback(void* data, const LiteRtLmStreamChunk* chunk) {
     item.text = t ? t : "";
     item.final = L.litert_lm_stream_chunk_is_final(chunk);
   }
-  {
-    std::lock_guard<std::mutex> lock(q->mu);
-    q->items.push_back(std::move(item));
-  }
+  std::lock_guard<std::mutex> lock(q->mu);
+  q->items.push_back(std::move(item));
+  // Notify under the lock: once it is released the request thread may take the final chunk and free q.
   q->cv.notify_one();
 }
 
@@ -1112,7 +1113,8 @@ void HandleChatCompletions(int fd, const Request& req) {
     if (stream) {
       if (error) {
         // openai_common.OpenAIStreamFormatter.format_error
-        SendAll(fd, "event: response.error\ndata: " + json({{"error", "RuntimeError: " + *error}}).dump() + "\n\n");
+        SendAll(fd, "event: response.error\ndata: " +
+                        json({{"error", "RuntimeError: " + *error}}).dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
       } else {
         json last = make_chunk(json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}}));
         last["timings"] = timings;
