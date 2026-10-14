@@ -27,6 +27,7 @@ private const val CHANNEL_ID = "engine"
 private const val NOTIFICATION_ID = 1
 private const val ACTION_QUIT = "com.turbollm.app.QUIT"
 private const val ACTION_ACTIVITY_FINISHED = "com.turbollm.app.ACTIVITY_FINISHED"
+private const val ACTION_REPOST = "com.turbollm.app.REPOST"
 private const val POLL_MS = 3000L
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
@@ -49,6 +50,7 @@ class EngineService : Service() {
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
     @Volatile private var busy = false
     @Volatile private var importing = false
+    @Volatile private var downloading = false
     @Volatile private var thermal = 0
     /** Set when the app was closed with notifications off: stop as soon as nothing is generating (see onStartCommand). */
     @Volatile private var stopWhenIdle = false
@@ -97,6 +99,12 @@ class EngineService : Service() {
                 return START_NOT_STICKY
             }
             appClosed()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_REPOST) {
+            // Android 14+ lets the user swipe the engine notification away (setOngoing no longer prevents it), and its
+            // Quit with it, while appClosed() keeps counting on Quit being there. Put it straight back.
+            if (running) updateNotification() else stopSelf(startId)
             return START_NOT_STICKY
         }
         stopWhenIdle = false
@@ -172,8 +180,8 @@ class EngineService : Service() {
         Thread({
             // `busy` is the poll's view, up to 3 s old: a reply sent just before Back would not be in it yet. Ask the
             // daemon now, and again right before unloading, so a generation that has just started is never aborted.
-            val idle = !queryBusy() && !ModelImport.isRunning()
-            if (idle) unloadModel { stopWhenIdle && !queryBusy() && !ModelImport.isRunning() }
+            val idle = !queryBusy() && !queryDownloading() && !ModelImport.isRunning()
+            if (idle) unloadModel { stopWhenIdle && !queryBusy() && !queryDownloading() && !ModelImport.isRunning() }
             ContextCompat.getMainExecutor(this).execute {
                 stopping.set(false)
                 // onDestroy releases the wake lock and clears `running` once the stop takes effect.
@@ -208,11 +216,17 @@ class EngineService : Service() {
                 this.importing = importing
                 updateNotification()
             }
-            val nowBusy = queryBusy() || importing
+            // So does a model download (Discover): a stopped service or a sleeping CPU would stall a multi-GB transfer.
+            val downloading = queryDownloading()
+            val nowBusy = queryBusy() || importing || downloading
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
             synchronized(stateLock) {
                 if (!running) return
+                if (downloading != this.downloading) {
+                    this.downloading = downloading
+                    updateNotification()
+                }
                 if (nowBusy != busy) {
                     busy = nowBusy
                     if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
@@ -255,6 +269,30 @@ class EngineService : Service() {
         false
     }
 
+    /** True while the daemon has a model download running or queued (GET /api/v1/downloads). Any failure = idle, as
+     *  above; a paused or failed download does not count, as nothing is transferring. */
+    private fun queryDownloading(): Boolean = try {
+        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/downloads").openConnection() as HttpURLConnection
+        conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
+        conn.connectTimeout = 1000
+        conn.readTimeout = 2000
+        try {
+            if (conn.responseCode != 200) {
+                false
+            } else {
+                val list = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optJSONArray("downloads")
+                (0 until (list?.length() ?: 0)).any {
+                    val status = list?.optJSONObject(it)?.optString("status")
+                    status == "downloading" || status == "queued"
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    } catch (_: Exception) {
+        false
+    }
+
     private fun releaseWakeLock() {
         wakeLock?.let { if (it.isHeld) it.release() }
     }
@@ -274,9 +312,15 @@ class EngineService : Service() {
             Intent(this, EngineService::class.java).setAction(ACTION_QUIT),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val repost = PendingIntent.getService(
+            this, 2,
+            Intent(this, EngineService::class.java).setAction(ACTION_REPOST),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         val hot = thermal >= PowerManager.THERMAL_STATUS_SEVERE
         val text = when {
             importing -> "Importing models"
+            downloading -> "Downloading models"
             hot && busy -> "Generating. The phone is hot, so it is throttling speed"
             hot -> "Running. The phone is hot, so generation will be slower"
             busy -> "Generating"
@@ -292,6 +336,7 @@ class EngineService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(open)
+            .setDeleteIntent(repost)
             .addAction(0, "Quit", quit)
             .build()
     }
