@@ -17,15 +17,16 @@
 // bundled (turbollm/tsup.android.config.ts, ~6 MB) and staged here.
 //
 // Layout produced (mirrors what Node expects once extracted to filesDir/daemon):
-//   daemon/package.json                     {"type":"module"} — without it Node reads the
-//                                           ESM bundle as CommonJS and dies on `import`
+//   daemon/package.json                     {"type":"module","version":…} — without the type
+//                                           Node reads the ESM bundle as CommonJS and dies on
+//                                           `import`; the version is what the daemon reports
 //   daemon/dist/…                           the bundle + android-preload.cjs + webdist/
 //   daemon/node_modules/sql.js/…            NOT bundled on purpose: sql.js resolves its own
 //                                           .wasm relative to its package dir at runtime
 //
 // Usage: node scripts/stage-daemon-assets.mjs [path-to-turbollm-checkout]
 import { execSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -97,8 +98,15 @@ if (!existsSync(wsSrc)) {
 cpSync(wsSrc, join(assets, 'node_modules', 'ws'), { recursive: true })
 
 // The daemon bundle is ESM. Node decides that by walking up for the nearest package.json,
-// and once extracted to filesDir there is no other one above it.
-writeFileSync(join(assets, 'package.json'), '{"type":"module"}\n')
+// and once extracted to filesDir there is no other one above it. It is also where the daemon
+// reads its own version (cli.ts: `<dir of cli.js>/../package.json`) — without one it fell back
+// to '0.1.1' in the UI, telemetry, Turbo Link hello and the update check on every Android install.
+const { version } = JSON.parse(readFileSync(join(turbollm, 'package.json'), 'utf8'))
+if (typeof version !== 'string' || !version) {
+  console.error(`FATAL: no version in ${join(turbollm, 'package.json')}`)
+  process.exit(1)
+}
+writeFileSync(join(assets, 'package.json'), `${JSON.stringify({ type: 'module', version })}\n`)
 
 function du(dir) {
   let total = 0
