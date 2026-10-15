@@ -44,7 +44,9 @@ import com.airbnb.lottie.compose.LottieCompositionSpec
 import com.airbnb.lottie.compose.LottieConstants
 import com.airbnb.lottie.compose.animateLottieCompositionAsState
 import com.airbnb.lottie.compose.rememberLottieComposition
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
@@ -185,11 +187,12 @@ private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
 @Composable
 fun DaemonWebViewScreen() {
     var ready by remember { mutableStateOf(false) }
-    val client = remember { DaemonClient() }
 
+    // Up AND ours: the WebView below gets the app-secret cookie the moment it is created, so it waits until the
+    // daemon has proved it holds the port (DaemonAuth), not merely until something answers there.
     LaunchedEffect(Unit) {
         while (!ready) {
-            ready = client.isDaemonReachable(ANDROID_DAEMON_PORT, DAEMON_APP_SECRET)
+            ready = withContext(Dispatchers.IO) { DaemonAuth.daemonProven() }
             if (!ready) delay(500)
         }
     }
@@ -391,7 +394,8 @@ private fun TurboLLMWebView() {
                 // The daemon trusts only loopback requests that carry the app secret (DAEMON_APP_SECRET); this cookie is
                 // how every request the page makes carries it, WebSocket handshakes included. HttpOnly: page scripts
                 // (a chat artifact included) cannot read it. Set before the first load, every launch, since the secret
-                // changes with each process.
+                // changes with each process, and only once the daemon has proved it holds the port (DaemonWebViewScreen
+                // creates this WebView after DaemonAuth.daemonProven).
                 CookieManager.getInstance().apply {
                     setCookie(DAEMON_URL, "turbollm_app=$DAEMON_APP_SECRET; Path=/; HttpOnly; SameSite=Strict")
                     flush()

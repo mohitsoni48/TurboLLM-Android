@@ -32,8 +32,9 @@ const val ANDROID_DAEMON_PORT = 7000
 /** Every app on the phone shares 127.0.0.1, and the daemon trusts loopback callers, so any installed app could use
  *  its whole API. The daemon is started with this random secret (TURBOLLM_APP_SECRET, see the daemon's auth.ts) and
  *  then trusts only loopback requests carrying it: the WebView as the `turbollm_app` cookie (DaemonWebView.kt), native
- *  calls as the X-TurboLLM-App header. One per process, like Node itself (nodeStarted below), so every component in
- *  this process holds the value the running daemon was given. */
+ *  calls as the X-TurboLLM-App header. Neither is sent before the daemon proves it holds the port (DaemonAuth.kt). One
+ *  per process, like Node itself (nodeStarted below), so every component in this process holds the value the running
+ *  daemon was given. */
 val DAEMON_APP_SECRET: String = ByteArray(32).also { SecureRandom().nextBytes(it) }
     .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
 

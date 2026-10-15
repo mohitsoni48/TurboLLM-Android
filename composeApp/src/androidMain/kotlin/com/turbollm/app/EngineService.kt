@@ -19,8 +19,6 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
-import java.net.HttpURLConnection
-import java.net.URL
 
 private const val TAG = "TurboLLM"
 private const val CHANNEL_ID = "engine"
@@ -194,11 +192,10 @@ class EngineService : Service() {
     private fun unloadModel(stillWanted: () -> Boolean) {
         runCatching {
             if (!stillWanted()) return
-            val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/engine/stop").openConnection() as HttpURLConnection
+            val conn = DaemonAuth.open("/api/v1/engine/stop")
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
             conn.connectTimeout = 1000
             conn.readTimeout = 5000
             conn.outputStream.use { it.write("{}".toByteArray()) }
@@ -249,8 +246,7 @@ class EngineService : Service() {
 
     /** True while a chat, Code run, routine or API generation is in flight. Any failure (daemon still booting) = idle. */
     private fun queryBusy(): Boolean = try {
-        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/activity").openConnection() as HttpURLConnection
-        conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
+        val conn = DaemonAuth.open("/api/v1/activity")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
         try {
@@ -272,8 +268,7 @@ class EngineService : Service() {
     /** True while the daemon has a model download running or queued (GET /api/v1/downloads). Any failure = idle, as
      *  above; a paused or failed download does not count, as nothing is transferring. */
     private fun queryDownloading(): Boolean = try {
-        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/downloads").openConnection() as HttpURLConnection
-        conn.setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
+        val conn = DaemonAuth.open("/api/v1/downloads")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
         try {

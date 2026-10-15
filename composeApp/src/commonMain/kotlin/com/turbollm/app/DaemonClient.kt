@@ -5,9 +5,6 @@ import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
-import io.ktor.client.request.header
-import io.ktor.client.statement.HttpResponse
-import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -42,22 +39,5 @@ class DaemonClient {
             client.get("http://127.0.0.1:6996/").body()
         } catch (e: Exception) {
             null
-        }
-
-    /** Plain reachability check against the REAL daemon's own status endpoint — deliberately
-     *  ignores the response body/shape (unlike `status()`, which expects Spike A's toy JSON
-     *  shape at `/`) since all this needs to know is "has the HTTP server come up yet," to
-     *  gate showing the WebView pointed at the daemon's real web UI. `port` is caller-supplied
-     *  (not hardcoded like `status()` above) since Android runs the daemon on its own port —
-     *  see ANDROID_DAEMON_PORT. `appSecret` is the loopback credential the daemon was started with (Android's
-     *  DAEMON_APP_SECRET): without it the daemon answers 401 and the app would wait here forever. */
-    suspend fun isDaemonReachable(port: Int, appSecret: String): Boolean =
-        try {
-            val response: HttpResponse = client.get("http://127.0.0.1:$port/api/v1/status") {
-                header("X-TurboLLM-App", appSecret)
-            }
-            response.status.isSuccess()
-        } catch (e: Exception) {
-            false
         }
 }
