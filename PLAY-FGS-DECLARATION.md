@@ -38,19 +38,21 @@ during generation.
 > The service keeps that local server and the loaded model available while the user is in another app. Without it,
 > Android freezes the app as soon as it leaves the screen: a reply being written stops mid-sentence and is lost, and
 > the model is reclaimed, so the next message waits for it to load again. Replies on a phone take from seconds to
-> minutes, and users switch apps while they wait. The service also keeps a model import (a multi-GB file copy) from
-> being frozen halfway.
+> minutes, and users switch apps while they wait. The service also keeps a model import (a multi-GB file copy) or an
+> in-app model download from being frozen halfway.
 
 **What does the user see, and how do they stop it?**
 
 > From the moment the app is opened, a low-importance ongoing notification titled "TurboLLM", with a **Quit** action
-> that stops the service, unloads the model and closes the app. Its text says what is happening: "Running in the
-> background" while idle, "Generating" while a reply is being written, "Importing models" during an import, and,
-> when the phone is thermally throttled, "Running. The phone is hot, so generation will be slower" or "Generating.
-> The phone is hot, so it is throttling speed". If the user has turned notifications off, so Quit cannot be reached,
-> leaving the app (Back, or swiping it away from Recents) unloads the model and stops the service as soon as nothing
-> is generating or importing. A partial wake lock is held only while a reply is being generated or a model imported,
-> never while idle.
+> that stops the service, unloads the model and closes the app. On Android 14 and later, where the user can swipe
+> this notification away, it is posted again at once, so Quit stays reachable. Its text says what is happening:
+> "Running in the background" while idle, "Generating" while a reply is being written, "Importing models" during an
+> import, "Downloading models" while a model download is running or queued, and, when the phone is thermally
+> throttled, "Running. The phone is hot, so generation will be slower" or "Generating. The phone is hot, so it is
+> throttling speed". If the user has turned notifications off, so Quit cannot be reached, leaving the app (Back, or
+> swiping it away from Recents) unloads the model and stops the service as soon as nothing is generating, importing or
+> downloading; a paused or failed download does not keep it running. A partial wake lock is held only while a reply
+> is being generated or a model imported or downloaded, never while idle.
 
 **Why does no other foreground service type fit?**
 
