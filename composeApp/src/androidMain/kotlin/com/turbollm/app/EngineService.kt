@@ -39,9 +39,10 @@ private const val POLL_MS = 3000L
  *  Type `specialUse` (Android 14+): a local inference server fits none of the fixed types, and
  *  `dataSync` would be wrong and is capped at 6 hours on Android 15.
  *
- *  It also holds a partial wake lock, but only while something is generating, so a long reply
- *  finishes with the screen off without keeping the CPU awake while idle. "Generating" comes
- *  from the daemon's own /api/v1/activity (the gate the UI uses), polled over loopback. */
+ *  It also holds a partial wake lock, but only while there is work: a reply being generated (the
+ *  daemon's own /api/v1/activity, the gate the UI uses), a model download (/api/v1/downloads),
+ *  both polled over loopback, or a model import (ModelImport). So a long reply or a multi-GB
+ *  transfer finishes with the screen off without keeping the CPU awake while idle. */
 class EngineService : Service() {
     @Volatile private var running = false
     private var wakeLock: PowerManager.WakeLock? = null
@@ -50,7 +51,8 @@ class EngineService : Service() {
     @Volatile private var importing = false
     @Volatile private var downloading = false
     @Volatile private var thermal = 0
-    /** Set when the app was closed with notifications off: stop as soon as nothing is generating (see onStartCommand). */
+    /** Set when the app was closed with notifications off: stop as soon as nothing is generating, importing or
+     *  downloading (see appClosed). */
     @Volatile private var stopWhenIdle = false
     /** The newest start request, so a stop only takes effect if no start arrived after it (stopSelfResult). Without
      *  this, Back then a quick reopen could stop the service under a pending startForegroundService, which Android
@@ -129,9 +131,9 @@ class EngineService : Service() {
         super.onDestroy()
     }
 
-    /** "Quit" in the notification: the only way to free a loaded model's memory short of force-stop, since the
-     *  service otherwise outlives the activity. Killing the process takes the engine children with it (Android kills
-     *  the app's whole process group). */
+    /** "Quit" in the notification: how the user frees a loaded model's memory without going back into the app, since
+     *  the service otherwise outlives the activity (with notifications off, appClosed does it instead). Killing the
+     *  process takes the engine children with it (Android kills the app's whole process group). */
     private fun quit() {
         Log.i(TAG, "quit from the notification")
         synchronized(stateLock) {
@@ -151,7 +153,8 @@ class EngineService : Service() {
 
     /** The user left the app (Back, or swiped from Recents). With the notification visible, its Quit is how they free
      *  the model, so the service stays. Without it there is nothing to reach, so the service unloads the model and
-     *  stops once nothing is generating, and the process becomes an ordinary closed app Android can reclaim. */
+     *  stops once nothing is generating, importing or downloading, and the process becomes an ordinary closed app
+     *  Android can reclaim. */
     private fun appClosed() {
         if (quitReachable()) return
         stopWhenIdle = true
@@ -229,7 +232,7 @@ class EngineService : Service() {
                     if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
                     updateNotification()
                 } else if (nowBusy) {
-                    wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for a generation that is still going
+                    wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for work that is still going
                 }
             }
             if (stopWhenIdle && !nowBusy) {
