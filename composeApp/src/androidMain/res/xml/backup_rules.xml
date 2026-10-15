@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 11 and older (fullBackupContent). Diagnostics logs are per-device and can be large; nothing to restore. -->
+<!-- Android 11 and older (fullBackupContent). Diagnostics logs are per-device and can be large; nothing to restore.
+     The chats and .turbollm/config.json are kept, tokens included: see data_extraction_rules.xml. -->
 <full-backup-content>
     <exclude domain="file" path="daemon.log" />
     <exclude domain="file" path="daemon.log.1" />

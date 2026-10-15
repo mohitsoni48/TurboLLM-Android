@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 12+ (dataExtractionRules): the same exclusions as backup_rules.xml, for cloud backup and device transfer. -->
+<!-- Android 12+ (dataExtractionRules): the same exclusions as backup_rules.xml, for cloud backup and device transfer.
+     What is kept includes the chats and the daemon's settings file .turbollm/config.json, which also holds the
+     third-party tokens the user entered (Hugging Face, GitHub, tunnel, search, MCP, Turbo Link peers) in plaintext.
+     That is deliberate for now: see play-store-assets/privacy-notes.md ("Backups"). -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="daemon.log" />

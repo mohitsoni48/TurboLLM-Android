@@ -72,16 +72,20 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
 `~/.turbollm`-equivalent state (chats, config, downloaded models/engines) lands entirely inside
 Android's app-private storage — not shared storage, not readable by other apps.
 
-**One open item, not yet resolved in code — flag for the dev team before shipping:**
-`AndroidManifest.xml` has `android:allowBackup="true"` with no `dataExtractionRules`/
-`fullBackupContent` exclusion file present. That means Android's own Auto Backup (to the user's
-Google account, not to any TurboLLM server) could sweep up the app's private files — including
-local chat history — into the user's device backup by default. This is a very different privacy
-surface than "nothing ever leaves the device" (it's the user's own Google backup, not a third
-party TurboLLM controls, but it's still data leaving the device to *somewhere*). Recommend either
-(a) adding a backup-rules XML that excludes the daemon's data directory, or (b) disclosing it
-plainly if the team decides the Google-account-only exposure is acceptable. Not fixed here — out
-of scope for asset prep — but should not be silently left unaddressed.
+**Backups — one open decision for the dev team before shipping:**
+`AndroidManifest.xml` has `android:allowBackup="true"` with backup rules
+(`res/xml/data_extraction_rules.xml` for Android 12+, `res/xml/backup_rules.xml` before). They keep
+models, caches, logs and the extracted daemon out, so Android's own Auto Backup (to the user's
+Google account, not to any TurboLLM server; end-to-end encrypted with the lock-screen credential
+on Android 9+ when the phone has one) and device-to-device transfer carry the rest of the app's private files:
+the chat history and the daemon's settings file, `files/.turbollm/config.json`. That file also
+holds, in plaintext, every third-party credential the user has entered: the Hugging Face and
+GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi search keys,
+MCP server keys and env, and the raw Turbo Link peer tokens that grant access to the user's
+other TurboLLM machines. (API keys the daemon issues are stored hashed.) None of these are needed
+to restore chats. Either disclose it plainly, or keep the credentials out of backups: moving them
+to a separate file the rules exclude takes a daemon change and a config migration; excluding
+`config.json` itself would also drop every setting on restore.
 
 ## Suggested Play Console "Data safety" form answers
 
