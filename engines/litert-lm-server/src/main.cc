@@ -44,6 +44,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <climits>
@@ -344,9 +345,12 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
 
   if (g_engine.engine && g_engine.key == key) return g_engine.engine;
   // A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end
-  // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates from that offset unchecked,
-  // and the std::bad_alloc a bogus one raises crosses the C API into std::terminate, killing the whole server, so the
-  // offset is bounded here first. Checked before the loaded engine is released, which a bad file then leaves in place.
+  // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32
+  // bytes before reading the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate,
+  // killing the whole server, so the offset is bounded here first. The bound is the runtime's own: it reads the header
+  // from the file's first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger
+  // offset can never load, yet would still cost an allocation up to the file's size (hundreds of MB on a phone).
+  // Checked before the loaded engine is released, which a bad file then leaves in place.
   // A file that can't be read or lacks the magic is left to the runtime, which reports it cleanly and more precisely
   // (e.g. "Permission denied").
   {
@@ -357,7 +361,8 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
               std::memcmp(h, "LITERTLM", 8) == 0;
     uint64_t header_end = 0;
     for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
-    if (ok && (header_end <= 32 || header_end > static_cast<uint64_t>(st.st_size))) {
+    constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
+    if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
       throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
                                ": invalid .litertlm header')");
     }
@@ -660,6 +665,8 @@ struct StreamQueue {
 // StreamCallback from its own thread with a pointer to the queue, so a request that leaves early (an exception while
 // tokens are still arriving: a malformed tool call, a JSON error) must not free the queue under it. On such an exit
 // this cancels the generation and waits for the final chunk; if none comes in 30 s the server exits (see below).
+// A chunk marked final is not always the last callback (an unparsable tool call is one), so HandleChatCompletions also
+// declares the queue before the conversation, whose deletion waits for the generation to end.
 class StreamGuard {
  public:
   StreamGuard(std::unique_ptr<StreamQueue>& q, LiteRtLmConversation* conv) : q_(q), conv_(conv) {}
@@ -1002,6 +1009,11 @@ void HandleChatCompletions(int fd, const Request& req) {
       L.litert_lm_conversation_config_set_thinking_config(cc, t);
       L.litert_lm_thinking_config_delete(t);
     }
+    // Declared before the conversation so it is freed after it: deleting the conversation waits for its generation to
+    // end (~SessionAdvanced's WaitUntilDone), and until then the runtime may call StreamCallback with this queue, even
+    // after a chunk marked final (see the error branch of the drain loop below).
+    auto q_owner = std::make_unique<StreamQueue>();
+    StreamQueue& q = *q_owner;
     L.litert_lm_clear_last_error();
     std::unique_ptr<LiteRtLmConversation, ConvDeleter> conv(L.litert_lm_conversation_create(engine, cc));
     L.litert_lm_conversation_config_delete(cc);
@@ -1023,8 +1035,6 @@ void HandleChatCompletions(int fd, const Request& req) {
       return p;
     };
 
-    auto q_owner = std::make_unique<StreamQueue>();
-    StreamQueue& q = *q_owner;
     std::string msg_str = prompt.dump();
     L.litert_lm_clear_last_error();
     int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), "{}", oa, StreamCallback, &q);
@@ -1084,9 +1094,19 @@ void HandleChatCompletions(int fd, const Request& req) {
       if (item.final) guard.Finished();
       watch_peer();
       if (item.is_error) {
-        if (item.text.find("CANCELLED") != std::string::npos) {
+        // Not necessarily the end of the generation: the runtime reports a tool call it cannot parse as soon as the
+        // call's closing tag streams in, marked final, and keeps decoding. Stop it whatever the error is (a no-op once
+        // the generation has ended), so deleting the conversation below does not wait for the rest of the turn while
+        // this request holds the engine.
+        if (!cancelled) {
+          cancelled = true;
+          L.litert_lm_conversation_cancel_process(conv.get());
+        }
+        // The text is absl::Status::ToString(), code first. Match from the start: a parse error quotes the model's
+        // output, which may contain these words.
+        if (item.text.rfind("CANCELLED:", 0) == 0) {
           // a cancelled turn ends quietly, as in the Python client
-        } else if (item.text.find("Max number of tokens reached") != std::string::npos) {
+        } else if (item.text.rfind("RESOURCE_EXHAUSTED: Max number of tokens reached", 0) == 0) {
           finish = "length";
         } else {
           error = item.text;
