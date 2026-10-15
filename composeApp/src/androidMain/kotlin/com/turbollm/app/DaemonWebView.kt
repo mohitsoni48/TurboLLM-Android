@@ -328,6 +328,15 @@ private fun TurboLLMWebView() {
                             }
                             return true // never let the WebView try to load this scheme
                         }
+                        // The daemon under the name localhost (a link in a reply or a docs snippet): opened as is, it is a
+                        // host the app-secret cookie (scoped to 127.0.0.1) never reaches, so the page asked for an API key.
+                        // Load the same page from 127.0.0.1 instead; it stays in the app, like any other daemon link.
+                        if (request.isForMainFrame && url.scheme == "http" && url.host == "localhost" &&
+                            url.port == ANDROID_DAEMON_PORT
+                        ) {
+                            view.loadUrl(url.buildUpon().encodedAuthority("127.0.0.1:$ANDROID_DAEMON_PORT").build().toString())
+                            return true
+                        }
                         // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
                         // replacing the app's UI inside its own WebView, where Back would be the only way out. So does
                         // localhost on any port but the daemon's: that is some other app's server, not ours.
