@@ -144,7 +144,9 @@ line per engine to `files/daemon.log`. Only that launch registers them: later bo
 whose path or version changed and nothing for the others, and `daemon.log` is truncated each
 time Node starts. So on a phone that already had the app, an empty grep does not mean the
 engines are missing. To query the API itself, create a key in the app (Customize → Connect →
-API keys) and send it as `X-TurboLLM-Auth: <key>`.
+API keys) and send it as `X-TurboLLM-Auth: <key>`. Only a debug build lets an adb host skip the
+key: its WebView accepts Chrome DevTools over adb, and script run there acts as the app. Release
+builds turn WebView debugging off.
 
 ---
 

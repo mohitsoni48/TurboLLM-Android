@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Build
 import android.webkit.CookieManager
@@ -313,7 +314,14 @@ private fun TurboLLMWebView() {
         // (adjustResize no longer resizes an edge-to-edge window), so the web UI needs no insets of its own.
         modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
         factory = { context ->
-            WebView.setWebContentsDebuggingEnabled(true)
+            // Debuggable builds only. DevTools attached over adb runs script in the daemon's origin, where every
+            // request carries the HttpOnly app-secret cookie, and can read that cookie too: the whole keyless API,
+            // creating an API key included, which a release build must not give an adb host (BUILDING-ENGINES.md).
+            // Other apps were never let in (the devtools socket admits only the shell, root and this app). QA over
+            // CDP (QA_BUGS.md) uses a debug build; -PturbollmApplicationIdSuffix installs one next to the Play app.
+            WebView.setWebContentsDebuggingEnabled(
+                (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+            )
             // QA_BUGS.md BUG-13: by default the Android System WebView renders as a single
             // opaque NAF="true" node in the accessibility tree — invisible to TalkBack and
             // to UI-Automator/Maestro element selectors. Chrome's accessibility bridge for
