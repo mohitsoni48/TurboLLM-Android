@@ -3,6 +3,7 @@ package com.turbollm.app
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.Proxy
 import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -29,7 +30,13 @@ import javax.crypto.spec.SecretKeySpec
  *  our daemon, on another new connection, proved it held the port. It reaches another app only if the daemon gave the
  *  port up in between, i.e. a LAN-toggle rebind; an app that is still on the port when the daemon binds again makes
  *  the daemon exit (cli.ts), so what is left is an app that binds and lets go inside that gap of a few ms, just as a
- *  request is made. */
+ *  request is made.
+ *
+ *  Both connections also go straight to the port, never through the system HTTP proxy (Proxy.NO_PROXY). Android
+ *  exempts 127.0.0.1 from that proxy only when the proxy's bypass list is not empty, and it often is empty: a Wi-Fi
+ *  proxy's "Bypass proxy for" starts empty, and so does the list of the proxy a VPN app sets with
+ *  VpnService.Builder.setHttpProxy. A proxy app on the phone would then carry both connections: it could pass the
+ *  nonce on to our daemon, which proves itself, and read the request that follows, secret and all. */
 object DaemonAuth {
     private const val BASE = "http://127.0.0.1:$ANDROID_DAEMON_PORT"
     private val random = SecureRandom()
@@ -39,7 +46,8 @@ object DaemonAuth {
      *  the main thread. False on any failure, a daemon still starting included. */
     fun daemonProven(): Boolean = try {
         val nonce = hex(ByteArray(32).also { random.nextBytes(it) })
-        val conn = URL("$BASE/api/v1/app-proof?nonce=$nonce").openConnection() as HttpURLConnection
+        // Proxy.NO_PROXY: to the port itself, not to a proxy that could relay the nonce (class comment).
+        val conn = URL("$BASE/api/v1/app-proof?nonce=$nonce").openConnection(Proxy.NO_PROXY) as HttpURLConnection
         conn.instanceFollowRedirects = false // the answer must come from this port, not from wherever it points
         conn.setRequestProperty("Connection", "close") // a new socket, not left in the pool for open() (class comment)
         conn.connectTimeout = 1000
@@ -64,7 +72,8 @@ object DaemonAuth {
      *  which every caller already handles as an unreachable daemon. Callers must not override its Connection header. */
     fun open(path: String): HttpURLConnection {
         if (!daemonProven()) throw IOException("no proof from port $ANDROID_DAEMON_PORT that it is our daemon; secret withheld")
-        return (URL("$BASE$path").openConnection() as HttpURLConnection).apply {
+        // Proxy.NO_PROXY: the secret goes to the port itself, never through a proxy (class comment).
+        return (URL("$BASE$path").openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
             // Its own new socket, and none left in the pool for the next proof or request to pick up (class comment).
             setRequestProperty("Connection", "close")
             setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
