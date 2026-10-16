@@ -1146,8 +1146,13 @@ void HandleChatCompletions(int fd, const Request& req) {
     }
 
     json usage, timings;
-    UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
-    if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+    // Not after an error, whose reply carries neither: the generation may still be running then (the cancel above only
+    // asks it to stop), and the runtime copies the session's benchmark info under a lock its decode thread does not
+    // take while writing it.
+    if (!error) {
+      UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
+      if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+    }
 
     if (stream) {
       if (error) {
