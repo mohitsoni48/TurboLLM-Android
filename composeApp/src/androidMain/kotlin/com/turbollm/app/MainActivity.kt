@@ -132,6 +132,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Post the engine notification (and its Quit) again whenever the app comes on screen, the permission prompt
+        // closing and a return from Settings included. Android drops a post made without the permission for good and
+        // re-posts nothing on a grant, and the first post (startForeground, from onCreate) goes out before the user
+        // can answer the prompt.
+        EngineService.repostNotification(this)
         storageAccess.onResume()
         DaemonLog.rotateIfLarge(filesDir)
     }

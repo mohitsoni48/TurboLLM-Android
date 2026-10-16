@@ -51,8 +51,9 @@ during generation.
 > throttled, "Running. The phone is hot, so generation will be slower" or "Generating. The phone is hot, so it is
 > throttling speed". If the user has turned notifications off, so Quit cannot be reached, leaving the app (Back, or
 > swiping it away from Recents) unloads the model and stops the service as soon as nothing is generating, importing or
-> downloading; a paused or failed download does not keep it running. A partial wake lock is held only while a reply
-> is being generated or a model imported or downloaded, never while idle.
+> downloading; a paused or failed download does not keep it running. Turning the notification off after leaving the
+> app does the same. A partial wake lock is held only while a reply is being generated or a model imported or
+> downloaded, never while idle.
 
 **Why does no other foreground service type fit?**
 

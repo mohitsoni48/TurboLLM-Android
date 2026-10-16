@@ -54,6 +54,9 @@ class EngineService : Service() {
     /** Set when the app was closed with notifications off: stop as soon as nothing is generating, importing or
      *  downloading (see appClosed). */
     @Volatile private var stopWhenIdle = false
+    /** Set when the app was closed with Quit reachable, so the service stayed for it: the poll then keeps checking
+     *  that Quit can still be reached (see pollActivity). */
+    @Volatile private var closedWithQuit = false
     /** The newest start request, so a stop only takes effect if no start arrived after it (stopSelfResult). Without
      *  this, Back then a quick reopen could stop the service under a pending startForegroundService, which Android
      *  answers by crashing the app ("did not then call Service.startForeground()"). */
@@ -103,11 +106,13 @@ class EngineService : Service() {
         }
         if (intent?.action == ACTION_REPOST) {
             // Android 14+ lets the user swipe the engine notification away (setOngoing no longer prevents it), and its
-            // Quit with it, while appClosed() keeps counting on Quit being there. Put it straight back.
+            // Quit with it, while appClosed() keeps counting on Quit being there. Put it straight back. MainActivity
+            // sends this too whenever it comes on screen (repostNotification).
             if (running) updateNotification() else stopSelf(startId)
             return START_NOT_STICKY
         }
         stopWhenIdle = false
+        closedWithQuit = false
         ServiceCompat.startForeground(
             this, NOTIFICATION_ID, buildNotification(),
             if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
@@ -156,13 +161,23 @@ class EngineService : Service() {
      *  stops once nothing is generating, importing or downloading, and the process becomes an ordinary closed app
      *  Android can reclaim. */
     private fun appClosed() {
-        if (quitReachable()) return
+        // Post it again first. quitReachable() reads the settings, not the shade, and a post made while notifications
+        // were off is dropped for good: on Android 13+ startForeground posts before the user can answer the
+        // permission prompt, and a later grant (at that prompt, or in Settings with the process still alive) re-posts
+        // nothing. Without this, Back after such a grant left the service and the model running with no notification
+        // and no Quit. Posted now, the notification is up whenever the settings say it can be.
+        updateNotification()
+        if (quitReachable()) {
+            closedWithQuit = true
+            return
+        }
+        closedWithQuit = false
         stopWhenIdle = true
         if (!busy) stopNow()
     }
 
     /** Whether the notification, and its Quit, can be seen: notifications on for the app (Android 13+ asks) and the
-     *  Engine channel not turned off on its own. */
+     *  Engine channel not turned off on its own. It reads the settings, not the shade, so appClosed posts first. */
     private fun quitReachable(): Boolean {
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return false
         if (Build.VERSION.SDK_INT >= 26) {
@@ -234,6 +249,14 @@ class EngineService : Service() {
                 } else if (nowBusy) {
                     wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for work that is still going
                 }
+            }
+            // The service stayed for Quit when the app was closed, but the user can still turn the Engine channel off
+            // (long-press on the notification). That removes the notification without sending its delete intent, so
+            // nothing else notices: decide again, as appClosed would now (on the main thread, where onDestroy runs, so
+            // a destroyed service posts nothing). (Revoking the app's notification permission on Android 13+ kills
+            // the process, which frees the model anyway.)
+            if (closedWithQuit && !quitReachable()) {
+                ContextCompat.getMainExecutor(this).execute { if (running && closedWithQuit) appClosed() }
             }
             if (stopWhenIdle && !nowBusy) {
                 ContextCompat.getMainExecutor(this).execute { if (stopWhenIdle && !busy) stopNow() }
@@ -344,6 +367,15 @@ class EngineService : Service() {
         fun activityFinished(context: Context) {
             runCatching {
                 context.startService(Intent(context, EngineService::class.java).setAction(ACTION_ACTIVITY_FINISHED))
+            }.onFailure { Log.w(TAG, "could not reach the engine service", it) }
+        }
+
+        /** The app came on screen: post the notification again (ACTION_REPOST). One dropped while notifications were
+         *  off then shows as soon as the user allows them, at the first-launch prompt or in Settings, since Android
+         *  re-posts nothing on a grant and returning to the app (singleTask, no recreation) does not run start(). */
+        fun repostNotification(context: Context) {
+            runCatching {
+                context.startService(Intent(context, EngineService::class.java).setAction(ACTION_REPOST))
             }.onFailure { Log.w(TAG, "could not reach the engine service", it) }
         }
 
