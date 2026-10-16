@@ -1,12 +1,14 @@
 package com.turbollm.app
 
-import org.json.JSONObject
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.Proxy
 import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -41,9 +43,26 @@ object DaemonAuth {
     private const val BASE = "http://127.0.0.1:$ANDROID_DAEMON_PORT"
     private val random = SecureRandom()
 
+    // Until its answer checks out, the port's holder may be another app, and nothing it sends may stall or crash us.
+    // HttpURLConnection's timeouts are per read, so an answer trickled a byte at a time would keep the splash and the
+    // EngineService poll waiting as long as the sender liked: hence one deadline for the whole request. A huge or
+    // deeply nested body would run a plain read or a recursive JSON parser out of memory or stack, an Error: hence a
+    // cap on what is read, a regex rather than a parse, and catching Throwable. The daemon's answer,
+    // {"proof":"<64 hex>"}, is 76 bytes.
+    private const val PROOF_DEADLINE_MS = 3000L
+    private const val PROOF_MAX_BYTES = 4096
+    private val PROOF = Regex("\"proof\"\\s*:\\s*\"([0-9a-f]{64})\"")
+
+    /** Ends a proof request still running at PROOF_DEADLINE_MS: disconnect() from another thread closes its socket,
+     *  which ends the read it is blocked in. */
+    private val deadlines = ScheduledThreadPoolExecutor(1) { r ->
+        Thread(r, "DaemonAuth deadline").apply { isDaemon = true }
+    }.apply { removeOnCancelPolicy = true }
+
     /** True only when our daemon answered a fresh nonce while it held the port (another app may have passed the nonce
      *  on, see the class comment), so a new connection made right after reaches it. Blocking network I/O: never on
-     *  the main thread. False on any failure, a daemon still starting included. */
+     *  the main thread. False on any failure, a daemon still starting included, and within about PROOF_DEADLINE_MS
+     *  whatever the port's holder sends. */
     fun daemonProven(): Boolean = try {
         val nonce = hex(ByteArray(32).also { random.nextBytes(it) })
         // Proxy.NO_PROXY: to the port itself, not to a proxy that could relay the nonce (class comment).
@@ -52,9 +71,13 @@ object DaemonAuth {
         conn.setRequestProperty("Connection", "close") // a new socket, not left in the pool for open() (class comment)
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
+        val deadline = deadlines.schedule(Runnable { conn.disconnect() }, PROOF_DEADLINE_MS, TimeUnit.MILLISECONDS)
         try {
             conn.responseCode == 200 && run {
-                val proof = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optString("proof")
+                // Only the first PROOF_MAX_BYTES, and matched as text rather than parsed: nothing the port's holder
+                // sends can grow the heap or the stack (comment at PROOF_DEADLINE_MS).
+                val body = conn.inputStream.use { readAtMost(it, PROOF_MAX_BYTES) }
+                val proof = PROOF.find(body)?.groupValues?.get(1).orEmpty()
                 // The daemon's message (appSecretProof): the address and port it was asked on, then the nonce.
                 val mac = Mac.getInstance("HmacSHA256")
                 mac.init(SecretKeySpec(DAEMON_APP_SECRET.toByteArray(), "HmacSHA256"))
@@ -62,10 +85,11 @@ object DaemonAuth {
                 MessageDigest.isEqual(want.toByteArray(), proof.toByteArray()) // constant time
             }
         } finally {
+            deadline.cancel(false)
             conn.disconnect()
         }
-    } catch (_: Exception) {
-        false
+    } catch (_: Throwable) {
+        false // an Error too: no answer from the port may crash the app (comment at PROOF_DEADLINE_MS)
     }
 
     /** A connection to [path] on the daemon carrying the secret, opened only once [daemonProven]. Throws otherwise,
@@ -78,6 +102,18 @@ object DaemonAuth {
             setRequestProperty("Connection", "close")
             setRequestProperty("X-TurboLLM-App", DAEMON_APP_SECRET)
         }
+    }
+
+    /** Up to [max] bytes of [input] as text; whatever follows is never read. */
+    private fun readAtMost(input: InputStream, max: Int): String {
+        val buf = ByteArray(max)
+        var n = 0
+        while (n < max) {
+            val got = input.read(buf, n, max - n)
+            if (got < 0) break
+            n += got
+        }
+        return String(buf, 0, n, Charsets.UTF_8)
     }
 
     private fun hex(bytes: ByteArray) = bytes.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
