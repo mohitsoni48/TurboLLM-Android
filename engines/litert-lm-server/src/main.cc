@@ -1072,9 +1072,15 @@ void HandleChatCompletions(int fd, const Request& req) {
     auto next_peer_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     auto watch_peer = [&] {
       auto now = std::chrono::steady_clock::now();
-      if (cancelled || now < next_peer_check) return;
+      if (now < next_peer_check) return;
       next_peer_check = now + std::chrono::milliseconds(200);
-      if (PeerGone(fd)) {
+      if (client_gone) {
+        // Cancel again on every tick until the final chunk. A cancel flags only the tasks the runtime has already
+        // queued, and the decode task is queued, with a fresh flag, only once the prefill task has finished: a cancel
+        // landing in between is lost, and the turn would run to its end for nobody, holding the engine. Cancelling a
+        // turn that has ended is a no-op.
+        L.litert_lm_conversation_cancel_process(conv.get());
+      } else if (!cancelled && PeerGone(fd)) {
         client_gone = cancelled = true;
         L.litert_lm_conversation_cancel_process(conv.get());
       }
