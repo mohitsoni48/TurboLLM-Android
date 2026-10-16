@@ -23,7 +23,8 @@
 //   - `timings` (llama.cpp's field names) on the final response, taken from the runtime's own
 //     benchmark counters, so speed is measured rather than derived from time-to-first-token.
 //   - Thinking-channel text streamed as `reasoning_content` instead of being dropped.
-//   - "length" as the finish reason when the token budget runs out.
+//   - "length" as the finish reason when the reply is cut off: by max_completion_tokens, or by the
+//     context window when the model reference or the config sets its size (max_num_tokens).
 //   - A client that disconnects cancels its generation instead of letting it run on.
 //   - Requests are served concurrently; only inference itself is serialized (the engine is one
 //     shared resource, exactly as in the Python server, which serialized everything).
@@ -1109,6 +1110,8 @@ void HandleChatCompletions(int fd, const Request& req) {
         if (item.text.rfind("CANCELLED:", 0) == 0) {
           // a cancelled turn ends quietly, as in the Python client
         } else if (item.text.rfind("RESOURCE_EXHAUSTED: Max number of tokens reached", 0) == 0) {
+          // A full context window, from a runtime that reports it as an error. LiteRT-LM 0.18.0's C API never does
+          // (see the token-count check below).
           finish = "length";
         } else {
           error = item.text;
@@ -1154,6 +1157,14 @@ void HandleChatCompletions(int fd, const Request& req) {
     if (!error) {
       UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
       if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+      // A full context window ends the turn with an ordinary final chunk: the conversation API reports it as an error
+      // only with return_error_on_max_tokens_reached, which defaults to off and which LiteRT-LM 0.18.0's C API has no
+      // way to turn on. So it is told from the counts. The runtime stops once the KV cache holds max_num_tokens, and
+      // this request's conversation is new, so its cache holds just this prompt (earlier messages included) and the
+      // reply. Only a limit this server set is known: a bundle whose own cache is smaller caps the window lower, and
+      // a reply cut off there still reads "stop".
+      const int window = g_engine.key.max_num_tokens;
+      if (finish == "stop" && window > 0 && usage["total_tokens"].get<int>() >= window) finish = "length";
     }
 
     if (stream) {
