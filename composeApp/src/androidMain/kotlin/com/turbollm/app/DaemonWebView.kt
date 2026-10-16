@@ -54,6 +54,15 @@ private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 /** The daemon UI's origin, with the trailing slash so a look-alike host cannot match. */
 private val DAEMON_ORIGIN = DAEMON_URL
 
+/** Schemes the WebView loads itself: web pages, and what the UI's own frames use. Navigations to any other scheme are
+ *  never loaded (shouldOverrideUrlLoading); turbollm-app is handled before that check. */
+private val WEBVIEW_SCHEMES = setOf("http", "https", "about", "data", "blob", "javascript")
+
+/** Contact links handed to the app that handles them (tel only opens the dialer). The web UI's markdown and model-card
+ *  sanitizers allow mailto, xmpp, irc and ircs links, and GFM turns a bare e-mail address in a reply into a mailto
+ *  link. */
+private val HANDED_OFF_SCHEMES = setOf("mailto", "xmpp", "irc", "ircs", "tel")
+
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
  *  raw `vh`-family CSS length (`vh`/`dvh`/`svh`/`lvh`) to a literal 0px — not just on
@@ -344,6 +353,17 @@ private fun TurboLLMWebView() {
                             !(url.host == "localhost" && url.port == ANDROID_DAEMON_PORT)
                         if (request.isForMainFrame && external) {
                             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            return true
+                        }
+                        // A scheme the WebView cannot load: navigated to, it replaced the app's UI with an
+                        // ERR_UNKNOWN_URL_SCHEME page, and Back then reloaded the UI from scratch, losing its state. A
+                        // contact link (mailto: and the like) opens in the app that handles it, main frame only, like
+                        // the links above. Anything else (intent:, market:, file:, another app's deep link) does
+                        // nothing, since what the page shows (a reply, a model card) is not to be trusted to open apps.
+                        if (url.scheme !in WEBVIEW_SCHEMES) {
+                            if (request.isForMainFrame && url.scheme in HANDED_OFF_SCHEMES) {
+                                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            }
                             return true
                         }
                         // Another 127.0.0.1 port would be sent the app-secret cookie (see shouldInterceptRequest
