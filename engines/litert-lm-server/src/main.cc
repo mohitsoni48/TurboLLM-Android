@@ -506,6 +506,8 @@ struct Request {
 
 std::vector<std::string> g_cors_origins;
 
+// False once the connection is gone, or once the client has stopped reading: every accepted socket has a 30 s
+// SO_SNDTIMEO (see main), and a send() that times out with nothing sent fails with EAGAIN.
 bool SendAll(int fd, const std::string& data) {
   size_t off = 0;
   while (off < data.size()) {
@@ -1155,21 +1157,24 @@ void HandleChatCompletions(int fd, const Request& req) {
     }
 
     if (stream) {
+      // Stop at the first send that fails: to a client that has stopped reading, each further one would wait out the
+      // send timeout again while this request holds the engine.
+      bool ok;
       if (error) {
         // openai_common.OpenAIStreamFormatter.format_error
-        SendAll(fd, "event: response.error\ndata: " +
-                        json({{"error", "RuntimeError: " + *error}}).dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+        ok = SendAll(fd, "event: response.error\ndata: " +
+                             json({{"error", "RuntimeError: " + *error}}).dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
       } else {
         json last = make_chunk(json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}}));
         last["timings"] = timings;
-        SendAll(fd, Sse(last));
-        if (include_usage) {
+        ok = SendAll(fd, Sse(last));
+        if (ok && include_usage) {
           json u = make_chunk(json::array());
           u["usage"] = usage;
-          SendAll(fd, Sse(u));
+          ok = SendAll(fd, Sse(u));
         }
       }
-      SendAll(fd, "data: [DONE]\n\n");
+      if (ok) SendAll(fd, "data: [DONE]\n\n");
       return;
     }
 
@@ -1358,10 +1363,19 @@ int main(int argc, char** argv) {
     }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    // A client that connects and never sends a request must not hold a thread forever. Applies to reads only;
-    // a long generation's writes and the disconnect poll are unaffected.
+    // A client that connects and never sends a request must not hold a thread forever.
     timeval rcv_timeout{60, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+    // Nor may one that stops reading. Chat completion and /v1/models responses are written under g_engine_mu, so a
+    // send blocked on a full socket held the engine, and with it every later chat and /v1/models request, for as long
+    // as the client kept the connection open. Now a send() gives up after 30 s: with a partial count if it got some
+    // bytes out, which SendAll takes as progress, else with an error, which ends a stream like a disconnect and cancels
+    // its generation. A client that reads nothing is dropped within one to two minutes: each send that still gets a few
+    // bytes out waits its own 30 s, and the kernel can free a little room once more after the buffers first fill. One
+    // that reads is served however slowly, as long as it never leaves the buffers full for 30 s. The disconnect poll is
+    // unaffected.
+    timeval snd_timeout{30, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
     std::thread(HandleConnection, fd).detach();
   }
   Log("Shutting down server...");
