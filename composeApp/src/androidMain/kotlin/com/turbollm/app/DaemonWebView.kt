@@ -352,11 +352,17 @@ private fun TurboLLMWebView() {
                         }
                         // The daemon under the name localhost (a link in a reply or a docs snippet): opened as is, it is a
                         // host the app-secret cookie (scoped to 127.0.0.1) never reaches, so the page asked for an API key.
-                        // Load the same page from 127.0.0.1 instead; it stays in the app, like any other daemon link.
-                        if (request.isForMainFrame && url.scheme == "http" && url.host == "localhost" &&
+                        // Load the same page from 127.0.0.1 instead; it stays in the app, like any other daemon link. An
+                        // https link to the daemon's port, under either name, is loaded the same way, over http: the
+                        // daemon speaks plain http, so loading it as is put a TLS error page (ERR_SSL_PROTOCOL_ERROR)
+                        // over the UI.
+                        val onDaemonPort = (url.host == "localhost" || url.host == "127.0.0.1") &&
                             url.port == ANDROID_DAEMON_PORT
+                        if (request.isForMainFrame && onDaemonPort &&
+                            (url.scheme == "https" || (url.scheme == "http" && url.host == "localhost"))
                         ) {
-                            view.loadUrl(url.buildUpon().encodedAuthority("127.0.0.1:$ANDROID_DAEMON_PORT").build().toString())
+                            val http = url.buildUpon().scheme("http").encodedAuthority("127.0.0.1:$ANDROID_DAEMON_PORT")
+                            view.loadUrl(http.build().toString())
                             return true
                         }
                         // A link off the daemon (Hugging Face, docs, a model card) opens outside the app rather than
