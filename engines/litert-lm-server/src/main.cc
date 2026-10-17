@@ -432,14 +432,40 @@ struct JsonTooDeep : std::runtime_error {
   JsonTooDeep() : std::runtime_error("nested deeper than " + std::to_string(kMaxJsonDepth) + " levels") {}
 };
 
-// json::parse, throwing JsonTooDeep at an array or object that kMaxJsonDepth others enclose. The callback's depth is
-// the number of enclosing arrays and objects.
+// The DOM builder json::parse itself uses, counting the arrays and objects open: it throws JsonTooDeep at one that
+// kMaxJsonDepth others enclose. Not json::parse with a parser callback, which would be simpler: that parser's
+// end_object scans the whole enclosing array or object for a value the callback discarded, each time an object closes,
+// so a body holding N objects in one array or object took O(N^2). A normal chat request with an extra field of 50,000
+// empty objects (575 KB) kept a core busy for 16 s, on the connection thread and before any lock, and nothing stops
+// that once the client has gone. This builder's start and end are what json::parse does, so it stays linear.
+struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
+  using json_sax_dom_parser::json_sax_dom_parser;
+  int depth = 0;
+  bool start_object(std::size_t n) {
+    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    return json_sax_dom_parser::start_object(n);
+  }
+  bool end_object() {
+    --depth;
+    return json_sax_dom_parser::end_object();
+  }
+  bool start_array(std::size_t n) {
+    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    return json_sax_dom_parser::start_array(n);
+  }
+  bool end_array() {
+    --depth;
+    return json_sax_dom_parser::end_array();
+  }
+};
+
+// json::parse, throwing JsonTooDeep at an array or object that kMaxJsonDepth others enclose. A syntax error throws
+// json::parse_error, as with json::parse (the builder is made with allow_exceptions).
 json ParseBounded(const std::string& s) {
-  return json::parse(s, [](int depth, json::parse_event_t event, json&) {
-    bool opens = event == json::parse_event_t::object_start || event == json::parse_event_t::array_start;
-    if (opens && depth >= kMaxJsonDepth) throw JsonTooDeep();
-    return true;
-  });
+  json result;
+  BoundedDomParser builder(result, true);
+  json::sax_parse(s, &builder);
+  return result;
 }
 
 json ParseToolArguments(const json& args) {
