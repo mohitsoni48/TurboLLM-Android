@@ -581,6 +581,48 @@ std::string CorsHeaders(const Request& req) {
   return h;
 }
 
+// Why a request that a web page may have sent is refused, or empty. This port takes no key (only the daemon is meant
+// to use it), and a browser that lets pages reach loopback (Firefox for Android does) let any site the user opened
+// POST here: one cross-site request naming any file released the user's model to load that file instead.
+//   - Host: a page on a domain the attacker points at 127.0.0.1 (DNS rebinding) is same-origin with this port, so it
+//     can send anything and read the reply. Its requests name that domain in Host; the daemon's name 127.0.0.1. So
+//     Host must be localhost or an IP address: a page whose origin is an IP address and this port came from whatever
+//     listens there, this server, which serves no pages. Any IP address, not only loopback ones, so that a server
+//     started with --host 0.0.0.0 (the user's own serve flags follow the daemon's --host 127.0.0.1) can still be
+//     reached by the phone's LAN address. A request without Host is no browser's.
+//   - Origin: a browser adds it to every POST a page sends to another origin, and sends one without asking first (no
+//     preflight) only with a form's content types: text/plain, application/x-www-form-urlencoded or
+//     multipart/form-data. One with application/json it sends only after a preflight that allows it, and this server
+//     allows none unless started with --cors-origin. So a POST carrying an Origin must be application/json, unless
+//     --cors-origin allows that Origin. Origin itself is not refused: a daemon older than TurboLLM#287 forwarded its
+//     client's headers on its /v1/* pass-through, Origin included, so a web client of its API reached this port with
+//     one (since TurboLLM#287 the daemon sends no Origin here). Nor is application/json required of every POST:
+//     `curl -d` sends a form type, and that older daemon forwarded its client's Content-Type too (the daemon now
+//     sends the chat body it re-serializes as application/json). A web client of such a daemon that posted JSON
+//     labelled text/plain is refused here: from this port it looks like a page posting here.
+std::string CrossSiteRefusal(const Request& req) {
+  if (req.headers.count("host")) {
+    std::string host = Lower(req.headers.at("host"));
+    host = host.substr(0, host[0] == '[' ? host.find(']') + 1 : host.find(':'));  // drop the port
+    in6_addr ip;  // room for either family
+    bool ip_literal = host.size() > 2 && host[0] == '[' && host.back() == ']'
+                          ? ::inet_pton(AF_INET6, host.substr(1, host.size() - 2).c_str(), &ip) == 1
+                          : ::inet_pton(AF_INET, host.c_str(), &ip) == 1;
+    if (host != "localhost" && !ip_literal) return "Forbidden: Host must be localhost or an IP address";
+  }
+  if (req.method == "POST" && req.headers.count("origin")) {
+    const std::string& origin = req.headers.at("origin");
+    for (const auto& o : g_cors_origins) {
+      if (o == "*" || o == origin) return "";
+    }
+    std::string type = req.headers.count("content-type") ? req.headers.at("content-type") : "";
+    if (Lower(Trim(type.substr(0, type.find(';')))) != "application/json") {
+      return "Forbidden: a cross-origin POST must be application/json";
+    }
+  }
+  return "";
+}
+
 bool SendResponse(int fd, const Request& req, int status, const std::string& reason, const std::string& content_type,
                   const std::string& body) {
   std::string head = "HTTP/1.1 " + std::to_string(status) + " " + SafeReason(reason) + "\r\n";
@@ -1244,7 +1286,9 @@ void HandleConnection(int fd) {
     return;
   }
   if (g_verbose) Log(req.method + " " + req.path);
-  if (req.method == "OPTIONS") {
+  if (std::string why = CrossSiteRefusal(req); !why.empty()) {
+    SendError(fd, req, 403, why);
+  } else if (req.method == "OPTIONS") {
     SendResponse(fd, req, 200, "OK", "text/plain", "");
   } else if (req.method == "GET" && req.path == "/health") {
     SendJson(fd, req, 200, {{"status", "ok"}});
