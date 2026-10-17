@@ -64,6 +64,11 @@ private val WEBVIEW_SCHEMES = setOf("http", "https", "about", "data", "blob", "j
  *  link. */
 private val HANDED_OFF_SCHEMES = setOf("mailto", "xmpp", "irc", "ircs", "tel")
 
+/** A link handed to another app goes out as a browser sends one: ACTION_VIEW with CATEGORY_BROWSABLE, so only an
+ *  activity that declares it, i.e. accepts links from web pages, can be started. A bare ACTION_VIEW also matched
+ *  exported activities that never declared it: ones their apps open to other apps' code, not to any link on a page. */
+private fun linkIntent(url: Uri) = Intent(Intent.ACTION_VIEW, url).addCategory(Intent.CATEGORY_BROWSABLE)
+
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
  *  raw `vh`-family CSS length (`vh`/`dvh`/`svh`/`lvh`) to a literal 0px — not just on
@@ -354,23 +359,27 @@ private fun TurboLLMWebView() {
                             view.loadUrl(url.buildUpon().encodedAuthority("127.0.0.1:$ANDROID_DAEMON_PORT").build().toString())
                             return true
                         }
-                        // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
+                        // A link off the daemon (Hugging Face, docs, a model card) opens outside the app rather than
                         // replacing the app's UI inside its own WebView, where Back would be the only way out. So does
-                        // localhost on any port but the daemon's: that is some other app's server, not ours.
+                        // localhost on any port but the daemon's: that is some other app's server, not ours. It goes
+                        // where a browser would send it (linkIntent): the browser, or an app that has claimed that web
+                        // address (an App Link), but never an activity that does not take links from web pages.
                         val external = (url.scheme == "http" || url.scheme == "https") && url.host != "127.0.0.1" &&
                             !(url.host == "localhost" && url.port == ANDROID_DAEMON_PORT)
                         if (request.isForMainFrame && external) {
-                            runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            runCatching { view.context.startActivity(linkIntent(url)) }
                             return true
                         }
                         // A scheme the WebView cannot load: navigated to, it replaced the app's UI with an
                         // ERR_UNKNOWN_URL_SCHEME page, and Back then reloaded the UI from scratch, losing its state. A
-                        // contact link (mailto: and the like) opens in the app that handles it, main frame only, like
-                        // the links above. Anything else (intent:, market:, file:, another app's deep link) does
-                        // nothing, since what the page shows (a reply, a model card) is not to be trusted to open apps.
+                        // contact link (mailto: and the like) opens in the app that handles it, sent the same way and
+                        // main frame only, like the links above. Anything else (intent:, market:, file:, a deep link in
+                        // another app's own scheme) does nothing, since what the page shows (a reply, a model card) is
+                        // not to be trusted to open apps. An https deep link is a web link like any other: it still
+                        // opens the app that claimed its address, as it would from a browser.
                         if (url.scheme !in WEBVIEW_SCHEMES) {
                             if (request.isForMainFrame && url.scheme in HANDED_OFF_SCHEMES) {
-                                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                                runCatching { view.context.startActivity(linkIntent(url)) }
                             }
                             return true
                         }
