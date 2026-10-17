@@ -761,9 +761,11 @@ Piece ParseChunk(const std::string& s) {
   return p;
 }
 
-json OpenAiToolCalls(const json& calls, const std::string& now_str, bool with_index) {
+// `first` is the number of the first call in `calls` within the turn: a stream sends a turn's calls over several
+// chunks, and each call keeps its place in the turn's numbering (see the drain loop).
+json OpenAiToolCalls(const json& calls, const std::string& now_str, bool with_index, int first = 0) {
   json out = json::array();
-  int i = 0;
+  int i = first;
   for (const auto& tc : calls) {
     json fn = tc.is_object() && tc.contains("function") ? tc["function"] : tc;
     json args = fn.is_object() && fn.contains("arguments") ? fn["arguments"] : json::object();
@@ -1126,6 +1128,12 @@ void HandleChatCompletions(int fd, const Request& req) {
       }
       Piece p = ParseChunk(item.text);
       if (!p.reasoning.empty()) ++reasoning_tokens;
+      // The runtime sends each tool-call block as its own chunk once the block closes, so parallel calls from a model
+      // that writes one block per call (Qwen's <tool_call>) arrive in several chunks. An OpenAI stream numbers a turn's
+      // calls 0, 1, 2, ... across all its chunks, and clients and the daemon's gateways put the deltas that share an
+      // index together into one call; numbered per chunk, every such call was index 0 with the same id, and they came
+      // out as one call whose arguments were the calls' objects run together. Numbered as in the non-streaming reply.
+      const int first_call = static_cast<int>(tool_calls_all.size());
       if (!p.tool_calls.empty()) {
         for (auto& tc : p.tool_calls) tool_calls_all.push_back(tc);
         finish = "tool_calls";
@@ -1140,7 +1148,7 @@ void HandleChatCompletions(int fd, const Request& req) {
         }
         if (ok && !p.tool_calls.empty()) {
           ok = SendAll(fd, Sse(make_chunk(json::array(
-                                {{{"index", 0}, {"delta", {{"tool_calls", OpenAiToolCalls(p.tool_calls, now_str, true)}}}, {"finish_reason", nullptr}}}))));
+                                {{{"index", 0}, {"delta", {{"tool_calls", OpenAiToolCalls(p.tool_calls, now_str, true, first_call)}}}, {"finish_reason", nullptr}}}))));
         }
         if (!ok && !cancelled) {
           client_gone = cancelled = true;
