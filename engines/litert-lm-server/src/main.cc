@@ -1101,10 +1101,12 @@ void HandleChatCompletions(int fd, const Request& req) {
     long long created = 0;
     const std::string now_str = NowStr(&created);
     const std::string chunk_id = "chatcmpl_" + now_str;
+    // No "usage" key on these chunks, not even null as the Python server writes with include_usage: the daemon's
+    // gateway turns include_usage on for streaming clients that leave it unset, so it can count tokens, and takes the
+    // usage chunk back out of their stream, so a null on every other chunk reached clients that never asked for usage.
+    // The usage chunk at the end sets it.
     auto make_chunk = [&](json choices) {
-      json p = {{"id", chunk_id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", raw_model}, {"choices", choices}};
-      if (include_usage) p["usage"] = nullptr;
-      return p;
+      return json{{"id", chunk_id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", raw_model}, {"choices", choices}};
     };
 
     std::string msg_str = prompt.dump();
