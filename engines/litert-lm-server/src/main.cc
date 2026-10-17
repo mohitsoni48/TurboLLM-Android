@@ -1470,7 +1470,18 @@ int main(int argc, char** argv) {
     // unaffected.
     timeval snd_timeout{30, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
-    std::thread(HandleConnection, fd).detach();
+    try {
+      std::thread(HandleConnection, fd).detach();
+    } catch (const std::exception& e) {
+      // No thread for this connection: std::system_error (EAGAIN) once the process is out of threads or address
+      // space, e.g. with hundreds of idle connections each holding a thread for up to 60 s, or std::bad_alloc. Uncaught,
+      // it ended the server (std::terminate) and with it the loaded model. Drop this connection and keep serving:
+      // threads come back as connections end. Pause as for accept errors above, so a backlog of pending connections is
+      // not dropped, and logged, in a tight loop.
+      Log(std::string("cannot start a connection thread: ") + e.what());
+      ::close(fd);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
   }
   Log("Shutting down server...");
   // Free the engine if no inference holds it; a generation still running is cut short by exit.
