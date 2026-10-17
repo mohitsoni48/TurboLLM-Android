@@ -422,11 +422,33 @@ std::map<std::string, std::string> BuildNameByToolCallId(const json& messages) {
   return out;
 }
 
+// Arrays and objects nested deeper than this are refused in what a request sends. The parser keeps its own stack, but
+// copying a value and dump() recurse once per level on the connection thread's stack (8 MB on glibc, about 1 MB on
+// Android), so a 20 KB body of ten thousand nested brackets overflowed it and killed the server with SIGSEGV. Nothing
+// a chat request carries comes near 128 levels, serde_json's default limit too.
+constexpr int kMaxJsonDepth = 128;
+
+struct JsonTooDeep : std::runtime_error {
+  JsonTooDeep() : std::runtime_error("nested deeper than " + std::to_string(kMaxJsonDepth) + " levels") {}
+};
+
+// json::parse, throwing JsonTooDeep at an array or object that kMaxJsonDepth others enclose. The callback's depth is
+// the number of enclosing arrays and objects.
+json ParseBounded(const std::string& s) {
+  return json::parse(s, [](int depth, json::parse_event_t event, json&) {
+    bool opens = event == json::parse_event_t::object_start || event == json::parse_event_t::array_start;
+    if (opens && depth >= kMaxJsonDepth) throw JsonTooDeep();
+    return true;
+  });
+}
+
 json ParseToolArguments(const json& args) {
   if (args.is_object()) return args;
   if (args.is_string()) {
     try {
-      json j = json::parse(args.get<std::string>());
+      // Bounded too: a tool call's arguments arrive as a string the body's own depth check cannot see into. Arguments
+      // nested too deeply become {}, as unparseable ones do.
+      json j = ParseBounded(args.get<std::string>());
       return j;
     } catch (...) {
     }
@@ -950,7 +972,10 @@ std::string NowStr(long long* created) {
 void HandleChatCompletions(int fd, const Request& req) {
   json body;
   try {
-    body = json::parse(req.body);
+    body = ParseBounded(req.body);
+  } catch (const JsonTooDeep& e) {
+    SendError(fd, req, 400, std::string("Invalid JSON: ") + e.what());
+    return;
   } catch (...) {
     SendError(fd, req, 400, "Invalid JSON");
     return;
