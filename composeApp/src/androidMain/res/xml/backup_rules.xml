@@ -17,4 +17,8 @@
         <exclude domain="file" path=".turbollm/logs/" />
         <!-- The daemon payload (~15 MB, most of the quota on its own): re-extracted from the APK (MainActivity.kt). -->
         <exclude domain="file" path="daemon/" />
+        <!-- The app's external files folder, Android/data/com.turbollm/files/ (the "external" domain), which Auto
+             Backup takes by default: the app writes nothing there, but a model folder or download folder the user adds
+             inside it holds multi-GB models, the same quota problem. The whole folder, since the user names those. -->
+        <exclude domain="external" path="." />
 </full-backup-content>

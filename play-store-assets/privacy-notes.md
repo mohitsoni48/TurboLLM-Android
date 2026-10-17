@@ -75,10 +75,11 @@ Android's app-private storage — not shared storage, not readable by other apps
 **Backups — one open decision for the dev team before shipping:**
 `AndroidManifest.xml` has `android:allowBackup="true"` with backup rules
 (`res/xml/data_extraction_rules.xml` for Android 12+, `res/xml/backup_rules.xml` before). They only
-exclude models, caches, logs and the extracted daemon under `files/`; everything else Auto Backup
-takes by default stays in. So Android's own Auto Backup (to the user's Google account, not to any
-TurboLLM server; end-to-end encrypted with the lock-screen credential on Android 9+ when the phone
-has one) and device-to-device transfer carry the rest of the app's own files:
+exclude models, caches, logs and the extracted daemon under `files/`, and the app's external files
+folder as a whole (below); everything else Auto Backup takes by default stays in. So Android's own
+Auto Backup (to the user's Google account, not to any TurboLLM server; end-to-end encrypted with
+the lock-screen credential on Android 9+ when the phone has one) and device-to-device transfer
+carry the rest of the app's own files:
 
 - `files/`: the chat history and the rest of the daemon's state, including its settings file,
   `files/.turbollm/config.json`.
@@ -92,14 +93,14 @@ has one) and device-to-device transfer carry the rest of the app's own files:
 - `shared_prefs/`: the app's own preferences (whether the model-folder storage prompt was
   answered), next to any preference files the WebView keeps there for itself (no user data: the
   app grants pages no permissions).
-- The app's external files folder, `Android/data/com.turbollm/files/` (app-specific external
-  storage, the "external" domain): the app writes nothing there itself, but a model folder the
-  user adds inside it holds multi-GB models (put there by the user, or downloaded into it). The
-  rules exclude paths only in the private `files/`, so a device transfer copies such a folder with
-  its models, while for cloud backup they go over Android's 25 MB backup quota and Android skips
-  the whole cloud backup, chats and `config.json` included.
 
-Android itself never backs up `cache/`, `code_cache/` or `no_backup/`.
+The app's external files folder, `Android/data/com.turbollm/files/` (app-specific external
+storage, the "external" domain), is left out of both the backup and the transfer: the app writes
+nothing there itself, but a model folder the user adds inside it holds multi-GB models (put there
+by the user, or downloaded into it). In a cloud backup they would go over Android's 25 MB quota,
+and Android would then skip the whole cloud backup, chats and `config.json` included. Like the
+other excluded models, they can be copied or downloaded again. Android itself never backs up
+`cache/`, `code_cache/` or `no_backup/`.
 
 `config.json` also holds, in plaintext, every third-party credential the user has entered: the
 Hugging Face and GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi
