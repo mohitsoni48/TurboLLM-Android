@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 11 and older (fullBackupContent). Diagnostics logs are per-device and can be large; nothing to restore. -->
+<!-- Android 11 and older (fullBackupContent). Diagnostics logs are per-device and can be large; nothing to restore.
+     The chats and .turbollm/config.json are kept, tokens included: see data_extraction_rules.xml. -->
 <full-backup-content>
     <exclude domain="file" path="daemon.log" />
     <exclude domain="file" path="daemon.log.1" />
@@ -7,4 +8,13 @@
         <!-- Imported models: multi-GB files exceed the backup quota, which makes Android skip the whole backup,
              chat history included. They can be imported again. -->
         <exclude domain="file" path="models/" />
+        <!-- Downloaded models: the daemon's default download folder (~/.turbollm/models, HOME being filesDir), the same
+             quota problem. They can be downloaded again. -->
+        <exclude domain="file" path=".turbollm/models/" />
+        <!-- LiteRT-LM's compiled-model cache for models in read-only folders: rebuilt on the next load. -->
+        <exclude domain="file" path=".turbollm/cache/" />
+        <!-- Engine logs: per-device diagnostics, like daemon.log. -->
+        <exclude domain="file" path=".turbollm/logs/" />
+        <!-- The daemon payload (~15 MB, most of the quota on its own): re-extracted from the APK (MainActivity.kt). -->
+        <exclude domain="file" path="daemon/" />
 </full-backup-content>

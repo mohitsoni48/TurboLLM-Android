@@ -23,7 +23,8 @@
 //   - `timings` (llama.cpp's field names) on the final response, taken from the runtime's own
 //     benchmark counters, so speed is measured rather than derived from time-to-first-token.
 //   - Thinking-channel text streamed as `reasoning_content` instead of being dropped.
-//   - "length" as the finish reason when the token budget runs out.
+//   - "length" as the finish reason when the reply is cut off: by max_completion_tokens, or by the
+//     context window when the model reference or the config sets its size (max_num_tokens).
 //   - A client that disconnects cancels its generation instead of letting it run on.
 //   - Requests are served concurrently; only inference itself is serialized (the engine is one
 //     shared resource, exactly as in the Python server, which serialized everything).
@@ -44,6 +45,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <climits>
@@ -343,6 +345,29 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   }
 
   if (g_engine.engine && g_engine.key == key) return g_engine.engine;
+  // A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end
+  // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32
+  // bytes before reading the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate,
+  // killing the whole server, so the offset is bounded here first. The bound is the runtime's own: it reads the header
+  // from the file's first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger
+  // offset can never load, yet would still cost an allocation up to the file's size (hundreds of MB on a phone).
+  // Checked before the loaded engine is released, which a bad file then leaves in place.
+  // A file that can't be read or lacks the magic is left to the runtime, which reports it cleanly and more precisely
+  // (e.g. "Permission denied").
+  {
+    struct stat st {};
+    unsigned char h[32] = {};
+    std::ifstream in(ref.path, std::ios::binary);
+    bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
+              std::memcmp(h, "LITERTLM", 8) == 0;
+    uint64_t header_end = 0;
+    for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
+    constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
+    if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
+      throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
+                               ": invalid .litertlm header')");
+    }
+  }
   if (g_engine.engine) {
     Log("Re-initializing engine (model: " + ref.id + ", backend: " + key.backend + ")");
     ReleaseEngine();
@@ -482,6 +507,8 @@ struct Request {
 
 std::vector<std::string> g_cors_origins;
 
+// False once the connection is gone, or once the client has stopped reading: every accepted socket has a 30 s
+// SO_SNDTIMEO (see main), and a send() that times out with nothing sent fails with EAGAIN.
 bool SendAll(int fd, const std::string& data) {
   size_t off = 0;
   while (off < data.size()) {
@@ -572,10 +599,12 @@ bool SendJson(int fd, const Request& req, int status, const json& j) {
 }
 
 // Python's send_error: the message is the status line's reason phrase. The body is an
-// OpenAI-style error object rather than Python's HTML page.
+// OpenAI-style error object rather than Python's HTML page. The message is often the runtime's own text, which need
+// not be UTF-8 (a bad model file's magic bytes), and this runs inside catch handlers, so dump must not throw.
 bool SendError(int fd, const Request& req, int status, const std::string& message) {
   json body = {{"error", {{"message", message}, {"type", status >= 500 ? "server_error" : "invalid_request_error"}, {"code", status}}}};
-  return SendResponse(fd, req, status, message, "application/json", body.dump() + "\n");
+  return SendResponse(fd, req, status, message, "application/json",
+                      body.dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
 }
 
 bool ReadRequest(int fd, Request& req) {
@@ -639,6 +668,8 @@ struct StreamQueue {
 // StreamCallback from its own thread with a pointer to the queue, so a request that leaves early (an exception while
 // tokens are still arriving: a malformed tool call, a JSON error) must not free the queue under it. On such an exit
 // this cancels the generation and waits for the final chunk; if none comes in 30 s the server exits (see below).
+// A chunk marked final is not always the last callback (an unparsable tool call is one), so HandleChatCompletions also
+// declares the queue before the conversation, whose deletion waits for the generation to end.
 class StreamGuard {
  public:
   StreamGuard(std::unique_ptr<StreamQueue>& q, LiteRtLmConversation* conv) : q_(q), conv_(conv) {}
@@ -683,10 +714,9 @@ void StreamCallback(void* data, const LiteRtLmStreamChunk* chunk) {
     item.text = t ? t : "";
     item.final = L.litert_lm_stream_chunk_is_final(chunk);
   }
-  {
-    std::lock_guard<std::mutex> lock(q->mu);
-    q->items.push_back(std::move(item));
-  }
+  std::lock_guard<std::mutex> lock(q->mu);
+  q->items.push_back(std::move(item));
+  // Notify under the lock: once it is released the request thread may take the final chunk and free q.
   q->cv.notify_one();
 }
 
@@ -982,6 +1012,11 @@ void HandleChatCompletions(int fd, const Request& req) {
       L.litert_lm_conversation_config_set_thinking_config(cc, t);
       L.litert_lm_thinking_config_delete(t);
     }
+    // Declared before the conversation so it is freed after it: deleting the conversation waits for its generation to
+    // end (~SessionAdvanced's WaitUntilDone), and until then the runtime may call StreamCallback with this queue, even
+    // after a chunk marked final (see the error branch of the drain loop below).
+    auto q_owner = std::make_unique<StreamQueue>();
+    StreamQueue& q = *q_owner;
     L.litert_lm_clear_last_error();
     std::unique_ptr<LiteRtLmConversation, ConvDeleter> conv(L.litert_lm_conversation_create(engine, cc));
     L.litert_lm_conversation_config_delete(cc);
@@ -1003,8 +1038,6 @@ void HandleChatCompletions(int fd, const Request& req) {
       return p;
     };
 
-    auto q_owner = std::make_unique<StreamQueue>();
-    StreamQueue& q = *q_owner;
     std::string msg_str = prompt.dump();
     L.litert_lm_clear_last_error();
     int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), "{}", oa, StreamCallback, &q);
@@ -1039,9 +1072,15 @@ void HandleChatCompletions(int fd, const Request& req) {
     auto next_peer_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     auto watch_peer = [&] {
       auto now = std::chrono::steady_clock::now();
-      if (cancelled || now < next_peer_check) return;
+      if (now < next_peer_check) return;
       next_peer_check = now + std::chrono::milliseconds(200);
-      if (PeerGone(fd)) {
+      if (client_gone) {
+        // Cancel again on every tick until the final chunk. A cancel flags only the tasks the runtime has already
+        // queued, and the decode task is queued, with a fresh flag, only once the prefill task has finished: a cancel
+        // landing in between is lost, and the turn would run to its end for nobody, holding the engine. Cancelling a
+        // turn that has ended is a no-op.
+        L.litert_lm_conversation_cancel_process(conv.get());
+      } else if (!cancelled && PeerGone(fd)) {
         client_gone = cancelled = true;
         L.litert_lm_conversation_cancel_process(conv.get());
       }
@@ -1064,9 +1103,21 @@ void HandleChatCompletions(int fd, const Request& req) {
       if (item.final) guard.Finished();
       watch_peer();
       if (item.is_error) {
-        if (item.text.find("CANCELLED") != std::string::npos) {
+        // Not necessarily the end of the generation: the runtime reports a tool call it cannot parse as soon as the
+        // call's closing tag streams in, marked final, and keeps decoding. Stop it whatever the error is (a no-op once
+        // the generation has ended), so deleting the conversation below does not wait for the rest of the turn while
+        // this request holds the engine.
+        if (!cancelled) {
+          cancelled = true;
+          L.litert_lm_conversation_cancel_process(conv.get());
+        }
+        // The text is absl::Status::ToString(), code first. Match from the start: a parse error quotes the model's
+        // output, which may contain these words.
+        if (item.text.rfind("CANCELLED:", 0) == 0) {
           // a cancelled turn ends quietly, as in the Python client
-        } else if (item.text.find("Max number of tokens reached") != std::string::npos) {
+        } else if (item.text.rfind("RESOURCE_EXHAUSTED: Max number of tokens reached", 0) == 0) {
+          // A full context window, from a runtime that reports it as an error. LiteRT-LM 0.18.0's C API never does
+          // (see the token-count check below).
           finish = "length";
         } else {
           error = item.text;
@@ -1106,24 +1157,41 @@ void HandleChatCompletions(int fd, const Request& req) {
     }
 
     json usage, timings;
-    UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
-    if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+    // Not after an error, whose reply carries neither: the generation may still be running then (the cancel above only
+    // asks it to stop), and the runtime copies the session's benchmark info under a lock its decode thread does not
+    // take while writing it.
+    if (!error) {
+      UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
+      if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+      // A full context window ends the turn with an ordinary final chunk: the conversation API reports it as an error
+      // only with return_error_on_max_tokens_reached, which defaults to off and which LiteRT-LM 0.18.0's C API has no
+      // way to turn on. So it is told from the counts. The runtime stops once the KV cache holds max_num_tokens, and
+      // this request's conversation is new, so its cache holds just this prompt (earlier messages included) and the
+      // reply. Only a limit this server set is known: a bundle whose own cache is smaller caps the window lower, and
+      // a reply cut off there still reads "stop".
+      const int window = g_engine.key.max_num_tokens;
+      if (finish == "stop" && window > 0 && usage["total_tokens"].get<int>() >= window) finish = "length";
+    }
 
     if (stream) {
+      // Stop at the first send that fails: to a client that has stopped reading, each further one would wait out the
+      // send timeout again while this request holds the engine.
+      bool ok;
       if (error) {
         // openai_common.OpenAIStreamFormatter.format_error
-        SendAll(fd, "event: response.error\ndata: " + json({{"error", "RuntimeError: " + *error}}).dump() + "\n\n");
+        ok = SendAll(fd, "event: response.error\ndata: " +
+                             json({{"error", "RuntimeError: " + *error}}).dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
       } else {
         json last = make_chunk(json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish}}}));
         last["timings"] = timings;
-        SendAll(fd, Sse(last));
-        if (include_usage) {
+        ok = SendAll(fd, Sse(last));
+        if (ok && include_usage) {
           json u = make_chunk(json::array());
           u["usage"] = usage;
-          SendAll(fd, Sse(u));
+          ok = SendAll(fd, Sse(u));
         }
       }
-      SendAll(fd, "data: [DONE]\n\n");
+      if (ok) SendAll(fd, "data: [DONE]\n\n");
       return;
     }
 
@@ -1312,10 +1380,19 @@ int main(int argc, char** argv) {
     }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    // A client that connects and never sends a request must not hold a thread forever. Applies to reads only;
-    // a long generation's writes and the disconnect poll are unaffected.
+    // A client that connects and never sends a request must not hold a thread forever.
     timeval rcv_timeout{60, 0};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+    // Nor may one that stops reading. Chat completion and /v1/models responses are written under g_engine_mu, so a
+    // send blocked on a full socket held the engine, and with it every later chat and /v1/models request, for as long
+    // as the client kept the connection open. Now a send() gives up after 30 s: with a partial count if it got some
+    // bytes out, which SendAll takes as progress, else with an error, which ends a stream like a disconnect and cancels
+    // its generation. A client that reads nothing is dropped within one to two minutes: each send that still gets a few
+    // bytes out waits its own 30 s, and the kernel can free a little room once more after the buffers first fill. One
+    // that reads is served however slowly, as long as it never leaves the buffers full for 30 s. The disconnect poll is
+    // unaffected.
+    timeval snd_timeout{30, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
     std::thread(HandleConnection, fd).detach();
   }
   Log("Shutting down server...");

@@ -16,8 +16,6 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
@@ -222,7 +220,7 @@ object ModelImport {
     /** Add the folder to the daemon's model folders (a no-op when it is there already); that request also rescans.
      *  False when the daemon did not accept it, so the caller says so instead of reporting a silent success. */
     private fun registerWithDaemon(dir: File): Boolean = runCatching {
-        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/modeldirs").openConnection() as HttpURLConnection
+        val conn = DaemonAuth.open("/api/v1/modeldirs")
         try {
             conn.requestMethod = "POST"
             conn.doOutput = true

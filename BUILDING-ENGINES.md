@@ -126,11 +126,27 @@ adb install composeApp/build/outputs/apk/debug/composeApp-debug.apk
 adb shell am start -n com.turbollm/com.turbollm.app.MainActivity
 # then, with NOTHING pushed:
 adb logcat -d | grep -E "E nodejs|TurboLLM:"
-adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/api/v1/engines
+adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/healthz   # {"status":"ok","version":…}
+adb shell "run-as com.turbollm cat files/daemon.log" | grep "registered bundled engine"
 ```
 
-Last run of exactly that: daemon booted, UI served HTTP 200, and both engines registered
-(`llama-server-android` and `llama-server-android-vulkan`).
+Last recorded run (before the app secret, when the check still read `/api/v1/engines`): daemon
+booted, UI served HTTP 200, and both engines registered (`llama-server-android` and
+`llama-server-android-vulkan`).
+
+`/api/v1/engines` over the adb forward now answers 401, and that is not a failed boot. The app
+starts the daemon with a per-launch secret (`TURBOLLM_APP_SECRET`) that only the app's own
+WebView and client carry, so adb, curl and Termux count as another app on the phone and need an
+API key like any LAN client. `/healthz` stays open, and on the first launch after a clean
+install, as in the procedure above, the daemon logs one `android: registered bundled engine …`
+line per engine to `files/daemon.log`. Only that launch registers them: later boots log
+`android: refreshed bundled engine …` or `android: repaired stale engine path …` for an engine
+whose path or version changed and nothing for the others, and `daemon.log` is truncated each
+time Node starts. So on a phone that already had the app, an empty grep does not mean the
+engines are missing. To query the API itself, create a key in the app (Customize → Connect →
+API keys) and send it as `X-TurboLLM-Auth: <key>`. Only a debug build lets an adb host skip the
+key: its WebView accepts Chrome DevTools over adb, and script run there acts as the app. Release
+builds turn WebView debugging off.
 
 ---
 

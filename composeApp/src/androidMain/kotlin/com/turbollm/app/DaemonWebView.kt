@@ -4,11 +4,14 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Build
+import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -42,12 +45,24 @@ import com.airbnb.lottie.compose.LottieCompositionSpec
 import com.airbnb.lottie.compose.LottieConstants
 import com.airbnb.lottie.compose.animateLottieCompositionAsState
 import com.airbnb.lottie.compose.rememberLottieComposition
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
 /** The daemon UI's origin, with the trailing slash so a look-alike host cannot match. */
 private val DAEMON_ORIGIN = DAEMON_URL
+
+/** Schemes the WebView loads itself: web pages, and what the UI's own frames use. Navigations to any other scheme are
+ *  never loaded (shouldOverrideUrlLoading); turbollm-app is handled before that check. */
+private val WEBVIEW_SCHEMES = setOf("http", "https", "about", "data", "blob", "javascript")
+
+/** Contact links handed to the app that handles them (tel only opens the dialer). The web UI's markdown and model-card
+ *  sanitizers allow mailto, xmpp, irc and ircs links, and GFM turns a bare e-mail address in a reply into a mailto
+ *  link. */
+private val HANDED_OFF_SCHEMES = setOf("mailto", "xmpp", "irc", "ircs", "tel")
 
 /** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
  *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
@@ -182,11 +197,12 @@ private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
 @Composable
 fun DaemonWebViewScreen() {
     var ready by remember { mutableStateOf(false) }
-    val client = remember { DaemonClient() }
 
+    // Up AND ours: the WebView below gets the app-secret cookie the moment it is created, so it waits until the
+    // daemon has proved it holds the port (DaemonAuth), not merely until something answers there.
     LaunchedEffect(Unit) {
         while (!ready) {
-            ready = client.isDaemonReachable(ANDROID_DAEMON_PORT)
+            ready = withContext(Dispatchers.IO) { DaemonAuth.daemonProven() }
             if (!ready) delay(500)
         }
     }
@@ -298,7 +314,14 @@ private fun TurboLLMWebView() {
         // (adjustResize no longer resizes an edge-to-edge window), so the web UI needs no insets of its own.
         modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing),
         factory = { context ->
-            WebView.setWebContentsDebuggingEnabled(true)
+            // Debuggable builds only. DevTools attached over adb runs script in the daemon's origin, where every
+            // request carries the HttpOnly app-secret cookie, and can read that cookie too: the whole keyless API,
+            // creating an API key included, which a release build must not give an adb host (BUILDING-ENGINES.md).
+            // Other apps were never let in (the devtools socket admits only the shell, root and this app). QA over
+            // CDP (QA_BUGS.md) uses a debug build; -PturbollmApplicationIdSuffix installs one next to the Play app.
+            WebView.setWebContentsDebuggingEnabled(
+                (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+            )
             // QA_BUGS.md BUG-13: by default the Android System WebView renders as a single
             // opaque NAF="true" node in the accessibility tree — invisible to TalkBack and
             // to UI-Automator/Maestro element selectors. Chrome's accessibility bridge for
@@ -322,15 +345,57 @@ private fun TurboLLMWebView() {
                             }
                             return true // never let the WebView try to load this scheme
                         }
+                        // The daemon under the name localhost (a link in a reply or a docs snippet): opened as is, it is a
+                        // host the app-secret cookie (scoped to 127.0.0.1) never reaches, so the page asked for an API key.
+                        // Load the same page from 127.0.0.1 instead; it stays in the app, like any other daemon link.
+                        if (request.isForMainFrame && url.scheme == "http" && url.host == "localhost" &&
+                            url.port == ANDROID_DAEMON_PORT
+                        ) {
+                            view.loadUrl(url.buildUpon().encodedAuthority("127.0.0.1:$ANDROID_DAEMON_PORT").build().toString())
+                            return true
+                        }
                         // A link off the daemon (Hugging Face, docs, a model card) opens in the browser rather than
-                        // replacing the app's UI inside its own WebView, where Back would be the only way out.
-                        val external = (url.scheme == "http" || url.scheme == "https") &&
-                            url.host != "127.0.0.1" && url.host != "localhost"
+                        // replacing the app's UI inside its own WebView, where Back would be the only way out. So does
+                        // localhost on any port but the daemon's: that is some other app's server, not ours.
+                        val external = (url.scheme == "http" || url.scheme == "https") && url.host != "127.0.0.1" &&
+                            !(url.host == "localhost" && url.port == ANDROID_DAEMON_PORT)
                         if (request.isForMainFrame && external) {
                             runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
                             return true
                         }
+                        // A scheme the WebView cannot load: navigated to, it replaced the app's UI with an
+                        // ERR_UNKNOWN_URL_SCHEME page, and Back then reloaded the UI from scratch, losing its state. A
+                        // contact link (mailto: and the like) opens in the app that handles it, main frame only, like
+                        // the links above. Anything else (intent:, market:, file:, another app's deep link) does
+                        // nothing, since what the page shows (a reply, a model card) is not to be trusted to open apps.
+                        if (url.scheme !in WEBVIEW_SCHEMES) {
+                            if (request.isForMainFrame && url.scheme in HANDED_OFF_SCHEMES) {
+                                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                            }
+                            return true
+                        }
+                        // Another 127.0.0.1 port would be sent the app-secret cookie (see shouldInterceptRequest
+                        // below). Unlike that callback, this one runs again for each redirect hop of a main-frame
+                        // navigation, so a link that 302s to 127.0.0.1:<other port> is stopped here, before that
+                        // request (and the cookie) goes out.
+                        if (url.host == "127.0.0.1" && url.port != ANDROID_DAEMON_PORT) return true
                         return false
+                    }
+
+                    // The app-secret cookie (below) is scoped to 127.0.0.1, and cookies ignore ports: anything on the
+                    // page pointing at another loopback port (an image in a model card or a reply, a link) would hand
+                    // it to whichever app listens there. Nothing the UI needs is on another port, so a request that
+                    // starts there is refused here. This only sees a request's FIRST URL, not its redirect hops: an
+                    // https image that 302s to 127.0.0.1:<other port> gets past it. Those hops are covered elsewhere:
+                    // for images and media by the daemon's CSP on the UI's HTML (APP_SECRET_CSP, daemon server.ts),
+                    // which is checked on every redirect; for main-frame navigations by shouldOverrideUrlLoading above.
+                    // Runs on a WebView thread, so it touches nothing but the request.
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val url = request.url
+                        if (url.host != "127.0.0.1" || url.port == ANDROID_DAEMON_PORT) return null
+                        return WebResourceResponse(
+                            "text/plain", "utf-8", 403, "Forbidden", emptyMap(), ByteArrayInputStream(ByteArray(0)),
+                        )
                     }
 
                     override fun onPageFinished(view: WebView, url: String?) {
@@ -362,6 +427,15 @@ private fun TurboLLMWebView() {
                             false
                         }
                     }
+                }
+                // The daemon trusts only loopback requests that carry the app secret (DAEMON_APP_SECRET); this cookie is
+                // how every request the page makes carries it, WebSocket handshakes included. HttpOnly: page scripts
+                // (a chat artifact included) cannot read it. Set before the first load, every launch, since the secret
+                // changes with each process, and only once the daemon has proved it holds the port (DaemonWebViewScreen
+                // creates this WebView after DaemonAuth.daemonProven).
+                CookieManager.getInstance().apply {
+                    setCookie(DAEMON_URL, "turbollm_app=$DAEMON_APP_SECRET; Path=/; HttpOnly; SameSite=Strict")
+                    flush()
                 }
                 loadUrl(DAEMON_URL)
                 webViewRef = this

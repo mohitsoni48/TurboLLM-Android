@@ -28,7 +28,9 @@ if (!existsSync(listingCopyPath)) {
   console.error(`FATAL: missing ${listingCopyPath}`)
   process.exit(1)
 }
-const md = readFileSync(listingCopyPath, 'utf8')
+// LF only from here on: Git for Windows checks the file out with CRLF by default (no .gitattributes), which the
+// fence regex below would not match, and the copy would reach Play with stray \r in it.
+const md = readFileSync(listingCopyPath, 'utf8').replace(/\r\n/g, '\n')
 
 // Extracts the first fenced ``` block that follows a `## <heading>` line matching `headingRe`.
 function extractFenced(headingRe) {
