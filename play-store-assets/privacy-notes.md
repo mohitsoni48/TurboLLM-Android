@@ -74,18 +74,42 @@ Android's app-private storage — not shared storage, not readable by other apps
 
 **Backups — one open decision for the dev team before shipping:**
 `AndroidManifest.xml` has `android:allowBackup="true"` with backup rules
-(`res/xml/data_extraction_rules.xml` for Android 12+, `res/xml/backup_rules.xml` before). They keep
-models, caches, logs and the extracted daemon out, so Android's own Auto Backup (to the user's
-Google account, not to any TurboLLM server; end-to-end encrypted with the lock-screen credential
-on Android 9+ when the phone has one) and device-to-device transfer carry the rest of the app's private files:
-the chat history and the daemon's settings file, `files/.turbollm/config.json`. That file also
-holds, in plaintext, every third-party credential the user has entered: the Hugging Face and
-GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi search keys,
-MCP server keys and env, and the raw Turbo Link peer tokens that grant access to the user's
-other TurboLLM machines. (API keys the daemon issues are stored hashed.) None of these are needed
-to restore chats. Either disclose it plainly, or keep the credentials out of backups: moving them
+(`res/xml/data_extraction_rules.xml` for Android 12+, `res/xml/backup_rules.xml` before). They only
+exclude models, caches, logs and the extracted daemon under `files/`; everything else Auto Backup
+takes by default stays in. So Android's own Auto Backup (to the user's Google account, not to any
+TurboLLM server; end-to-end encrypted with the lock-screen credential on Android 9+ when the phone
+has one) and device-to-device transfer carry the rest of the app's own files:
+
+- `files/`: the chat history and the rest of the daemon's state, including its settings file,
+  `files/.turbollm/config.json`.
+- `app_webview/`: the WebView's own data. Among it are its cookie store (the only cookie the app
+  sets is the per-launch app secret, which no longer works after a restart) and the web UI's
+  localStorage: UI settings such as the theme and pinned models, the assistant and user names
+  and custom instructions set under personalization, each conversation's agent, reasoning effort
+  and thinking budget (by conversation id), the id of the chat last open, the draft last typed
+  into the text classification playground, and any API key pasted into the web UI's key prompt,
+  in plaintext (`tllm.authToken`). The rest is the WebView's other site storage and caches.
+- `shared_prefs/`: the app's own preferences (whether the model-folder storage prompt was
+  answered), next to any preference files the WebView keeps there for itself (no user data: the
+  app grants pages no permissions).
+- The app's external files folder, `Android/data/com.turbollm/files/` (app-specific external
+  storage, the "external" domain): the app writes nothing there itself, but a model folder the
+  user adds inside it holds multi-GB models (put there by the user, or downloaded into it). The
+  rules exclude paths only in the private `files/`, so a device transfer copies such a folder with
+  its models, while for cloud backup they go over Android's 25 MB backup quota and Android skips
+  the whole cloud backup, chats and `config.json` included.
+
+Android itself never backs up `cache/`, `code_cache/` or `no_backup/`.
+
+`config.json` also holds, in plaintext, every third-party credential the user has entered: the
+Hugging Face and GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi
+search keys, MCP server keys and env, and the raw Turbo Link peer tokens that grant access to the
+user's other TurboLLM machines. (API keys the daemon issues are stored hashed there; one pasted
+into the web UI's key prompt is in the localStorage above.) None of these are needed to restore
+chats. Either disclose it plainly, or keep the credentials out of backups: moving them
 to a separate file the rules exclude takes a daemon change and a config migration; excluding
-`config.json` itself would also drop every setting on restore.
+`config.json` itself would also drop every setting on restore, and excluding `app_webview/`
+would drop the web UI's own settings along with a pasted key.
 
 ## Suggested Play Console "Data safety" form answers
 
