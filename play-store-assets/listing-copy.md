@@ -70,12 +70,18 @@ PRIVACY BY DESIGN
 - No account, no login, no cloud backend for your conversations.
 - No telemetry, no analytics, no crash-reporting SDK phoning home in this
   build.
-- Chats and downloaded models live only in this app's private storage on
-  your device.
-- Your prompts, files, and model weights are never sent to us or anyone
-  else. The only network requests this app makes are ones you triggered
-  yourself: downloading a model you picked, fetching the inference engine
-  binary the first time it's needed, or a tool call you explicitly approved.
+- Your chats stay in this app's private storage on your device. Android's
+  own backup to your Google account and its transfer to a new phone also
+  copy them off it, if you use them (with a screen lock on Android 9 and
+  later, the backup is end-to-end encrypted). Downloaded models stay in
+  the app's storage unless you pick another folder for them.
+- Your prompts, files, and model weights are never sent to us. They leave
+  the phone only through that backup (which leaves models out), a tool
+  call you approve, or a device or service you connect the app to
+  yourself. The only network requests this app makes are ones you
+  triggered yourself: downloading a model you picked, fetching the
+  inference engine binary the first time it's needed, or a tool call you
+  explicitly approved.
 
 WORTH KNOWING
 
@@ -90,9 +96,9 @@ WHO IT'S FOR
 Privacy-conscious users, local-AI enthusiasts, developers who already run
 TurboLLM or llama.cpp on a computer, and anyone curious what a genuinely
 offline LLM chat feels like on a phone — under your control, on your
-hardware, with nothing leaving the device.
+hardware.
 ```
-(2,736 chars — well under the 4,000 limit; keyword density: "local" x6, "offline" x5, "AI"/"LLM"
+(3,140 chars — well under the 4,000 limit; keyword density: "local" x6, "offline" x5, "AI"/"LLM"
 x9, "on-device" x2, "privacy/private" x3, "no cloud/account/subscription/telemetry" x5, plus
 feature nouns tuned for search — Hugging Face, GGUF, agents, tokens, llama.cpp.)
 
