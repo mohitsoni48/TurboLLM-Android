@@ -1071,9 +1071,28 @@ void HandleChatCompletions(int fd, const Request& req) {
       }
     }
 
-    const bool stream = body.value("stream", false);
-    const bool include_usage =
-        body.contains("stream_options") && body["stream_options"].is_object() && body["stream_options"].value("include_usage", false);
+    // Absent or null is false for both, as the Python server's body.get() reads them, and as clients that write every
+    // optional field send them. json's value() threw type_error on a null, and the catch below made that a 500. Any
+    // other non-boolean is the client's mistake: a 400 that says so, not a 500.
+    bool stream = false;
+    if (body.contains("stream") && !body["stream"].is_null()) {
+      if (!body["stream"].is_boolean()) {
+        SendError(fd, req, 400, "stream must be a boolean");
+        return;
+      }
+      stream = body["stream"].get<bool>();
+    }
+    bool include_usage = false;
+    if (body.contains("stream_options") && body["stream_options"].is_object()) {
+      const json& so = body["stream_options"];
+      if (so.contains("include_usage") && !so.at("include_usage").is_null()) {
+        if (!so.at("include_usage").is_boolean()) {
+          SendError(fd, req, 400, "stream_options.include_usage must be a boolean");
+          return;
+        }
+        include_usage = so.at("include_usage").get<bool>();
+      }
+    }
 
     std::lock_guard<std::mutex> engine_lock(g_engine_mu);
     LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc);
