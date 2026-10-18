@@ -81,8 +81,12 @@ during generation.
 Record with the system screen recorder, with touches shown (Developer options → Show taps). Use
 a small model, so the first load is quick and the reply visibly continues.
 
-1. **0:00** Open TurboLLM. On the Models screen, load a small model, for example a
-   `.litertlm` such as LFM2.5-230M.
+1. **0:00** Open TurboLLM. On the Models screen, load a small GGUF model, for example
+   Qwen2.5-0.5B-Instruct (Q4_K_M). It runs on llama.cpp, the engine the app selects until you
+   pick another. A `.litertlm` model such as LFM2.5-230M runs only on LiteRT-LM, which the app
+   never selects by itself: under llama.cpp the Models screen hides it and a load started
+   anyway fails. To record with one, select LiteRT-LM in Engines before you start recording
+   (the engine selector at the top of that screen lists it as `litert-lm-android`).
 2. **0:08** In Workspace, ask for something long: *"Write a 500-word story about a lighthouse
    keeper."* Let a line or two of the reply appear.
 3. **0:15** Pull down the notification shade. Show the TurboLLM notification reading
