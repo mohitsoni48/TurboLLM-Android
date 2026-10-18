@@ -26,6 +26,7 @@ private const val NOTIFICATION_ID = 1
 private const val ACTION_QUIT = "com.turbollm.app.QUIT"
 private const val ACTION_ACTIVITY_FINISHED = "com.turbollm.app.ACTIVITY_FINISHED"
 private const val ACTION_REPOST = "com.turbollm.app.REPOST"
+private const val EXTRA_ACTIVITY = "com.turbollm.app.ACTIVITY"
 private const val POLL_MS = 3000L
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
@@ -101,6 +102,11 @@ class EngineService : Service() {
                 stopSelf(startId) // this intent created the service; it was not running in the foreground
                 return START_NOT_STICKY
             }
+            // Only the newest activity's close counts. Android destroys a finished activity once the next one on
+            // screen is idle, so after Back and a quick reopen the old activity's close can come after the new one's
+            // start, and acting on it unloaded the model under the open app (and with notifications off stopped the
+            // service too).
+            if (intent.getIntExtra(EXTRA_ACTIVITY, 0) != newestActivity) return START_NOT_STICKY
             appClosed()
             return START_NOT_STICKY
         }
@@ -193,15 +199,23 @@ class EngineService : Service() {
     private fun stopNow() {
         if (!stopping.compareAndSet(false, true)) return
         val startId = lastStartId
+        // The app came back if an activity was created since: MainActivity.onCreate takes its number at once, while
+        // the start it sends waits on the main thread behind that onCreate, and stopWhenIdle stays set until it runs.
+        val activity = newestActivity
         Thread({
             // `busy` is the poll's view, up to 3 s old: a reply sent just before Back would not be in it yet. Ask the
             // daemon now, and again right before unloading, so a generation that has just started is never aborted.
             val idle = !queryBusy() && !queryDownloading() && !ModelImport.isRunning()
-            if (idle) unloadModel { stopWhenIdle && !queryBusy() && !queryDownloading() && !ModelImport.isRunning() }
+            if (idle) {
+                unloadModel {
+                    stopWhenIdle && newestActivity == activity &&
+                        !queryBusy() && !queryDownloading() && !ModelImport.isRunning()
+                }
+            }
             ContextCompat.getMainExecutor(this).execute {
                 stopping.set(false)
                 // onDestroy releases the wake lock and clears `running` once the stop takes effect.
-                if (idle && stopWhenIdle && !busy) stopSelfResult(startId)
+                if (idle && stopWhenIdle && newestActivity == activity && !busy) stopSelfResult(startId)
             }
         }, "turbollm-stop").start()
     }
@@ -363,10 +377,18 @@ class EngineService : Service() {
     }
 
     companion object {
-        /** The activity is finishing (Back): see ACTION_ACTIVITY_FINISHED. */
-        fun activityFinished(context: Context) {
+        /** The number of the newest MainActivity instance (activityOpened), so a close from an older one is ignored
+         *  (see ACTION_ACTIVITY_FINISHED). Set on the main thread, read by the stop thread too. */
+        @Volatile private var newestActivity = 0
+
+        /** MainActivity.onCreate: this activity's number, to hand back to activityFinished. */
+        fun activityOpened(): Int = ++newestActivity
+
+        /** The activity numbered [activity] is finishing (Back): see ACTION_ACTIVITY_FINISHED. */
+        fun activityFinished(context: Context, activity: Int) {
             runCatching {
-                context.startService(Intent(context, EngineService::class.java).setAction(ACTION_ACTIVITY_FINISHED))
+                val intent = Intent(context, EngineService::class.java).setAction(ACTION_ACTIVITY_FINISHED)
+                context.startService(intent.putExtra(EXTRA_ACTIVITY, activity))
             }.onFailure { Log.w(TAG, "could not reach the engine service", it) }
         }
 

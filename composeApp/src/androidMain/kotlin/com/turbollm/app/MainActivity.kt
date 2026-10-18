@@ -44,6 +44,8 @@ private val nodeStarted = AtomicBoolean(false)
 
 class MainActivity : ComponentActivity() {
     private lateinit var storageAccess: StorageAccess
+    /** From EngineService.activityOpened: the service ignores this activity's close once a newer one is open. */
+    private var activityNumber = 0
 
     /** The system file picker for importing models (ModelImport). Any type: .gguf and .litertlm have no MIME type
      *  providers agree on, so ModelImport checks the name instead. */
@@ -67,6 +69,8 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         recordCrashes()
+        // First, so a stop the service began on the last Back sees at once that the app is open again (stopNow).
+        activityNumber = EngineService.activityOpened()
 
         // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
         // nothing pushed to the device. Synchronous on purpose: the Node thread started below
@@ -148,7 +152,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         // Back, not a configuration change (those no longer recreate the activity, see the manifest).
-        if (isFinishing) EngineService.activityFinished(this)
+        // Android may run this only after the app was opened again, a new MainActivity included (activityNumber).
+        if (isFinishing) EngineService.activityFinished(this, activityNumber)
         super.onDestroy()
     }
 
