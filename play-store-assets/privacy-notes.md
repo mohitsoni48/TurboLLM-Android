@@ -127,6 +127,18 @@ and Android would then skip the whole cloud backup, chats and `config.json` incl
 other excluded models, they can be copied or downloaded again. Android itself never backs up
 `cache/`, `code_cache/` or `no_backup/`.
 
+When the cloud backup actually runs: Android's scheduled Auto Backup takes an app at most once a
+day, and by default only while the phone is idle, charging and on Wi-Fi (any unmetered network, or
+mobile data if the user allowed it). It also passes over an app that counts as in the foreground,
+and an app running a foreground service does. `EngineService` is one, and it runs from the moment
+the app is opened until Quit (with notifications off, until the app is left with nothing
+generating, importing or downloading), so while it runs Android puts TurboLLM's backup off and
+tries again 1 to 3 hours later. A phone that keeps the app open day and night can go a long time
+without a new TurboLLM backup; one is taken on a night the app is not running, after Quit, a
+reboot, or Android ending the process. Excluding the models only keeps a backup that does run
+under the 25 MB quota. `android:backupInForeground="true"` would remove the wait, but Android
+stops the app to back it up, which would unload the model and cut off a reply, so it is not set.
+
 `config.json` also holds, in plaintext, every third-party credential the user has entered: the
 Hugging Face and GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi
 search keys, MCP server keys and env, and the raw Turbo Link peer tokens that grant access to the
