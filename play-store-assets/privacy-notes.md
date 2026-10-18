@@ -103,14 +103,12 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
      folder is set (`StorageAccess.kt`). On Android 11+ the app requests no storage permission, so
      in shared storage it can read only files it created itself; models are imported with the
      system file picker, which needs none.
-   - `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` — declared since the first build, but nothing uses it:
-     no code asks for the exemption (`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`). Google Play
-     allows asking for it only when Doze breaks the app's core function, so remove it or justify
-     it before submitting.
    - No location, camera, microphone or contacts permission, and no All files access
      (`MANAGE_EXTERNAL_STORAGE`). `FOREGROUND_SERVICE_DATA_SYNC`, which an earlier build declared
      for a foreground service it never implemented and Play's automated review flagged, is gone;
      the foreground service now in the app is the `specialUse` one above.
+     `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, which earlier builds declared but never used (no code
+     asked for the exemption), is gone too.
 
 ## Where data lives
 
