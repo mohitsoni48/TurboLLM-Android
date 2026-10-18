@@ -10,8 +10,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Model folders in shared storage (/sdcard/AI…), Android 10 and older only: the ordinary storage permissions,
          read to scan and load, write because the daemon downloads into the primary model folder. On Android 11+ the
-         app does not read shared storage at all: models are imported with the system file picker, which needs no
-         permission (ModelImport.kt, StorageAccess.kt). -->
+         app holds none, so in shared storage it reads only the files it created itself (downloads into a primary
+         model folder under Download/ or Documents/); models the user or another app put there are imported with the
+         system file picker instead, which needs no permission (ModelImport.kt, StorageAccess.kt). -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 

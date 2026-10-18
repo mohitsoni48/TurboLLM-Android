@@ -94,8 +94,24 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
 ## Where data lives
 
 `HOME` is set to the app's private `filesDir` (`MainActivity.kt`), so the daemon's usual
-`~/.turbollm`-equivalent state (chats, config, downloaded models/engines) lands entirely inside
-Android's app-private storage — not shared storage, not readable by other apps.
+`~/.turbollm`-equivalent state (chats, config, downloaded engines) lands inside Android's
+app-private storage, which other apps cannot read. So do the models, unless the user adds a model
+folder somewhere else: imported ones go to `files/models/`, and downloads go to the primary model
+folder, which is one of the app's own unless the user picks another. A model folder the user adds
+can be:
+- in shared storage, such as `/sdcard/AI`: the app reads it on Android 10 and older, with the
+  storage permission, and downloads into it when it is the primary model folder. Other apps with
+  storage access, and a computer over USB, can read the models there. On Android 11+ the app
+  cannot read the models the user or another app put there, and offers to import them instead
+  (`StorageAccess.kt`). Android still lets it create files under `Download/` and `Documents/`,
+  though, so if the primary model folder is in one of those, the daemon's downloads can land in
+  shared storage there: the app reads them back, and a computer over USB or an app with All files
+  access can read them too.
+- in the app's external files folder, `Android/data/com.turbollm/files/`: no permission needed,
+  and downloaded into when it is the primary model folder. A computer over USB can read it, and
+  on Android 10 and older so can other apps with the storage permission.
+
+Chats and settings stay in `filesDir` either way.
 
 **Backups — one open decision for the dev team before shipping:**
 `AndroidManifest.xml` has `android:allowBackup="true"` with backup rules
