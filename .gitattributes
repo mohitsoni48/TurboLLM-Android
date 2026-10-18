@@ -1,0 +1,6 @@
+# Files a Unix shell runs keep LF line endings on every checkout. Git for Windows checks text out
+# with CRLF by default, and the WSL engine build runs scripts/*.sh straight from that checkout
+# (BUILDING-ENGINES.md: bash "/mnt/d/.../scripts/build-static-engine.sh"), where bash stops at the
+# first \r ("set: pipefail: invalid option name"). gradlew is the same for WSL, Linux and macOS.
+*.sh    text eol=lf
+gradlew text eol=lf

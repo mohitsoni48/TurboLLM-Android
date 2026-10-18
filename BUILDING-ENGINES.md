@@ -449,8 +449,19 @@ wsl -d Ubuntu-24.04 -u root -- bash "/mnt/d/llama-turbo/TurboLLM Android/scripts
 DRY_RUN=1 bash scripts/build-static-engine.sh   # resolved paths + the commands, builds nothing
 ```
 
-It is the WSL original plus the four things that original did not do, each of which exists
-because of something that went wrong:
+A Windows checkout that had the scripts before `.gitattributes` pinned them and `gradlew` to LF
+still has the CRLF copies Git for Windows wrote by default (`core.autocrlf=true`), and bash stops
+at the first `\r`: "set: pipefail: invalid option name". Pulling does not rewrite them, since
+their contents did not change, and `git status` stays clean. Write them again once, with Git for
+Windows in that checkout (this discards uncommitted edits to those four files, nothing else):
+
+```bash
+git rm -q --cached -- "scripts/*.sh" gradlew
+git checkout HEAD -- "scripts/*.sh" gradlew
+```
+
+The script is the WSL original plus the four things that original did not do, each of which
+exists because of something that went wrong:
 
 - **Builds ONE static binary** — `-DBUILD_SHARED_LIBS=OFF` with `-DGGML_BACKEND_DL=OFF`, since
   the runtime backend loader is a shared-library mechanism and the two are incompatible. Same

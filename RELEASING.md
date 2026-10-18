@@ -108,6 +108,11 @@ not change `minSdk`, which stays at 24 — only the Vulkan binary itself needs A
 wsl -d Ubuntu-24.04 -u root -- bash "/mnt/d/llama-turbo/TurboLLM Android/scripts/build-static-engine.sh"
 ```
 
+On a Windows checkout that had the scripts before `.gitattributes` pinned them to LF, this stops
+at once with "set: pipefail: invalid option name" until they are written again; the one-time
+commands for that are in
+[BUILDING-ENGINES.md](BUILDING-ENGINES.md#the-build-script--scriptsbuild-static-enginesh).
+
 That script verifies the result (AArch64, system-only `NEEDED`, embedded commit == `$SRC`
 HEAD, size, sha256) and installs it into `composeApp/src/androidMain/jniLibs/arm64-v8a/`
 itself. See [BUILDING-ENGINES.md](BUILDING-ENGINES.md#build-b--the-vulkan-gpu-engine).
