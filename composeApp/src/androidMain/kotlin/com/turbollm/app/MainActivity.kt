@@ -162,8 +162,9 @@ class MainActivity : ComponentActivity() {
         return mapOf("TURBOLLM_ANDROID_SOC" to name)
     }
 
-    /** The engine notification carries the Quit action and the "phone is hot" warning. Asked once; Android stops
-     *  prompting on its own after the user declines, and the service runs either way. */
+    /** The engine notification carries the Quit action and the "phone is hot" warning. Asked each time the activity
+     *  is created while it is not granted, with nothing kept to stop asking; Android stops showing the prompt on its
+     *  own once the user has declined it twice. The service runs either way. */
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT < 33) return
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
@@ -174,12 +175,14 @@ class MainActivity : ComponentActivity() {
      *  install works with nothing ever pushed to the device.
      *
      *  This replaces a `/sdcard` copy that was only ever a dev helper. That approach cannot work
-     *  for a real user twice over: the app declares no storage permission, and nothing would have
-     *  put the files there anyway. It also hid a second, larger problem — the daemon bundle the
-     *  npm build produces leaves `dependencies` external (npm installs them on a desktop), so a
-     *  genuinely fresh install died at boot with `Cannot find package '@hono/node-server'`. The
-     *  payload staged into assets is therefore built by a separate Android pass with its
-     *  dependencies bundled in (turbollm/tsup.android.config.ts + scripts/stage-daemon-assets.mjs).
+     *  for a real user twice over: the app holds no storage permission to read it with unless, on
+     *  Android 10 or older, the user allowed one for a model folder in shared storage (none on 11+),
+     *  and nothing would have put the files there anyway. It also hid a second, larger problem —
+     *  the daemon bundle the npm build produces leaves `dependencies` external (npm installs them
+     *  on a desktop), so a genuinely fresh install died at boot with `Cannot find package
+     *  '@hono/node-server'`. The payload staged into assets is therefore built by a separate
+     *  Android pass with its dependencies bundled in (turbollm/tsup.android.config.ts +
+     *  scripts/stage-daemon-assets.mjs).
      *
      *  Re-extracted whenever the APK changes, keyed on `lastUpdateTime`: an app update ships a new
      *  daemon, and a stale copy in filesDir would silently win over it. Everything else in

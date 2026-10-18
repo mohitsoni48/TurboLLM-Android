@@ -48,23 +48,48 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
 1. **Native app code (Kotlin) only ever talks to `127.0.0.1`** — `DaemonClient.kt` and
    `DaemonWebView.kt` both hit `http://127.0.0.1:7000` (the embedded daemon), nothing external.
 2. **The embedded daemon (the same `turbollm` product code that runs on desktop) makes the same
-   categories of outbound request desktop does, all user-initiated:**
+   categories of outbound request desktop does, all user-initiated except where noted:**
    - Downloading a model you chose, from Hugging Face.
-   - Downloading the inference engine binary the first time it's needed (an NDK-cross-compiled
-     `llama-server`, hosted on TurboLLM's own GitHub/Hugging Face releases — ADR-391).
+   - Downloading an inference engine, which a normal install never does: the engines ship inside
+     the APK (the CPU `llama-server`, the LiteRT-LM server unless a build turns it off, and the
+     Vulkan `llama-server` in builds made with it) and are registered from there at every boot
+     (`engines/seed.ts`). The app has no way to install another: Android lets it run only code
+     installed with it, so its Engines page lists the built-in engines with no install control.
+     The daemon downloads one (TurboLLM's own Android build of `llama-server`, from Hugging Face)
+     in two cases only: once at boot, not started by you, if no engine in the APK could be
+     registered at all, and when a client calls its engine-install API directly, which nothing in
+     the app does.
    - Any in-chat tool call you explicitly approve (e.g. `web_search`), same approval-gated flow as
      desktop.
    - **Not present on this build:** the periodic telemetry upload — disabled per above.
 3. **`AndroidManifest.xml` permissions**, and why each exists:
    - `INTERNET` — the above network use.
-   - `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` — lets the user optionally exempt TurboLLM from the OS
-     killing an in-progress local inference run.
-   - No location, camera, microphone, contacts, notification, or broad storage permission
-     requested. (`FOREGROUND_SERVICE`/`FOREGROUND_SERVICE_DATA_SYNC`/`POST_NOTIFICATIONS` were
-     declared in earlier builds for a foreground-service notification that was never actually
-     implemented — the daemon just runs on a background thread inside the activity — and were
-     removed after Play's automated review flagged the unused `FOREGROUND_SERVICE_DATA_SYNC`
-     grant.)
+   - `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_SPECIAL_USE` — `EngineService`, a foreground
+     service of type `specialUse` that keeps the daemon, the engines and a loaded model running
+     while the app is in the background. It starts when the app is opened and runs until Quit in
+     its notification (or, with notifications off, until the app is left with nothing generating,
+     importing or downloading). `PLAY-FGS-DECLARATION.md` has the text for Play's declaration.
+   - `POST_NOTIFICATIONS` — that service's ongoing notification, which carries the Quit action and
+     the "phone is hot" warning. On Android 13+ the app asks for it each time it starts until it is
+     granted; Android stops showing the prompt once the user has declined it twice. The service
+     runs either way.
+   - `WAKE_LOCK` — a partial wake lock, held only while a reply is generated or a model imported or
+     downloaded, so that work finishes with the screen off; never while idle.
+   - `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE`, Android 10 and older only
+     (`maxSdkVersion="29"`, with `requestLegacyExternalStorage`) — for a model folder the user adds
+     in shared storage, such as `/sdcard/AI`: read to scan and load its models, write because the
+     daemon downloads into the primary model folder. Asked for, after a dialog, only when such a
+     folder is set (`StorageAccess.kt`). On Android 11+ the app requests no storage permission, so
+     in shared storage it can read only files it created itself; models are imported with the
+     system file picker, which needs none.
+   - `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` — declared since the first build, but nothing uses it:
+     no code asks for the exemption (`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`). Google Play
+     allows asking for it only when Doze breaks the app's core function, so remove it or justify
+     it before submitting.
+   - No location, camera, microphone or contacts permission, and no All files access
+     (`MANAGE_EXTERNAL_STORAGE`). `FOREGROUND_SERVICE_DATA_SYNC`, which an earlier build declared
+     for a foreground service it never implemented and Play's automated review flagged, is gone;
+     the foreground service now in the app is the `specialUse` one above.
 
 ## Where data lives
 
