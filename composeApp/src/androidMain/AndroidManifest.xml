@@ -51,7 +51,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="On-device LLM inference server: keeps a loaded model and in-progress generations alive while the user is in another app" />
+                android:value="On-device LLM inference server: keeps a loaded model and in-progress generations alive while the user is in another app, along with the model imports and downloads the user started for it" />
         </service>
     </application>
 </manifest>

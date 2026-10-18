@@ -19,6 +19,17 @@ No standard type describes this work:
 - `shortService` is limited to about 3 minutes.
 - A WorkManager long-running worker still runs as a typed foreground service.
 
+The same service also keeps a model import or an in-app model download going until it is done.
+Taken alone, those transfers are `dataSync` work: Android's list for that type includes upload or
+download and import or export. They are not why the service runs, though. It starts when the app
+is opened, not for them, so it is already up for the inference server by the time the user starts
+an import or a download from the app's own screens, and they only bring in the models that server
+loads. Declaring the service `dataSync` instead would limit the inference server to 6 hours in 24
+while the app is in the background (this app targets Android 15+). The declaration below says so
+to Play. If Play asks for the transfers to be declared on their own: it allows more than one type
+per service, but adding `dataSync` is a code change (`EngineService`'s `startForeground` type and
+the manifest) that this page does not make.
+
 The manifest's `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` already states the use. The text below expands
 it for the form.
 
@@ -57,10 +68,13 @@ during generation.
 
 **Why does no other foreground service type fit?**
 
-> The work is a local, user-started AI inference server. It is not data sync, media playback or processing,
-> location, a phone call, health or connected-device work, and it lasts as long as the user keeps the app in use,
-> longer than shortService allows. The other candidate types are capped at 6 hours on Android 15 and describe
-> different work.
+> The work is a local, user-started AI inference server, kept running for as long as the user keeps the app in use.
+> It is not media playback or processing, location, a phone call, health or connected-device work, and it lasts
+> longer than shortService allows. The model imports and downloads the service also keeps going are data transfers,
+> but they are not why it runs: it starts when the app is opened, not for them, they run inside it while it is
+> already up for the inference server, and they only bring in the models that server loads. dataSync fits those
+> transfers alone, and like mediaProcessing it is capped at 6 hours in 24 on Android 15, while the inference server
+> runs for as long as the app is in use.
 
 ## Video script (about 45 seconds, screen recording on a phone)
 
