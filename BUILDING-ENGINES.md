@@ -87,14 +87,15 @@ about 220 MB of which is `@earendil-works/pi-*` plus its `@mistralai`/`@google`/
 `turbollm/tsup.android.config.ts` is a **separate build pass** that bundles the dependencies in.
 Total payload: **14.5 MB**.
 
-Four things in that config are load-bearing, each one a crash that was hit and fixed:
+Four things in that build are load-bearing, each one a crash that was hit and fixed. The first
+three are set in that config; the last is written by `stage-daemon-assets.mjs`:
 
 | Setting | Without it |
 |---|---|
 | `target: 'node18'` | nodejs-mobile embeds Node **18.20.4**, not the 22 the desktop package targets — syntax the phone cannot parse |
 | `banner` defines `require` | bundled CommonJS keeps esbuild's `__require` shim, which throws: `Dynamic require of "assert" is not supported` (undici) |
 | `banner` defines `__dirname` | `ReferenceError: __dirname is not defined in ES module scope` — sql.js locates its own `.wasm` that way |
-| `dist/package.json` = `{"type":"module"}` | Node decides ESM by walking up for the nearest `package.json`; without one above the extracted bundle it reads the ESM entrypoint as CommonJS and dies on `import` |
+| `daemon/package.json` = `{"type":"module","version":…}` | Node decides ESM by walking up for the nearest `package.json`; without one above the extracted bundle it reads the ESM entrypoint as CommonJS and dies on `import`. The daemon also reads its version from the file's `version` field (`dist/../package.json`) and reports 0.1.1 when that field is missing |
 
 Two files cannot be bundled and are staged beside the bundle instead:
 
