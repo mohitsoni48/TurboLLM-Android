@@ -46,9 +46,25 @@ this file) and grepped all Kotlin source for network calls. Findings below descr
 CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnostics" row.
 
 1. **Native app code (Kotlin) only ever talks to `127.0.0.1`** — `DaemonClient.kt` and
-   `DaemonWebView.kt` both hit `http://127.0.0.1:7000` (the embedded daemon), nothing external.
+   `DaemonWebView.kt` both hit `http://127.0.0.1:7000` (the embedded daemon). The web UI in that
+   WebView goes further, though: it loads the images its pages point at from any https host, and
+   from any host over plain http on port 80. The daemon's CSP for the app allows that on purpose
+   (`APP_SECRET_CSP` in its `server.ts`: images and media from `'self'`, any `https:` host,
+   `http://*`, which with no port matches plain http on port 80 only, `data:` and `blob:`), and
+   `DaemonWebView.kt` refuses only other `127.0.0.1` ports. Those are the images in a model card
+   (the README in the Hugging Face dialog, which can embed images from any site) and markdown
+   images in chat replies and the other text the UI renders as markdown. An image in a reply loads
+   as soon as the reply shows, with no approval, so a reply (after a prompt injection in a pasted
+   file or a search result, say) can make the phone contact a host the model names and pass it
+   text from the chat in the image's URL. That behaviour is TurboLLM#287's "Known, not fixed
+   here" entry "Markdown images in chat", an owner decision; fill in the Data safety form with it
+   in mind.
 2. **The embedded daemon (the same `turbollm` product code that runs on desktop) makes the same
    categories of outbound request desktop does, all user-initiated except where noted:**
+   - Searching and browsing Hugging Face from Discover: opening it lists popular repos, typing
+     searches them, and opening a repo fetches its details, its file list and its model card (the
+     README; for a repo of checkpoints, their config files too), all from `huggingface.co` over
+     HTTPS, with the user's Hugging Face token when one is set (`hf/hf.ts`).
    - Downloading a model you chose, from Hugging Face.
    - Downloading an inference engine, which a normal install never does: the engines ship inside
      the APK (the CPU `llama-server`, the LiteRT-LM server unless a build turns it off, and the
@@ -62,6 +78,11 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
    - Any in-chat tool call you explicitly approve (e.g. `web_search`), same approval-gated flow as
      desktop.
    - **Not present on this build:** the periodic telemetry upload — disabled per above.
+   - **Not present in the app either:** desktop's check for a newer TurboLLM, which fetches
+     `registry.npmjs.org/turbollm/latest` at every daemon start and when Settings reads a stale
+     answer. The app updates through Play, so the daemon skips that check inside it (TurboLLM#287,
+     "fix(update): the Android app does not check npm for an app update"); Termux installs, which
+     update through npm, keep it.
 3. **`AndroidManifest.xml` permissions**, and why each exists:
    - `INTERNET` — the above network use.
    - `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_SPECIAL_USE` — `EngineService`, a foreground
@@ -176,9 +197,13 @@ would drop the web UI's own settings along with a pasted key.
   usage data** (App activity → App interactions, Device or other IDs). Both are shared with
   Google as the processor (Play's form has a specific "shared with Firebase/Google for analytics"
   path — use it, don't mark this as "not shared"). Your own chat content, prompts, files, and
-  model weights are NOT collected or shared by either SDK or by TurboLLM.
+  model weights are NOT collected or shared by either SDK or by TurboLLM. TurboLLM itself
+  collects nothing, but an image in a model reply loads from the host it names (any https host,
+  or plain http on port 80) as soon as the reply shows, so text a reply puts in an image's URL
+  reaches that host (item 1 under "What this app actually does over the network").
 - **Is data encrypted in transit?** Yes for Firebase's traffic (Google's SDKs use HTTPS/TLS).
-  N/A for the app's own loopback traffic; Hugging Face/GitHub downloads use HTTPS.
+  N/A for the app's own loopback traffic; Hugging Face/GitHub downloads use HTTPS. Images in a
+  reply or a model card can load over plain http, on port 80 (item 1).
 - **Can users request data deletion?** Yes for local app data — uninstalling removes it, and there
   is no TurboLLM-side account/record. For Firebase-held crash/analytics data, follow Firebase's
   own data deletion process (Google Analytics for Firebase supports user-level deletion requests) —
