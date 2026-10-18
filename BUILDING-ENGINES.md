@@ -143,10 +143,21 @@ line per engine to `files/daemon.log`. Only that launch registers them: later bo
 `android: refreshed bundled engine …` or `android: repaired stale engine path …` for an engine
 whose path or version changed and nothing for the others, and `daemon.log` is truncated each
 time Node starts. So on a phone that already had the app, an empty grep does not mean the
-engines are missing. To query the API itself, create a key in the app (Customize → Connect →
-API keys) and send it as `X-TurboLLM-Auth: <key>`. Only a debug build lets an adb host skip the
-key: its WebView accepts Chrome DevTools over adb, and script run there acts as the app. Release
-builds turn WebView debugging off.
+engines are missing. Uninstalling first does not always make the next launch a first one
+either: Android restores an app's Auto Backup whenever it is installed, `adb install` included,
+if the backup was made by an APK signed with the same key (for the debug APK above, one of your
+own earlier debug builds). On such a phone the restored `.turbollm/config.json` already lists
+the engines, at the old install's library path. That launch then logs the `refreshed …` or
+`repaired …` line for an engine whose path or version changed and nothing for the others, and
+the grep above finds nothing. To keep the check a first registration, turn install-time restore
+off around it: note what `adb shell settings get secure backup_auto_restore` prints (`1`, or
+`null` if it was never changed, means on), run `adb shell bmgr autorestore false` before
+`adb install`, and once done run `adb shell bmgr autorestore true` only if it was on, since it
+is the phone's own Automatic restore setting. Or read the engines from the API. To query the
+API itself, create a key in the app (Customize → Connect → API keys) and send it as
+`X-TurboLLM-Auth: <key>`. Only a debug build lets an adb host skip the key: its WebView accepts
+Chrome DevTools over adb, and script run there acts as the app. Release builds turn WebView
+debugging off.
 
 ---
 
