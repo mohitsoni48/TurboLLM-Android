@@ -3,7 +3,9 @@ package com.turbollm.app
 import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
 import java.net.Proxy
+import java.net.Socket
 import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -23,16 +25,16 @@ import javax.crypto.spec.SecretKeySpec
  *  secret itself. A proof per request rather than one kept until a request fails: an app that took the port over
  *  between two requests would answer the second one, not fail it.
  *
- *  A proof vouches only for the listener, so the proof and the request each go out on a new socket (Connection:
- *  close), never on a pooled one. Android's HttpURLConnection keeps keep-alive sockets in one pool for the process and
- *  reuses them even after disconnect(), and a pooled socket stays connected to whoever accepted it: an app holding the
- *  port at launch could let our daemon have it, keep the socket we pooled, pass each nonce on to the daemon, and
- *  receive the request that follows on that socket. With every socket to the port closed after its one request,
- *  nothing to it is ever in the pool. What this guarantees: the secret goes out only on a connection opened just after
- *  our daemon, on another new connection, proved it held the port. It reaches another app only if the daemon gave the
- *  port up in between, i.e. a LAN-toggle rebind; an app that is still on the port when the daemon binds again makes
- *  the daemon exit (cli.ts), so what is left is an app that binds and lets go inside that gap of a few ms, just as a
- *  request is made.
+ *  A proof vouches only for the listener, so the proof and the request each go out on a new socket, never on a pooled
+ *  one: the proof on a plain socket of its own (see PROOF_DEADLINE_MS), the request with Connection: close. Android's
+ *  HttpURLConnection keeps keep-alive sockets in one pool for the process and reuses them even after disconnect(), and
+ *  a pooled socket stays connected to whoever accepted it: an app holding the port at launch could let our daemon have
+ *  it, keep the socket we pooled, pass each nonce on to the daemon, and receive the request that follows on that
+ *  socket. With every socket to the port closed after its one request, nothing to it is ever in the pool. What this
+ *  guarantees: the secret goes out only on a connection opened just after our daemon, on another new connection, proved
+ *  it held the port. It reaches another app only if the daemon gave the port up in between, i.e. a LAN-toggle rebind;
+ *  an app that is still on the port when the daemon binds again makes the daemon exit (cli.ts), so what is left is an
+ *  app that binds and lets go inside that gap of a few ms, just as a request is made.
  *
  *  Both connections also go straight to the port, never through the system HTTP proxy (Proxy.NO_PROXY). Android
  *  exempts 127.0.0.1 from that proxy only when the proxy's bypass list is not empty, and it often is empty: a Wi-Fi
@@ -40,21 +42,26 @@ import javax.crypto.spec.SecretKeySpec
  *  VpnService.Builder.setHttpProxy. A proxy app on the phone would then carry both connections: it could pass the
  *  nonce on to our daemon, which proves itself, and read the request that follows, secret and all. */
 object DaemonAuth {
-    private const val BASE = "http://127.0.0.1:$ANDROID_DAEMON_PORT"
+    private const val HOST = "127.0.0.1"
+    private const val BASE = "http://$HOST:$ANDROID_DAEMON_PORT"
     private val random = SecureRandom()
 
     // Until its answer checks out, the port's holder may be another app, and nothing it sends may stall or crash us.
-    // HttpURLConnection's timeouts are per read, so an answer trickled a byte at a time would keep the splash and the
-    // EngineService poll waiting as long as the sender liked: hence one deadline for the whole request. A huge or
-    // deeply nested body would run a plain read or a recursive JSON parser out of memory or stack, an Error: hence a
-    // cap on what is read, a regex rather than a parse, and catching Throwable. The daemon's answer,
-    // {"proof":"<64 hex>"}, is 76 bytes.
+    // Socket timeouts are per read, so an answer trickled a byte at a time would keep the splash and the EngineService
+    // poll waiting as long as the sender liked: hence one deadline for the whole request. An endless or deeply nested
+    // answer would run a plain read or a recursive JSON parser out of memory or stack, an Error: hence a cap on what
+    // is read, a regex rather than a parse, and catching Throwable. The cap covers the whole answer, status line and
+    // headers included, so the request is written by hand on a plain socket: HttpURLConnection reads the status line
+    // and headers whole before it hands over the body, with no limit, and header lines sent as fast as loopback goes
+    // filled a 96 MiB heap in under 2 s, well inside the deadline. The daemon's answer is about 230 bytes, its body
+    // {"proof":"<64 hex>"} 76.
     private const val PROOF_DEADLINE_MS = 3000L
     private const val PROOF_MAX_BYTES = 4096
     private val PROOF = Regex("\"proof\"\\s*:\\s*\"([0-9a-f]{64})\"")
+    private val STATUS_OK = Regex("^HTTP/1\\.[01] 200 ")
 
-    /** Ends a proof request still running at PROOF_DEADLINE_MS: disconnect() from another thread closes its socket,
-     *  which ends the read it is blocked in. */
+    /** Ends a proof request still running at PROOF_DEADLINE_MS: close() from another thread closes its socket, which
+     *  ends the connect or read it is blocked in. */
     private val deadlines = ScheduledThreadPoolExecutor(1) { r ->
         Thread(r, "DaemonAuth deadline").apply { isDaemon = true }
     }.apply { removeOnCancelPolicy = true }
@@ -65,28 +72,34 @@ object DaemonAuth {
      *  whatever the port's holder sends. */
     fun daemonProven(): Boolean = try {
         val nonce = hex(ByteArray(32).also { random.nextBytes(it) })
-        // Proxy.NO_PROXY: to the port itself, not to a proxy that could relay the nonce (class comment).
-        val conn = URL("$BASE/api/v1/app-proof?nonce=$nonce").openConnection(Proxy.NO_PROXY) as HttpURLConnection
-        conn.instanceFollowRedirects = false // the answer must come from this port, not from wherever it points
-        conn.setRequestProperty("Connection", "close") // a new socket, not left in the pool for open() (class comment)
-        conn.connectTimeout = 1000
-        conn.readTimeout = 2000
-        val deadline = deadlines.schedule(Runnable { conn.disconnect() }, PROOF_DEADLINE_MS, TimeUnit.MILLISECONDS)
-        try {
-            conn.responseCode == 200 && run {
-                // Only the first PROOF_MAX_BYTES, and matched as text rather than parsed: nothing the port's holder
-                // sends can grow the heap or the stack (comment at PROOF_DEADLINE_MS).
-                val body = conn.inputStream.use { readAtMost(it, PROOF_MAX_BYTES) }
-                val proof = PROOF.find(body)?.groupValues?.get(1).orEmpty()
-                // The daemon's message (appSecretProof): the address and port it was asked on, then the nonce.
-                val mac = Mac.getInstance("HmacSHA256")
-                mac.init(SecretKeySpec(DAEMON_APP_SECRET.toByteArray(), "HmacSHA256"))
-                val want = hex(mac.doFinal("turbollm-app-proof\n127.0.0.1:$ANDROID_DAEMON_PORT\n$nonce".toByteArray()))
-                MessageDigest.isEqual(want.toByteArray(), proof.toByteArray()) // constant time
+        // Proxy.NO_PROXY: to the port itself, not to a proxy that could relay the nonce (class comment). A socket of
+        // its own, never pooled, and closed after this one answer.
+        Socket(Proxy.NO_PROXY).use { socket ->
+            val deadline = deadlines.schedule(Runnable { socket.close() }, PROOF_DEADLINE_MS, TimeUnit.MILLISECONDS)
+            try {
+                socket.connect(InetSocketAddress(HOST, ANDROID_DAEMON_PORT), 1000)
+                socket.soTimeout = 2000
+                // Connection: close, so the daemon closes the socket after its answer and that ends the read below.
+                val request = "GET /api/v1/app-proof?nonce=$nonce HTTP/1.1\r\n" +
+                    "Host: $HOST:$ANDROID_DAEMON_PORT\r\nConnection: close\r\n\r\n"
+                socket.getOutputStream().apply { write(request.toByteArray(Charsets.US_ASCII)); flush() }
+                // Only the first PROOF_MAX_BYTES of the answer, headers included, and matched as text rather than
+                // parsed: nothing the port's holder sends can grow the heap or the stack (see PROOF_DEADLINE_MS).
+                val answer = readAtMost(socket.getInputStream(), PROOF_MAX_BYTES)
+                val bodyAt = answer.indexOf("\r\n\r\n")
+                // A 200 only: a redirect is not followed, the answer must come from this port. The proof is taken from
+                // the body, after the blank line that ends the headers.
+                STATUS_OK.containsMatchIn(answer) && bodyAt >= 0 && run {
+                    val proof = PROOF.find(answer, bodyAt + 4)?.groupValues?.get(1).orEmpty()
+                    // The daemon's message (appSecretProof): the address and port it was asked on, then the nonce.
+                    val mac = Mac.getInstance("HmacSHA256")
+                    mac.init(SecretKeySpec(DAEMON_APP_SECRET.toByteArray(), "HmacSHA256"))
+                    val want = hex(mac.doFinal("turbollm-app-proof\n$HOST:$ANDROID_DAEMON_PORT\n$nonce".toByteArray()))
+                    MessageDigest.isEqual(want.toByteArray(), proof.toByteArray()) // constant time
+                }
+            } finally {
+                deadline.cancel(false)
             }
-        } finally {
-            deadline.cancel(false)
-            conn.disconnect()
         }
     } catch (_: Throwable) {
         false // an Error too: no answer from the port may crash the app (comment at PROOF_DEADLINE_MS)
