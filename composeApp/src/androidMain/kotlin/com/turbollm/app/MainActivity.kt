@@ -80,7 +80,8 @@ class MainActivity : ComponentActivity() {
         EngineService.start(this)
         requestNotificationPermission()
         storageAccess = StorageAccess(this)
-        // A model import interrupted by the process dying leaves a multi-GB <name>.part behind; nothing else removes it.
+        // A model import interrupted by the process dying leaves a multi-GB <name>.import-part behind; nothing else
+        // removes it. Only that suffix: a daemon download into the same folder keeps its <name>.part there.
         Thread { ModelImport.sweepPartialFiles(this) }.start()
 
         if (nodeStarted.compareAndSet(false, true)) {
