@@ -22,7 +22,8 @@ embedded daemon with:
 ```kotlin
 args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
 ```
-— `composeApp/src/androidMain/kotlin/com/turbollm/app/MainActivity.kt:69`
+— `composeApp/src/androidMain/kotlin/com/turbollm/app/MainActivity.kt`, in the `startScript` call
+that launches the daemon
 
 `--no-telemetry` is documented as a one-way kill switch in the telemetry doc — no runtime toggle
 can turn it back on. So the desktop-style telemetry system (usage levels, event log, opt-out UI
@@ -45,10 +46,16 @@ Material — no Firebase, no Crashlytics, no ads SDK, no analytics SDK present *
 this file) and grepped all Kotlin source for network calls. Findings below describe the app AS
 CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnostics" row.
 
-1. **Native app code (Kotlin) only ever talks to `127.0.0.1`** — `DaemonClient.kt` and
-   `DaemonWebView.kt` both hit `http://127.0.0.1:7000` (the embedded daemon). The web UI in that
-   WebView goes further, though: it loads the images its pages point at from any https host, and
-   from any host over plain http on port 80. The daemon's CSP for the app allows that on purpose
+1. **Native app code (Kotlin) only ever talks to `127.0.0.1`**: all of it goes to the embedded
+   daemon at `http://127.0.0.1:7000`. `DaemonWebView.kt` loads the UI from there, and
+   `DaemonAuth.kt` makes the app's other calls to it: the check that the daemon proves itself
+   before the app sends its secret, and the authenticated requests from `EngineService.kt`
+   (activity, downloads, engine stop), `ModelImport.kt` (adding the imported-models folder) and
+   `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain` points at
+   `127.0.0.1:6996`; it is unused Spike A code that only the old `App()` screen, which the
+   Android app never shows, constructs.) The web UI in that WebView goes further, though: it
+   loads the images its pages point at from any https host, and from any host over plain http
+   on port 80. The daemon's CSP for the app allows that on purpose
    (`APP_SECRET_CSP` in its `server.ts`: images and media from `'self'`, any `https:` host,
    `http://*`, which with no port matches plain http on port 80 only, `data:` and `blob:`), and
    `DaemonWebView.kt` refuses only other `127.0.0.1` ports. Those are the images in a model card
