@@ -51,7 +51,7 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
    `DaemonAuth.kt` makes the app's other calls to it: the check that the daemon proves itself
    before the app sends its secret, and the authenticated requests from `EngineService.kt`
    (activity, downloads, status, and the request to write the chat database to disk before
-   the service stops), `ModelImport.kt` (adding the imported-models folder) and
+   Quit and before the service stops), `ModelImport.kt` (adding the imported-models folder) and
    `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain` points at
    `127.0.0.1:6996`; it is unused Spike A code that only the old `App()` screen, which the
    Android app never shows, constructs.) The web UI in that WebView goes further, though: it

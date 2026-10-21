@@ -154,16 +154,27 @@ class EngineService : Service() {
 
     /** "Quit" in the notification: how the user frees a loaded model's memory without going back into the app, since
      *  the service otherwise outlives the activity (with notifications off there is no Quit, see appClosed). Killing
-     *  the process takes the engine children with it (Android kills the app's whole process group). */
+     *  the process takes the engine children with it (Android kills the app's whole process group).
+     *
+     *  The daemon writes its chat database to disk first (flushDatabase). The kill used to come at once, and the
+     *  daemon writes the database only on its own schedule, so a reply that had just finished, or a chat started just
+     *  before Quit, was gone when the app was opened again. The flush runs off the main thread, where this is called,
+     *  and takes at most FLUSH_WAIT_MS; the service stays in the foreground until then, so Android cannot freeze the
+     *  process under the write. The kill follows whatever the flush answered. */
     private fun quit() {
         Log.i(TAG, "quit from the notification")
         synchronized(stateLock) {
             running = false
             releaseWakeLock()
         }
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
-        Process.killProcess(Process.myPid())
+        Thread({
+            flushDatabase()
+            ContextCompat.getMainExecutor(this).execute {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                Process.killProcess(Process.myPid())
+            }
+        }, "turbollm-quit").start()
     }
 
     /** Swiped away from Recents: the same as backing out of the app. */
