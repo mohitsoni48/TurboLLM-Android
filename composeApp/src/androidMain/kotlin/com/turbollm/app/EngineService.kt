@@ -46,15 +46,23 @@ private val LOADED_STATES = setOf("starting", "running", "stopping")
  *  Type `specialUse` (Android 14+): a local inference server fits none of the fixed types, and
  *  `dataSync` would be wrong and is capped at 6 hours on Android 15.
  *
- *  It also holds a partial wake lock, but only while there is work: a reply being generated (the
- *  daemon's own /api/v1/activity, the gate the UI uses), a model download (/api/v1/downloads),
- *  both polled over loopback, or a model import (ModelImport). So a long reply or a multi-GB
- *  transfer finishes with the screen off without keeping the CPU awake while idle. */
+ *  It also holds a partial wake lock, but only while there is work: a reply being generated, or a
+ *  model load, an auto-tune or a skill being written (the daemon's own /api/v1/activity, the gate
+ *  the UI uses), a model download (/api/v1/downloads), both polled over loopback, or a model
+ *  import (ModelImport). So a long reply or a multi-GB transfer finishes with the screen off
+ *  without keeping the CPU awake while idle, or while a chat waits for the user to answer a tool
+ *  approval. */
 class EngineService : Service() {
     @Volatile private var running = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
     @Volatile private var busy = false
+    /** The notification's line for what the daemon is running (DaemonActivity.work), null while nothing is. Written by
+     *  the poll, read wherever the notification is built, like the fields below. */
+    @Volatile private var work: String? = null
+    /** A chat waits for the user to answer a tool approval (DaemonActivity.waiting): named in the notification, not
+     *  work, so no wake lock is held for it. */
+    @Volatile private var waiting = false
     @Volatile private var importing = false
     /** What the notification shows while a model download is running or queued (downloadNotice), null while none
      *  is. Written by the poll, read wherever the notification is built. */
@@ -278,14 +286,13 @@ class EngineService : Service() {
         while (running) {
             // A model import counts as work too: the service must neither stop nor let the CPU sleep under the copy.
             val importing = ModelImport.isRunning()
-            if (importing != this.importing) {
-                this.importing = importing
-                updateNotification()
-            }
             // So does a model download (Discover): a stopped service or a sleeping CPU would stall a multi-GB transfer.
             val downloads = queryDownloads()
             val downloading = !downloads.isNullOrEmpty()
-            val nowBusy = queryBusy() || importing || downloading
+            val activity = queryActivity()
+            val work = activity?.work
+            val waiting = activity?.waiting == true
+            val nowBusy = work != null || importing || downloading
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
             synchronized(stateLock) {
@@ -301,17 +308,22 @@ class EngineService : Service() {
                     ++downloadMisses <= DOWNLOAD_MISSES -> this.download
                     else -> null
                 }
-                if (download != this.download) {
-                    this.download = download
-                    updateNotification()
-                }
+                // Everything the notification shows is updated first, then it is posted once, and only if any of it
+                // changed. Posted after each change, it showed the state in between: "Generating" for a moment at the
+                // end of every download or import, with the download gone and the busy state not yet updated.
+                val changed = importing != this.importing || download != this.download || work != this.work ||
+                    waiting != this.waiting
+                this.importing = importing
+                this.download = download
+                this.work = work
+                this.waiting = waiting
                 if (nowBusy != busy) {
                     busy = nowBusy
                     if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
-                    updateNotification()
                 } else if (nowBusy) {
                     wakeLock?.acquire(30 * 60 * 1000L) // renew the timeout for work that is still going
                 }
+                if (changed) updateNotification()
             }
             // The service stayed for Quit when the app was closed, but the user can still turn the Engine channel off
             // (long-press on the notification). That removes the notification without sending its delete intent, so
@@ -335,25 +347,28 @@ class EngineService : Service() {
         }
     }
 
-    /** True while a chat, Code run, routine or API generation is in flight. Any failure (daemon still booting) = idle. */
-    private fun queryBusy(): Boolean = try {
+    /** True while a chat, Code run, routine, API generation, model load, auto-tune or skill is in flight
+     *  (queryActivity). A chat waiting for a tool approval is not. Any failure (daemon still booting) = idle. */
+    private fun queryBusy(): Boolean = queryActivity()?.work != null
+
+    /** What the daemon is doing (GET /api/v1/activity, see DaemonActivity), or null when it could not be read. */
+    private fun queryActivity(): DaemonActivity? = try {
         val conn = DaemonAuth.open("/api/v1/activity")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
         try {
             if (conn.responseCode != 200) {
-                false
+                null
             } else {
                 // Parsed, not string-matched: any shape this does not recognise reads as idle, so a format change
                 // can never pin the wake lock on with the screen off.
-                val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-                json.optBoolean("engineGenerating", false) || (json.optJSONArray("items")?.length() ?: 0) > 0
+                daemonActivity(JSONObject(conn.inputStream.bufferedReader().use { it.readText() }))
             }
         } finally {
             conn.disconnect()
         }
     } catch (_: Exception) {
-        false
+        null
     }
 
     /** True while the daemon holds a model: the primary engine loading, running or still stopping (`engine.state`
@@ -433,12 +448,16 @@ class EngineService : Service() {
         val hot = thermal >= PowerManager.THERMAL_STATUS_SEVERE
         // A download names its file (or the count) and shows its progress, unless an import, named first, is running.
         val download = this.download?.takeUnless { importing }
+        val work = this.work
         val text = when {
             importing -> "Importing models"
             download != null -> download.text
-            hot && busy -> "Generating. The phone is hot, so it is throttling speed"
+            hot && work != null -> "$work. The phone is hot, so it is throttling speed"
+            work != null -> work
+            // A reply parked on a tool approval waits for the user, in the app, not for the phone: say so. It holds
+            // no wake lock (see DaemonActivity).
+            waiting -> "Waiting for your approval"
             hot -> "Running. The phone is hot, so generation will be slower"
-            busy -> "Generating"
             else -> "Running in the background"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -490,4 +509,28 @@ class EngineService : Service() {
             }.onFailure { Log.w(TAG, "could not start the engine service", it) }
         }
     }
+}
+
+/** What GET /api/v1/activity says the daemon is doing. [work] is the notification's line for what is in progress, null
+ *  while nothing is; [waiting] is true while a chat waits for the user to answer a tool approval, which is not work
+ *  (the daemon lists those chats under `waiting`, not `items`). */
+private class DaemonActivity(val work: String?, val waiting: Boolean)
+
+/** The work line comes from the items' `kind`. A model load is named first: nothing generates on that model until it
+ *  is loaded, and a chat waiting for it is listed too. Then an auto-tune, which runs the engine itself. A chat, Code
+ *  run or routine is "Generating", and so is a kind this does not know, or an item that is not an object, so new work
+ *  still reads as work. A skill being written is named only when nothing else runs. An API client's generation has no
+ *  item, only `engineGenerating`. */
+private fun daemonActivity(json: JSONObject): DaemonActivity {
+    val items = json.optJSONArray("items")
+    val kinds = (0 until (items?.length() ?: 0)).map { items?.optJSONObject(it)?.optString("kind").orEmpty() }
+    val work = when {
+        "load" in kinds -> "Loading a model"
+        "tune" in kinds -> "Auto-tuning"
+        kinds.any { it != "skill" } -> "Generating"
+        kinds.isNotEmpty() -> "Writing a skill"
+        json.optBoolean("engineGenerating", false) -> "Generating"
+        else -> null
+    }
+    return DaemonActivity(work, (json.optJSONArray("waiting")?.length() ?: 0) > 0)
 }

@@ -103,8 +103,10 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
      the "phone is hot" warning. On Android 13+ the app asks for it each time it starts until it is
      granted; Android stops showing the prompt once the user has declined it twice. The service
      runs either way.
-   - `WAKE_LOCK` — a partial wake lock, held only while a reply is generated or a model imported or
-     downloaded, so that work finishes with the screen off; never while idle.
+   - `WAKE_LOCK` — a partial wake lock, held only while a reply is being generated, a model
+     being loaded, auto-tuned, imported or downloaded, or a skill written, so that work finishes
+     with the screen off; never while idle or while a reply waits for the user to approve a tool
+     call.
    - `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE`, Android 10 and older only
      (`maxSdkVersion="29"`, with `requestLegacyExternalStorage`) — for a model folder the user adds
      in shared storage, such as `/sdcard/AI`: read to scan and load its models, write because the
