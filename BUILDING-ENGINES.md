@@ -227,18 +227,76 @@ Termux users get their best speed from LiteRT-LM, which TurboLLM runs there as
 `python -m litert_lm_cli.main serve`. The app can't: it has no Python, and it may only execute
 files that shipped in its APK. But that Python server is a thin layer — every inference call
 goes through ctypes into **one** native library, `liblitert-lm.so`, the only binary in Google's
-`litert-lm-api` wheel. So the app ships that same library unchanged and replaces only the layer
-above it:
+`litert-lm-api` wheel. So the app ships that same library, with one dependency renamed (see
+[libandroid.so and its shim](#libandroidso-and-its-shim)), and replaces only the layer above it:
 
 | File (jniLibs/&lt;abi&gt;/) | What it is | Where it comes from |
 |---|---|---|
-| `liblitert-lm.so` | Google's LiteRT-LM runtime (CPU + GPU) | Extracted from the `litert-lm-api` 0.18.0 Android wheel on PyPI, **sha256-pinned** in `scripts/stage-litert-lm-engine.mjs`. Byte-identical to what Termux runs. Apache-2.0. |
+| `liblitert-lm.so` | Google's LiteRT-LM runtime (CPU + GPU) | Extracted from the `litert-lm-api` 0.18.0 Android wheel on PyPI, **sha256-pinned** in `scripts/stage-litert-lm-engine.mjs`. The build renames its `libandroid.so` dependency to `liblrtandr.so` (7 bytes of `.dynstr`) and checks the result against a second pinned hash; otherwise byte-identical to what Termux runs. Apache-2.0. |
 | `liblitertlm_server.so` | Native port of `litert-lm serve` — an executable named like a library so Android installs it | Built from `engines/litert-lm-server/` with the NDK on every build |
+| `liblrtandr.so` | Stands in for `libandroid.so`, which the engine process cannot load | Generated from the library's own imports and built with the NDK on every build |
 
-`stageLitertLmEngine` (`composeApp/build.gradle.kts`) does both, then checks each file's ELF
+`stageLitertLmEngine` (`composeApp/build.gradle.kts`) does all three, then checks each file's ELF
 architecture and that every LOAD segment is 16 KB-aligned (the wheel's library already is).
 Output goes to `composeApp/build/generated/litert-lm/jniLibs/`, never into `src/`. Cost: about
 14 MB compressed per ABI.
+
+### libandroid.so and its shim
+
+`liblitert-lm.so` is built for apps, which load it into their own process, and it lists
+`libandroid.so` among its dependencies. The server is not an app process: the daemon executes it
+from `nativeLibraryDir`, and in a freshly executed process the linker has to find all of
+`libandroid.so`'s dependencies itself (`libandroid_runtime`, `libhwui`, the media stack), which an
+app, forked from the zygote, already has loaded. On the owner's phone that failed and no
+`.litertlm` ever loaded:
+
+```
+cannot load liblitert-lm.so:
+  .../lib/arm64/liblitert-lm.so: dlopen failed: library "libstagefright.so" not found: needed by /system/lib64/libmediandk.so in namespace (default)
+```
+
+The library uses `libandroid.so` only to read APK assets (`AAssetManager_*`, `AAsset_*`), and the
+server loads models from file paths. So `scripts/stage-litert-lm-engine.mjs` replaces that
+dependency, working from the library it ships rather than from a list written for one version:
+
+1. It reads the library's dynamic section: its `DT_NEEDED` entries and every undefined dynamic
+   symbol with its binding and type. `LOADABLE_LIBS` names the libraries a standalone process can
+   load (bionic's, `liblog`, `libz`, EGL/GLES/Vulkan/`libnativewindow`); every other `DT_NEEDED`
+   entry is replaced. Today that is `libandroid.so` alone.
+2. Against the NDK's stub libraries, at every API level from the app's minSdk (24) to the newest
+   the NDK has, it takes the GLOBAL imports only a replaced library provides (today 8 functions:
+   `AAssetManager_fromJava`, `AAssetManager_open`, `AAssetManager_openDir`,
+   `AAssetDir_getNextFileName`, `AAssetDir_close`, `AAsset_close`, `AAsset_getBuffer`,
+   `AAsset_getLength`). The build fails, naming the symbols, if one of them is data rather than a
+   function, if a GLOBAL import has no provider at all, if a GLOBAL import comes from both a
+   replaced and a loadable library, if a WEAK one comes only from a replaced library, or if a
+   replaced library's imports carry symbol versions, at any of those levels: a WEAK import that
+   `libandroid.so` gained some levels before `libnativewindow.so` did would be unresolved on the
+   devices in between, even though the minSdk and the newest stubs agree.
+3. It writes a C shim per replaced library into the build directory and builds it with the NDK's
+   clang: one function per import, each of which, if it is ever called, writes
+   `liblitert-lm.so called <function>(), which libandroid.so provides, but libandroid.so cannot be
+   loaded in the engine process (liblrtandr.so stands in for it); stopping.` to stderr (which the
+   daemon shows when the engine exits) and to logcat, then calls `abort()`. None returns a value.
+   The shim's file name has the replaced name's length, fits `lib*.so` and starts with `liblr`;
+   the build checks that it exports exactly those functions and needs only loadable libraries. A
+   shim an earlier run staged and this one does not is removed; nothing else in the output
+   directory is touched, so pointing `--out` at `composeApp/src/androidMain/jniLibs` by hand
+   leaves the llama.cpp engines there alone.
+4. It renames the `DT_NEEDED` string in place (refusing if it is the tail of a longer string or
+   if any symbol, version entry or other dynamic tag shares its bytes; the second copy of
+   `libandroid.so` in `.rodata`, next to TFLite's NNAPI strings, is left alone) and checks the
+   file against `patchedSha256`.
+5. It links a probe executable against the staged library, the shim and the NDK stubs of the
+   library's other dependencies with `-Wl,--no-allow-shlib-undefined`, so a GLOBAL import nothing
+   in the library's dependency list provides fails the build with the linker's own message.
+
+WEAK imports get no shim function: the library allows them to be absent. `AHardwareBuffer_*` is
+the case that matters: `libandroid.so` defines those too from API 26, and with it gone they bind to
+`libnativewindow.so`'s, which `libEGL.so` needs (checked on the Android 15 emulator image).
+
+`node --test scripts/stage-litert-lm-engine.test.mjs` covers the reading, the checks, the rename,
+the naming and the removal of stale shims on synthetic ELF files.
 
 ### What the server is, and why it is shaped this way
 
@@ -279,7 +337,9 @@ system Vulkan/OpenCL/GL libraries.
 ### Bumping LiteRT-LM
 
 Change `LITERT_LM_VERSION` and both wheel hashes in `scripts/stage-litert-lm-engine.mjs`
-(PyPI publishes them at `https://pypi.org/pypi/litert-lm-api/<version>/json`), refresh
+(PyPI publishes them at `https://pypi.org/pypi/litert-lm-api/<version>/json`), then both
+`patchedSha256` values: the build stops with the new hash once the shim, its checks and the link
+probe have passed, and a changed list of shimmed functions is worth a look. Refresh
 `engines/litert-lm-server/third_party/litert_lm/c/*.h` from the matching
 `google-ai-edge/LiteRT-LM` tag, and check that every function listed in
 `src/litert_lm_api.h` still exists — the server refuses to start, naming the missing ones, if
@@ -287,11 +347,18 @@ it doesn't.
 
 ### Not yet verified
 
-- **No device has run it.** The NDK cross-compile itself was not run while writing it (no NDK
-  was available); the first `assembleDebug` is that check. The code uses only POSIX/bionic
-  APIs available at API 24.
+- **No phone has run it successfully.** On the owner's phone the wheel's library failed to load,
+  which is why it now has [a shim](#libandroidso-and-its-shim); no phone has run the patched one
+  yet. The patched library was run in a chroot of the x86_64 Android 15 emulator image's system
+  and vendor partitions, with that image's linker and its generated `/linkerconfig`: it loads
+  and answers a chat request on CPU, and still does with `libstagefright.so` removed from the
+  image, where the unpatched one fails with the owner's message. The code uses only
+  POSIX/bionic APIs available at API 24.
 - GPU speed versus Termux on the same phone, and whether every GPU path (OpenCL, WebGPU/Vulkan)
-  loads from an app-spawned process the way it does from Termux.
+  loads from an app-spawned process the way it does from Termux. The linker namespace of a
+  `/data` executable searches `/system` and `/system_ext` only, so a vendor `libOpenCL.so` may
+  not be found. A GPU that cannot be initialised fails the load with the runtime's error (there
+  is no automatic fallback); the app then suggests switching the model's Backend to CPU.
 
 ---
 

@@ -96,7 +96,8 @@ val shipLitertLmEngine: Boolean =
 // never disagree about which engine builds exist.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
 
-// Where stageLitertLmEngine puts <abi>/{liblitert-lm.so, liblitertlm_server.so}.
+// Where stageLitertLmEngine puts <abi>/{liblitert-lm.so, liblitertlm_server.so} and the shim that
+// stands in for libandroid.so (liblrtandr.so). jniLibs packages everything in it.
 val litertLmJniLibs = layout.buildDirectory.dir("generated/litert-lm/jniLibs")
 
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
@@ -472,11 +473,15 @@ if (shipVulkanEngine) {
 
 // ── The LiteRT-LM engine ──────────────────────────────────────────────────────────────────
 //
-// Two files per ABI: liblitert-lm.so — Google's runtime, the same file the litert-lm-api wheel
-// installs under Termux, fetched from PyPI against a pinned sha256 — and liblitertlm_server.so,
+// Three files per ABI: liblitert-lm.so — Google's runtime, the file the litert-lm-api wheel
+// installs under Termux, fetched from PyPI against a pinned sha256, with its libandroid.so
+// dependency renamed because the engine process cannot load that library —, liblitertlm_server.so,
 // the native OpenAI-compatible server in engines/litert-lm-server that replaces the Python
-// `litert-lm serve` the app cannot run. scripts/stage-litert-lm-engine.mjs does both, then checks
-// each file's ELF architecture and 16 KB alignment. See BUILDING-ENGINES.md, "The LiteRT-LM engine".
+// `litert-lm serve` the app cannot run, and liblrtandr.so, the shim generated from the library's
+// imports to stand in for libandroid.so. scripts/stage-litert-lm-engine.mjs does all three, checks
+// each file's ELF architecture and 16 KB alignment and the patched library's pinned sha256, and
+// links a probe against the result so an import nothing provides fails the build. See
+// BUILDING-ENGINES.md, "The LiteRT-LM engine".
 //
 // The NDK is the one AGP itself resolves for native-lib, and CMake is the SDK copy that
 // externalNativeBuild above pins, so this needs nothing a plain `assembleDebug` didn't already.
@@ -485,7 +490,7 @@ if (shipVulkanEngine) {
 // incrementally, so a repeat run costs about a second.
 val stageLitertLmEngine by tasks.registering(Exec::class) {
     group = "build"
-    description = "Fetches liblitert-lm.so and builds liblitertlm_server.so into the APK's jniLibs."
+    description = "Fetches liblitert-lm.so and builds liblitertlm_server.so and its libandroid.so shim into the APK's jniLibs."
     workingDir = rootProject.projectDir
     // BaseExtension resolves both from local.properties / ANDROID_HOME and the pinned ndkVersion. (The
     // androidComponents.sdkComponents providers carry no value at execution time in AGP 8.7.)
@@ -514,6 +519,8 @@ if (shipLitertLmEngine) {
     // Same reasoning as the daemon payload check: an APK that silently lacks the engine it was
     // built for is worse than a failed build. Only the APK/AAB tasks themselves: AGP also has
     // bundle*ClassesToJar and assemble*UnitTest, which run without merging native libs at all.
+    // The shim is not listed: its name comes from the library, and the staging run that writes
+    // liblitert-lm.so fails unless the shim it links against is staged beside it.
     val packagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
     tasks.matching { packagingTask.matches(it.name) }.configureEach {
         doLast {
