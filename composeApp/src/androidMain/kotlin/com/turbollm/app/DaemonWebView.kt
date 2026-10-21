@@ -456,5 +456,14 @@ private fun TurboLLMWebView() {
                 webViewRef = this
             }
         },
+        // The WebView goes with its screen (Back finishes the activity, which disposes this composition). Nothing used
+        // to destroy it, so the WebView, its page and the renderer process behind it lived on until the garbage
+        // collector reached them. The page going away does not touch the daemon's work, so this only frees the memory
+        // and the renderer sooner. Loading is stopped first, then the WebView is destroyed: it is never used again.
+        onRelease = { webView ->
+            if (webViewRef === webView) webViewRef = null
+            webView.stopLoading()
+            webView.destroy()
+        },
     )
 }
