@@ -58,7 +58,8 @@ during generation.
 > that stops the service, unloads the model and closes the app. On Android 14 and later, where the user can swipe
 > this notification away, it is posted again at once, so Quit stays reachable. Its text says what is happening:
 > "Running in the background" while idle, "Generating" while a reply is being written, "Importing models" during an
-> import, "Downloading models" while a model download is running or queued, and, when the phone is thermally
+> import, the progress while a model download is running or queued (the file's name as the title, or "Downloading
+> models" for several, how much has arrived and how fast, and a progress bar), and, when the phone is thermally
 > throttled, "Running. The phone is hot, so generation will be slower" or "Generating. The phone is hot, so it is
 > throttling speed". If the user has turned notifications off, so Quit cannot be reached, leaving the app (Back, or
 > swiping it away from Recents) unloads the model and stops the service as soon as nothing is generating, importing or

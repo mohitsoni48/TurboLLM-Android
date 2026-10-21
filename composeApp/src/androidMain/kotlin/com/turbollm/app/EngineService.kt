@@ -28,6 +28,8 @@ private const val ACTION_ACTIVITY_FINISHED = "com.turbollm.app.ACTIVITY_FINISHED
 private const val ACTION_REPOST = "com.turbollm.app.REPOST"
 private const val EXTRA_ACTIVITY = "com.turbollm.app.ACTIVITY"
 private const val POLL_MS = 3000L
+/** How many polls in a row may fail to read the download list before the notification drops its last progress. */
+private const val DOWNLOAD_MISSES = 3
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
  *
@@ -50,7 +52,11 @@ class EngineService : Service() {
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
     @Volatile private var busy = false
     @Volatile private var importing = false
-    @Volatile private var downloading = false
+    /** What the notification shows while a model download is running or queued (downloadNotice), null while none
+     *  is. Written by the poll, read wherever the notification is built. */
+    @Volatile private var download: DownloadNotice? = null
+    /** Polls in a row that could not read the download list (see pollActivity). Poll thread only. */
+    private var downloadMisses = 0
     @Volatile private var thermal = 0
     /** Set when the app was closed with notifications off: stop as soon as nothing is generating, importing or
      *  downloading (see appClosed). */
@@ -246,14 +252,26 @@ class EngineService : Service() {
                 updateNotification()
             }
             // So does a model download (Discover): a stopped service or a sleeping CPU would stall a multi-GB transfer.
-            val downloading = queryDownloading()
+            val downloads = queryDownloads()
+            val downloading = !downloads.isNullOrEmpty()
             val nowBusy = queryBusy() || importing || downloading
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
             synchronized(stateLock) {
                 if (!running) return
-                if (downloading != this.downloading) {
-                    this.downloading = downloading
+                // A download's progress changes from one poll to the next, so the notification is posted again
+                // whenever its download lines would read differently, at the poll's pace (3 s) and quietly
+                // (setOnlyAlertOnce, setSilent). A poll that could not read the list keeps the last lines up for up
+                // to DOWNLOAD_MISSES polls in a row (the daemon slow to answer for a moment) instead of flashing
+                // another state for 3 s. It still counts as idle above, as before, so a daemon that stops answering
+                // never pins the wake lock.
+                val download = when {
+                    downloads != null -> downloadNotice(downloads).also { downloadMisses = 0 }
+                    ++downloadMisses <= DOWNLOAD_MISSES -> this.download
+                    else -> null
+                }
+                if (download != this.download) {
+                    this.download = download
                     updateNotification()
                 }
                 if (nowBusy != busy) {
@@ -307,25 +325,25 @@ class EngineService : Service() {
 
     /** True while the daemon has a model download running or queued (GET /api/v1/downloads). Any failure = idle, as
      *  above; a paused or failed download does not count, as nothing is transferring. */
-    private fun queryDownloading(): Boolean = try {
+    private fun queryDownloading(): Boolean = !queryDownloads().isNullOrEmpty()
+
+    /** The daemon's running and queued model downloads (parseLiveDownloads), or null when the list could not be read
+     *  (the daemon still booting, a reply this does not recognise). */
+    private fun queryDownloads(): List<LiveDownload>? = try {
         val conn = DaemonAuth.open("/api/v1/downloads")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
         try {
             if (conn.responseCode != 200) {
-                false
+                null
             } else {
-                val list = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optJSONArray("downloads")
-                (0 until (list?.length() ?: 0)).any {
-                    val status = list?.optJSONObject(it)?.optString("status")
-                    status == "downloading" || status == "queued"
-                }
+                parseLiveDownloads(conn.inputStream.bufferedReader().use { it.readText() })
             }
         } finally {
             conn.disconnect()
         }
     } catch (_: Exception) {
-        false
+        null
     }
 
     private fun releaseWakeLock() {
@@ -353,9 +371,11 @@ class EngineService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val hot = thermal >= PowerManager.THERMAL_STATUS_SEVERE
+        // A download names its file (or the count) and shows its progress, unless an import, named first, is running.
+        val download = this.download?.takeUnless { importing }
         val text = when {
             importing -> "Importing models"
-            downloading -> "Downloading models"
+            download != null -> download.text
             hot && busy -> "Generating. The phone is hot, so it is throttling speed"
             hot -> "Running. The phone is hot, so generation will be slower"
             busy -> "Generating"
@@ -363,7 +383,7 @@ class EngineService : Service() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_engine)
-            .setContentTitle("TurboLLM")
+            .setContentTitle(download?.title ?: "TurboLLM")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -373,6 +393,9 @@ class EngineService : Service() {
             .setContentIntent(open)
             .setDeleteIntent(repost)
             .addAction(0, "Quit", quit)
+            .apply {
+                if (download != null) setProgress(DOWNLOAD_PROGRESS_MAX, download.progress, download.indeterminate)
+            }
             .build()
     }
 
