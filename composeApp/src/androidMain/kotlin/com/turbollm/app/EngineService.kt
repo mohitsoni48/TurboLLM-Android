@@ -30,6 +30,10 @@ private const val EXTRA_ACTIVITY = "com.turbollm.app.ACTIVITY"
 private const val POLL_MS = 3000L
 /** How many polls in a row may fail to read the download list before the notification drops its last progress. */
 private const val DOWNLOAD_MISSES = 3
+/** The longest the daemon is given to write its database before the service stops (flushDatabase). */
+private const val FLUSH_WAIT_MS = 2000L
+/** The primary engine states in which it holds a model (the daemon's manager.ts State): see queryLoaded. */
+private val LOADED_STATES = setOf("starting", "running", "stopping")
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
  *
@@ -58,8 +62,8 @@ class EngineService : Service() {
     /** Polls in a row that could not read the download list (see pollActivity). Poll thread only. */
     private var downloadMisses = 0
     @Volatile private var thermal = 0
-    /** Set when the app was closed with notifications off: stop as soon as nothing is generating, importing or
-     *  downloading (see appClosed). */
+    /** Set when the app was closed with notifications off: stop once no model is loaded and nothing is generating,
+     *  importing or downloading (see appClosed). */
     @Volatile private var stopWhenIdle = false
     /** Set when the app was closed with Quit reachable, so the service stayed for it: the poll then keeps checking
      *  that Quit can still be reached (see pollActivity). */
@@ -149,8 +153,8 @@ class EngineService : Service() {
     }
 
     /** "Quit" in the notification: how the user frees a loaded model's memory without going back into the app, since
-     *  the service otherwise outlives the activity (with notifications off, appClosed does it instead). Killing the
-     *  process takes the engine children with it (Android kills the app's whole process group). */
+     *  the service otherwise outlives the activity (with notifications off there is no Quit, see appClosed). Killing
+     *  the process takes the engine children with it (Android kills the app's whole process group). */
     private fun quit() {
         Log.i(TAG, "quit from the notification")
         synchronized(stateLock) {
@@ -168,10 +172,11 @@ class EngineService : Service() {
         super.onTaskRemoved(rootIntent)
     }
 
-    /** The user left the app (Back, or swiped from Recents). With the notification visible, its Quit is how they free
-     *  the model, so the service stays. Without it there is nothing to reach, so the service unloads the model and
-     *  stops once nothing is generating, importing or downloading, and the process becomes an ordinary closed app
-     *  Android can reclaim. */
+    /** The user left the app (Back, or swiped from Recents). Leaving never unloads the model: only the user does (in
+     *  the app, or with Quit), or the daemon's own idle timer (Settings, daemon.idleTtlMinutes, which the user can
+     *  change or turn off). With the notification visible, its Quit is how they free the model, so the service stays.
+     *  Without it there is nothing to reach, so the service stays only while a model is loaded or work runs, and stops
+     *  once neither is true (stopNow), and the process becomes an ordinary closed app Android can reclaim. */
     private fun appClosed() {
         // Post it again first. quitReachable() reads the settings, not the shade, and a post made while notifications
         // were off is dropped for good: on Android 13+ startForeground posts before the user can answer the
@@ -199,9 +204,12 @@ class EngineService : Service() {
         return true
     }
 
-    /** Unload the model, then stop, unless the app came back or a newer start request arrived in the meantime.
-     *  Unloading first matters: a stopped service alone leaves the model resident until Android reclaims the process,
-     *  and with no notification there would be no other way to free it. */
+    /** Stop, once no model is loaded and nothing runs, unless the app came back or a newer start request arrived in
+     *  the meantime. It unloads nothing. It used to stop the model (POST /api/v1/engine/stop) as soon as nothing was
+     *  generating, so a loaded model was gone after every Back with notifications off; a model is unloaded only by
+     *  the user or by the daemon's idle timer, and until one of them has, the poll keeps the service up. The daemon
+     *  writes its chat database to disk first (flushDatabase): a stopped service lets Android freeze the process and
+     *  later kill it, which loses whatever the daemon had not written yet. */
     private fun stopNow() {
         if (!stopping.compareAndSet(false, true)) return
         val startId = lastStartId
@@ -209,37 +217,49 @@ class EngineService : Service() {
         // the start it sends waits on the main thread behind that onCreate, and stopWhenIdle stays set until it runs.
         val activity = newestActivity
         Thread({
-            // `busy` is the poll's view, up to 3 s old: a reply sent just before Back would not be in it yet. Ask the
-            // daemon now, and again right before unloading, so a generation that has just started is never aborted.
-            val idle = !queryBusy() && !queryDownloading() && !ModelImport.isRunning()
-            if (idle) {
-                unloadModel {
-                    stopWhenIdle && newestActivity == activity &&
-                        !queryBusy() && !queryDownloading() && !ModelImport.isRunning()
-                }
+            // `busy` is the poll's view, up to 3 s old: a reply sent or a model load started just before Back would
+            // not be in it yet. Ask the daemon now, and again after the flush, right before stopping, so the service
+            // never stops under work or a model that has just started.
+            val stop = idleNow() && run {
+                flushDatabase()
+                stopWhenIdle && newestActivity == activity && idleNow()
             }
             ContextCompat.getMainExecutor(this).execute {
                 stopping.set(false)
                 // onDestroy releases the wake lock and clears `running` once the stop takes effect.
-                if (idle && stopWhenIdle && newestActivity == activity && !busy) stopSelfResult(startId)
+                if (stop && stopWhenIdle && newestActivity == activity && !busy) stopSelfResult(startId)
             }
         }, "turbollm-stop").start()
     }
 
-    /** Stop the primary model through the daemon (POST /api/v1/engine/stop), freeing its memory. Best-effort. */
-    private fun unloadModel(stillWanted: () -> Boolean) {
-        runCatching {
-            if (!stillWanted()) return
-            val conn = DaemonAuth.open("/api/v1/engine/stop")
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.connectTimeout = 1000
-            conn.readTimeout = 5000
-            conn.outputStream.use { it.write("{}".toByteArray()) }
-            conn.responseCode
-            conn.disconnect()
-        }.onFailure { Log.w(TAG, "could not unload the model before stopping", it) }
+    /** No model loaded and nothing generating, importing or downloading, asked of the daemon now (see stopNow). */
+    private fun idleNow(): Boolean = !queryBusy() && !queryDownloading() && !ModelImport.isRunning() && !queryLoaded()
+
+    /** Ask the daemon to write its chat database to disk now (POST /api/v1/daemon/flush), waiting at most
+     *  FLUSH_WAIT_MS. On Android the database is kept in memory (sql.js) and written out on the daemon's own schedule,
+     *  so what it had not written yet when the process went was lost. Best-effort: a daemon without the route (404),
+     *  one that does not answer, or a failed proof only ends the wait. The wait has a deadline of its own because
+     *  DaemonAuth.open's proof alone may take up to 3 s against a port that does not answer. */
+    private fun flushDatabase() {
+        val flush = Thread({
+            runCatching {
+                val conn = DaemonAuth.open("/api/v1/daemon/flush")
+                try {
+                    conn.requestMethod = "POST"
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.connectTimeout = 500
+                    conn.readTimeout = 1500
+                    conn.outputStream.use { it.write("{}".toByteArray()) }
+                    val code = conn.responseCode
+                    if (code != 200) Log.w(TAG, "the daemon did not write its database (HTTP $code)")
+                } finally {
+                    conn.disconnect()
+                }
+            }.onFailure { Log.w(TAG, "could not ask the daemon to write its database", it) }
+        }, "turbollm-flush").apply { isDaemon = true }
+        flush.start()
+        runCatching { flush.join(FLUSH_WAIT_MS) }
     }
 
     private fun pollActivity() {
@@ -290,7 +310,9 @@ class EngineService : Service() {
             if (closedWithQuit && !quitReachable()) {
                 ContextCompat.getMainExecutor(this).execute { if (running && closedWithQuit) appClosed() }
             }
-            if (stopWhenIdle && !nowBusy) {
+            // A loaded model keeps the service up too, until the user or the daemon's idle timer unloads it (stopNow).
+            // Asked only while the app is closed with notifications off, the one case it decides anything.
+            if (stopWhenIdle && !nowBusy && !queryLoaded()) {
                 ContextCompat.getMainExecutor(this).execute { if (stopWhenIdle && !busy) stopNow() }
             }
             if (++polls % 20 == 0) DaemonLog.rotateIfLarge(filesDir) // about once a minute
@@ -315,6 +337,33 @@ class EngineService : Service() {
                 // can never pin the wake lock on with the screen off.
                 val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
                 json.optBoolean("engineGenerating", false) || (json.optJSONArray("items")?.length() ?: 0) > 0
+            }
+        } finally {
+            conn.disconnect()
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    /** True while the daemon holds a model: the primary engine loading, running or still stopping (`engine.state`
+     *  starting, running or stopping), or any model alive in a pool slot beside it, such as an embedding model or a
+     *  Jev or Laya model, all from GET /api/v1/status. `poolModels` counts those slots (running, starting or
+     *  stopping); a daemon from before TurboLLM#287 leaves it out, which reads as 0, and names only a Jev or Laya model
+     *  (`jev`, `laya`), so those are still read. An engine in `error` holds nothing. Any failure reads as not loaded,
+     *  as the work checks read it as idle: a daemon that no longer answers has nothing to keep, and a stop needs two
+     *  readings to agree, stopNow's before and after the flush (appClosed calls stopNow at once when nothing is busy;
+     *  when the poll starts the stop, its own reading comes first). */
+    private fun queryLoaded(): Boolean = try {
+        val conn = DaemonAuth.open("/api/v1/status")
+        conn.connectTimeout = 1000
+        conn.readTimeout = 2000
+        try {
+            if (conn.responseCode != 200) {
+                false
+            } else {
+                val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                json.optJSONObject("engine")?.optString("state") in LOADED_STATES || json.optInt("poolModels") > 0 ||
+                    json.optJSONObject("jev") != null || json.optJSONObject("laya") != null
             }
         } finally {
             conn.disconnect()

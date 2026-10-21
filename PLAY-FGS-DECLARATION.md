@@ -61,11 +61,14 @@ during generation.
 > import, the progress while a model download is running or queued (the file's name as the title, or "Downloading
 > models" for several, how much has arrived and how fast, and a progress bar), and, when the phone is thermally
 > throttled, "Running. The phone is hot, so generation will be slower" or "Generating. The phone is hot, so it is
-> throttling speed". If the user has turned notifications off, so Quit cannot be reached, leaving the app (Back, or
-> swiping it away from Recents) unloads the model and stops the service as soon as nothing is generating, importing or
-> downloading; a paused or failed download does not keep it running. Turning the notification off after leaving the
-> app does the same. A partial wake lock is held only while a reply is being generated or a model imported or
-> downloaded, never while idle.
+> throttling speed". Leaving the app never unloads the model by itself: the user does, in the app or with Quit, or
+> the app's idle timer does once the model has gone unused for a while (60 minutes by default; the user can change
+> it or turn it off in Settings). If the user has turned notifications off, so Quit cannot be reached, leaving the
+> app (Back, or swiping it away from Recents) keeps the service only while a model is loaded (any model, an embedding
+> model included) or something is being generated, imported or downloaded, and stops it once none of these is true; a
+> paused or failed download does not keep it running. Turning the notification off after leaving the app does the
+> same. A partial wake lock is held only while a reply is being generated or a model imported or downloaded, never
+> while idle.
 
 **Why does no other foreground service type fit?**
 
