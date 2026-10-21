@@ -7,7 +7,10 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -17,6 +20,7 @@ import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Column
@@ -25,12 +29,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -49,6 +56,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+
+private const val TAG = "TurboLLM"
 
 private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
@@ -202,6 +211,15 @@ private fun WebView.injectSafeAreaInsets(topPx: Int, bottomPx: Int) {
 @Composable
 fun DaemonWebViewScreen() {
     var ready by remember { mutableStateOf(false) }
+    // Counts the WebView renderers that have died (TurboLLMWebView's onRenderProcessGone). Each death gives the screen
+    // a new key, so the whole TurboLLMWebView is built again: the dead WebView leaves the composition (its onRelease
+    // destroys it) and a fresh one is made with the same setup as the first.
+    var renderer by remember { mutableIntStateOf(0) }
+    // Unless the renderer keeps crashing: a page that crashes it each time it loads was built and crashed again in a
+    // loop. After RENDERER_CRASHES crashes within a minute (RendererCrashes; a kill for memory does not count) the
+    // screen shows RendererCrashScreen in its place, until the user taps Reload.
+    val crashes = remember { RendererCrashes() }
+    var crashLoop by remember { mutableStateOf(false) }
 
     // Up AND ours: the WebView below gets the app-secret cookie the moment it is created, so it waits until the
     // daemon has proved it holds the port (DaemonAuth), not merely until something answers there.
@@ -268,16 +286,51 @@ fun DaemonWebViewScreen() {
                         modifier = Modifier.padding(top = 20.dp),
                     )
                 }
+            } else if (crashLoop) {
+                RendererCrashScreen(onReload = {
+                    Log.i(TAG, "Reload tapped after the WebView renderer kept crashing; loading the UI again")
+                    crashLoop = false
+                })
             } else {
-                TurboLLMWebView()
+                key(renderer) {
+                    TurboLLMWebView(onRendererGone = { didCrash ->
+                        val again = crashes.rebuild(didCrash, SystemClock.elapsedRealtime())
+                        if (again) renderer++ else crashLoop = true
+                        again
+                    })
+                }
             }
         }
     }
 }
 
+/** Shown in place of the WebView once its renderer has crashed RENDERER_CRASHES times within a minute: plain native
+ *  text, and a Reload button that builds the WebView again. The daemon, the loaded model and any download keep
+ *  running behind it; only the page is gone. On the splash's pinned dark Surface, hence the explicit light text color
+ *  (see the splash's own Text). */
+@Composable
+private fun RendererCrashScreen(onReload: () -> Unit) {
+    // Back leaves the app as from the UI's root screen (TurboLLMWebView's BackHandler), finishing the activity, so it
+    // goes through the same close (EngineService.activityFinished) whichever screen is up.
+    val activity = LocalContext.current as? Activity
+    BackHandler(enabled = true) { activity?.finish() }
+    Column(
+        modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("The page keeps crashing.", color = Color(0xFFEDEDEC))
+        Button(onClick = onReload, modifier = Modifier.padding(top = 20.dp)) {
+            Text("Reload")
+        }
+    }
+}
+
+/** [onRendererGone] is told of each renderer death, and whether it was a crash; it answers whether a fresh WebView
+ *  is built (DaemonWebViewScreen). */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun TurboLLMWebView() {
+private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     // Hardware back (QA_BUGS.md BUG-02, then QA_UX_REPORT.md F-01). Two earlier shapes of this
     // both failed: `enabled = webViewRef?.canGoBack() == true` was a snapshot Compose could never
@@ -420,6 +473,30 @@ private fun TurboLLMWebView() {
                         // web UI's own safe-area padding (Shell.tsx --tllm-safe-top/bottom) must be zero —
                         // anything else would pad twice.
                         view.injectSafeAreaInsets(0, 0)
+                    }
+
+                    // The renderer process is gone: Android killed it for memory (most likely with the app in the
+                    // background) or it crashed. Without this override Android's default then kills the app's own
+                    // process as well, and that process holds the daemon, the loaded model and any download. Handled
+                    // instead: this WebView can never be used again, so the screen drops it and builds a fresh one
+                    // (DaemonWebViewScreen) with this same factory, set up as on first load: the app-secret cookie
+                    // (below), then the UI. After RENDERER_CRASHES crashes within a minute it shows its Reload screen
+                    // instead (RendererCrashes). Called on Android 8+ only, where the callback exists.
+                    @RequiresApi(Build.VERSION_CODES.O)
+                    override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                        if (webViewRef === view) webViewRef = null
+                        val next = if (onRendererGone(detail.didCrash())) {
+                            "loading the UI again"
+                        } else {
+                            "it crashed $RENDERER_CRASHES times within ${RENDERER_CRASH_WINDOW_MS / 1000} s, " +
+                                "so the UI is not loaded again until Reload"
+                        }
+                        Log.w(
+                            TAG,
+                            "WebView renderer gone (didCrash=${detail.didCrash()}, " +
+                                "rendererPriorityAtExit=${detail.rendererPriorityAtExit()}); $next",
+                        )
+                        return true
                     }
                 }
                 webChromeClient = object : WebChromeClient() {
