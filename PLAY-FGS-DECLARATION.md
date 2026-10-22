@@ -68,31 +68,33 @@ daemon takes longer to answer, right after it does.
 > From the moment the app is opened, a low-importance ongoing notification titled "TurboLLM", with a **Quit** action
 > that stops the service, unloads the model and closes the app, about 3 seconds after the tap. On Android 14 and
 > later, where the user can swipe this notification away, it is posted again at once, so Quit stays reachable. Its
-> text says what is happening: "Running in the background" while idle, "Generating" while a reply is being written,
-> "Loading a model", "Auto-tuning" or "Writing a skill" while the app does one of those, "Waiting for your approval"
-> while a reply waits for the user to allow a tool call, "Importing models" during an import, the progress while a
-> model download is running or queued (the file's name as the title, or "Downloading models" for several, how much has
-> arrived and how fast, and a progress bar), and, when the phone is thermally throttled, "Running. The phone is hot,
-> so generation will be slower" or what is running followed by "The phone is hot, so it is throttling speed" (for
-> example "Generating. The phone is hot, so it is throttling speed"). Leaving the app never unloads the model by
-> itself: the user does, in the app or with Quit, or the app's idle timer does once the model has gone unused for a
-> while (60 minutes by default; the user can change it or turn it off in Settings). Closing the app (Back from its
-> main screen, or swiping it away from Recents; pressing Home does not close it) with nothing running works as Quit
-> does, whether notifications are on or off: about 3 seconds later the service stops and the app's process ends.
-> Opening the app again within those 3 seconds, after Quit or such a close, keeps it running, as does the app coming
-> back on screen after Quit (for example the phone unlocked onto it). Nothing is running when no model is loaded or
-> loading (any model, an embedding model included), nothing is being generated, imported or downloaded (a paused or
-> failed download does not count), no reply waits for the user's approval, no routine is running, and no access from
-> other devices is on: LAN access, remote access (a tunnel, Tailscale Serve or Funnel), or Turbo Link letting other
-> devices use this phone's models; when the app gets no answer from the daemon, or one it cannot read, it counts as
-> running. Closed with something running, the app keeps the service, also after that work has ended, after the idle
-> timer has unloaded the model and after that access has been turned off, until the user taps Quit or closes the app
-> again with nothing running (after opening it, or by swiping away the card it left in Recents). A routine only
-> scheduled for later does not count as running: such a close stops the routine scheduler with the app, until the app
-> is opened again. If the user has turned notifications off (or the notification's channel), there is no Quit to tap:
-> on Android 13 and later the system's list of active apps can still stop the app, and closing it again with nothing
-> running quits. A partial wake lock is held only while a reply is being generated, a model being loaded, auto-tuned,
-> imported or downloaded, or a skill written, never while idle or while a reply waits for the user's approval.
+> text says what is happening: "Idle" while no work is in progress, or "Idle · " and the model's name while a model is
+> loaded (the chat model's name, or a text classification model's while no chat model is loaded; an embedding model
+> loaded alone is not named), "Generating" while a reply is being written, "Loading a model", "Auto-tuning" or
+> "Writing a skill" while the app does one of those, "Waiting for your approval" while a reply waits for the user to
+> allow a tool call, "Importing models" during an import, the progress while a model download is running or queued
+> (the file's name as the title, or "Downloading models" for several, how much has arrived and how fast, and a
+> progress bar), and, when the phone is thermally throttled, "Idle. The phone is hot, so generation will be slower" or
+> what is running followed by "The phone is hot, so it is throttling speed" (for example "Generating. The phone is
+> hot, so it is throttling speed"). Leaving the app never unloads the model by itself: the user does, in the app or
+> with Quit, or the app's idle timer does once the model has gone unused for a while (60 minutes by default; the user
+> can change it or turn it off in Settings). Closing the app (Back from its main screen, or swiping it away from
+> Recents; pressing Home does not close it) with nothing running works as Quit does, whether notifications are on or
+> off: about 3 seconds later the service stops and the app's process ends. Opening the app again within those 3
+> seconds, after Quit or such a close, keeps it running, as does the app coming back on screen after Quit (for example
+> the phone unlocked onto it). Nothing is running when no model is loaded or loading (any model, an embedding model
+> included), nothing is being generated, imported or downloaded (a paused or failed download does not count), no reply
+> waits for the user's approval, no routine is running, and no access from other devices is on: LAN access, remote
+> access (a tunnel, Tailscale Serve or Funnel), or Turbo Link letting other devices use this phone's models; when the
+> app gets no answer from the daemon, or one it cannot read, it counts as running. Closed with something running, the
+> app keeps the service, also after that work has ended, after the idle timer has unloaded the model and after that
+> access has been turned off, until the user taps Quit or closes the app again with nothing running (after opening it,
+> or by swiping away the card it left in Recents). A routine only scheduled for later does not count as running: such
+> a close stops the routine scheduler with the app, until the app is opened again. If the user has turned
+> notifications off (or the notification's channel), there is no Quit to tap: on Android 13 and later the system's
+> list of active apps can still stop the app, and closing it again with nothing running quits. A partial wake lock is
+> held only while a reply is being generated, a model being loaded, auto-tuned, imported or downloaded, or a skill
+> written, never while idle or while a reply waits for the user's approval.
 
 **Why does no other foreground service type fit?**
 
@@ -123,10 +125,10 @@ a small model, so the first load is quick and the reply visibly continues.
 4. **0:20** Press Home and open another app (for example Settings) for about 10 seconds.
 5. **0:30** Return to TurboLLM. The reply has kept growing while the app was in the background,
    and is complete or nearly so.
-6. **0:38** Pull down the shade again. The notification now reads "Running in the background":
-   the model stays loaded, ready for the next message, which is what the service is for.
-   Tap **Quit**. About 3 seconds later the notification disappears and the app closes, freeing
-   the model.
+6. **0:38** Pull down the shade again. The notification now reads "Idle · " followed by the
+   model's name: the reply is done, and the model stays loaded, ready for the next message,
+   which is what the service is for. Tap **Quit**. About 3 seconds later the notification
+   disappears and the app closes, freeing the model.
 
 Upload the video unlisted (for example on YouTube) and paste the link into the declaration.
 

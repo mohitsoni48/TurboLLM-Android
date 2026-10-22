@@ -29,6 +29,9 @@ private const val EXTRA_ACTIVITY = "com.turbollm.app.ACTIVITY"
 private const val POLL_MS = 3000L
 /** How many polls in a row may fail to read the download list before the notification drops its last progress. */
 private const val DOWNLOAD_MISSES = 3
+/** How many polls in a row may fail to read the activity before the notification drops its last work or approval
+ *  line. */
+private const val ACTIVITY_MISSES = 3
 /** The longest the daemon is given to write its database before the process ends (flushDatabase). */
 private const val FLUSH_WAIT_MS = 2000L
 /** How long a close made while the daemon gives no proof (still starting, mostly) waits for it before it is decided
@@ -42,7 +45,7 @@ private const val BOOT_POLL_MS = 500L
  *  change: WebView turns on Chromium's aggressive DOM storage flushing, whose commit delay is 1 s, and a change made
  *  while a commit is under way waits for that one first. Nothing writes it when the process is killed. */
 private const val CLOSE_HOLD_MS = 3000L
-/** The primary engine states in which it holds a model (the daemon's manager.ts State): see statusRuns. */
+/** The primary engine states in which it holds a model (the daemon's manager.ts State): see statusReading. */
 private val LOADED_STATES = setOf("starting", "running", "stopping")
 
 /** Keeps the daemon and its engine processes running while the app is not on screen.
@@ -73,12 +76,17 @@ class EngineService : Service() {
     /** A chat waits for the user to answer a tool approval (DaemonActivity.waiting): named in the notification, not
      *  work, so no wake lock is held for it. */
     @Volatile private var waiting = false
+    /** The loaded model's name (StatusReading.name), which the notification names while nothing runs; null while no
+     *  model is loaded or the loaded one has no name in the status. Read by the poll only while nothing runs. */
+    @Volatile private var model: String? = null
     @Volatile private var importing = false
     /** What the notification shows while a model download is running or queued (downloadNotice), null while none
      *  is. Written by the poll, read wherever the notification is built. */
     @Volatile private var download: DownloadNotice? = null
     /** Polls in a row that could not read the download list (see pollActivity). Poll thread only. */
     private var downloadMisses = 0
+    /** Polls in a row that could not read the activity (see pollActivity). Poll thread only. */
+    private var activityMisses = 0
     @Volatile private var thermal = 0
     /** The newest plain start request (EngineService.start, from MainActivity.onCreate), so a close quits only if no
      *  start arrived after it (see appClosed). A close, a repost and Quit do not count: a repost (the notification
@@ -337,7 +345,7 @@ class EngineService : Service() {
         val activity = queryActivity() ?: return true
         if (activity.work != null || activity.waiting) return true
         if (queryDownloads()?.isEmpty() != true) return true
-        return queryStatus() != false
+        return queryStatus()?.runs != false
     }
 
     /** Ask the daemon to write its chat database to disk now (POST /api/v1/daemon/flush), waiting at most
@@ -376,9 +384,24 @@ class EngineService : Service() {
             val downloads = queryDownloads()
             val downloading = !downloads.isNullOrEmpty()
             val activity = queryActivity()
-            val work = activity?.work
-            val waiting = activity?.waiting == true
-            val nowBusy = work != null || importing || downloading
+            // A poll that could not read the activity keeps its last work or approval line up for up to
+            // ACTIVITY_MISSES polls in a row, as the download lines do below: the daemon can be slow to answer for a
+            // moment mid-reply, and the line read "Idle" for that poll, while a close then counts the unreadable
+            // reply as something running. It still counts as idle for the wake lock, as before, so a daemon that
+            // stops answering never pins it. Only this thread writes `work` and `waiting`, so they are read here
+            // without the lock.
+            val shown = when {
+                activity != null -> activity.also { activityMisses = 0 }
+                ++activityMisses <= ACTIVITY_MISSES -> DaemonActivity(this.work, this.waiting)
+                else -> null
+            }
+            val work = shown?.work
+            val waiting = shown?.waiting == true
+            val nowBusy = activity?.work != null || importing || downloading
+            // The loaded model's name, for the line shown while nothing runs: asked only then, and kept from the last
+            // reading when the status cannot be read, so a slow answer does not drop the name for 3 s.
+            val status = if (work == null && !importing && !downloading && !waiting) queryStatus() else null
+            val model = if (status != null) status.name else this.model
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
             synchronized(stateLock) {
@@ -398,11 +421,12 @@ class EngineService : Service() {
                 // changed. Posted after each change, it showed the state in between: "Generating" for a moment at the
                 // end of every download or import, with the download gone and the busy state not yet updated.
                 val changed = importing != this.importing || download != this.download || work != this.work ||
-                    waiting != this.waiting
+                    waiting != this.waiting || model != this.model
                 this.importing = importing
                 this.download = download
                 this.work = work
                 this.waiting = waiting
+                this.model = model
                 if (nowBusy != busy) {
                     busy = nowBusy
                     if (nowBusy) wakeLock?.acquire(30 * 60 * 1000L) else releaseWakeLock()
@@ -424,7 +448,8 @@ class EngineService : Service() {
     }
 
     /** What the daemon is doing (GET /api/v1/activity, see DaemonActivity), or null when it could not be read: the poll
-     *  reads that as idle, a close (anythingRuns) as something running. */
+     *  reads that as idle for the wake lock and keeps its last line for a few polls, a close (anythingRuns) counts it
+     *  as something running. */
     private fun queryActivity(): DaemonActivity? = try {
         val conn = DaemonAuth.open("/api/v1/activity")
         conn.connectTimeout = 1000
@@ -447,9 +472,9 @@ class EngineService : Service() {
         null
     }
 
-    /** Whether GET /api/v1/status shows something running (statusRuns), or null when the status could not be read,
-     *  which a close (anythingRuns) counts as running: it never quits the daemon on a guess. */
-    private fun queryStatus(): Boolean? = try {
+    /** What GET /api/v1/status says (see statusReading), or null when the status could not be read, which a close
+     *  (anythingRuns) counts as running: it never quits the daemon on a guess. */
+    private fun queryStatus(): StatusReading? = try {
         val conn = DaemonAuth.open("/api/v1/status")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
@@ -457,7 +482,7 @@ class EngineService : Service() {
             if (conn.responseCode != 200) {
                 null
             } else {
-                statusRuns(JSONObject(conn.inputStream.bufferedReader().use { it.readText() }))
+                statusReading(JSONObject(conn.inputStream.bufferedReader().use { it.readText() }))
             }
         } finally {
             conn.disconnect()
@@ -513,6 +538,7 @@ class EngineService : Service() {
         // A download names its file (or the count) and shows its progress, unless an import, named first, is running.
         val download = this.download?.takeUnless { importing }
         val work = this.work
+        val model = this.model
         val text = when {
             importing -> "Importing models"
             download != null -> download.text
@@ -521,8 +547,12 @@ class EngineService : Service() {
             // A reply parked on a tool approval waits for the user, in the app, not for the phone: say so. It holds
             // no wake lock (see DaemonActivity).
             waiting -> "Waiting for your approval"
-            hot -> "Running. The phone is hot, so generation will be slower"
-            else -> "Running in the background"
+            // Nothing runs: "Idle", with the model still loaded, if any, by name (the system ellipsizes a long one).
+            // It read "Running in the background", which did not say whether anything was. Hot, the warning takes
+            // the line, as a long name would push it out of the one line the shade shows.
+            hot -> "Idle. The phone is hot, so generation will be slower"
+            model != null -> "Idle · $model"
+            else -> "Idle"
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_engine)
@@ -586,16 +616,28 @@ class EngineService : Service() {
  *  (the daemon lists those chats under `waiting`, not `items`). */
 private class DaemonActivity(val work: String?, val waiting: Boolean)
 
+/** What GET /api/v1/status says. [runs]: something runs there, a model held or a server feature on (statusReading).
+ *  [name]: the model the notification names while nothing runs, null when none is loaded or the loaded one is only
+ *  an embedding model in a pool slot, which the status does not name. */
+private class StatusReading(val runs: Boolean, val name: String?)
+
 /** What GET /api/v1/status counts as running (see anythingRuns). A model is loaded while the primary engine is
  *  loading, running or still stopping (`engine.state` starting, running or stopping), or any model is alive in a pool
  *  slot beside it, such as an embedding model or a Jev or Laya model. `poolModels` counts those slots (running,
  *  starting or stopping); a daemon from before TurboLLM#287 leaves it out, which reads as 0, and names only a Jev or
  *  Laya model (`jev`, `laya`), so those are still read. An engine in `error` holds nothing. A server feature on counts
- *  too (daemonServes). Null for a reply with no `engine`, which is not the daemon's status: unreadable. */
-private fun statusRuns(json: JSONObject): Boolean? {
+ *  too (daemonServes). The name is the primary's model while it holds one, else the Jev or Laya model's. Null for a
+ *  reply with no `engine`, which is not the daemon's status: unreadable. */
+private fun statusReading(json: JSONObject): StatusReading? {
     val engine = json.optJSONObject("engine") ?: return null
-    return engine.optString("state") in LOADED_STATES || json.optInt("poolModels") > 0 ||
-        json.optJSONObject("jev") != null || json.optJSONObject("laya") != null || daemonServes(json)
+    val primary = engine.optString("state") in LOADED_STATES
+    val jev = json.optJSONObject("jev")
+    val laya = json.optJSONObject("laya")
+    val loaded = primary || json.optInt("poolModels") > 0 || jev != null || laya != null
+    // opt, not optString: optString reads a JSON null as the text "null".
+    val name = listOfNotNull(json.optJSONObject("model")?.takeIf { primary }, jev, laya)
+        .firstNotNullOfOrNull { (it.opt("name") as? String)?.takeIf(String::isNotBlank) }
+    return StatusReading(loaded || daemonServes(json), name)
 }
 
 /** A server feature is on (`serving` in GET /api/v1/status, TurboLLM's serving-status.ts): the daemon listens beyond
