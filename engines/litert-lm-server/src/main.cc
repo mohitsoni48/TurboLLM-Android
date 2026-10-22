@@ -44,6 +44,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1421,6 +1424,26 @@ void PrintHelp() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef __linux__
+  // Die with the process that started this one, by the kernel: SIGKILL the moment the thread that forked it ends. On
+  // Android that is the daemon's Node thread in the app process, so the server, and the model it holds, ends however
+  // the app process ends (Quit, a crash, Android killing the app), at once. The app's daemon starts it through
+  // libtether_exec.so, which arms the same signal before the exec (BUILDING-ENGINES.md, "The engine tether"); this
+  // covers every other way it is started: by a daemon without that helper, through the daemon's sh lifeline when the
+  // helper fails its self-test, or by hand. Armed before anything else runs, so even a server stuck loading its
+  // library goes. A parent process that ended before the prctl never sends it: this process was then already
+  // reparented to init, so the server does not start. This sees the process end, not the thread: had only the forking
+  // thread ended, this process would have moved to another thread of its parent and the signal would come when that
+  // one ends; the daemon's thread ends only with the daemon. A server that init starts on purpose is refused too;
+  // none is, as this binary ships only in the APK (host builds are for its tests).
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+    std::fprintf(stderr, "prctl(PR_SET_PDEATHSIG) failed: %s; the server will not end with its parent\n",
+                 std::strerror(errno));
+  } else if (::getppid() == 1) {
+    std::fprintf(stderr, "the process that started %s has already exited; not starting\n", kServerName);
+    return 1;
+  }
+#endif
   std::string config_path, host = "127.0.0.1";
   int port = 9379;
   std::vector<std::string> args(argv + 1, argv + argc);

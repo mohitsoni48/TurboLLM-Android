@@ -328,6 +328,16 @@ satisfied the server's `std::runtime_error`/`__cxa_*` references from those expo
 AddressSanitizer caught an exception being destroyed by the other runtime. See
 `src/litert_lm_api.h`.
 
+**It ends with whatever started it.** The first thing `main()` does is arm
+`PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills the server the moment the thread that started it
+ends, and it exits 1 without starting when its parent is already init (the starter died before
+the `prctl`). The daemon's [engine tether](#the-engine-tether) does the same before it execs the
+server; this covers a server started any other way: by a daemon without the tether, through the
+daemon's `/system/bin/sh` fallback, or by hand. `node --test
+engines/litert-lm-server/parent-death.test.mjs` builds the server for the machine (Linux, `cc`
+and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing, and checks that a
+stand-in daemon's SIGKILL takes the listening server with it and that an orphaned start exits.
+
 ### GPU
 
 The app reads the GPU's name from a throwaway GL context (`MainActivity.gpuEnv`) and passes it
@@ -392,7 +402,8 @@ which lives exactly as long as the daemon. So whichever way the app process ends
 is `Process.killProcess`, a crash, Android killing the app), the kernel ends the engines with
 it at once. Behind that, system_server still kills whatever is left in the
 app's cgroup once the app process has died (AOSP 7 to 15); before the helper, that was an
-engine's only tie to the app.
+engine's only tie to the app. `liblitertlm_server.so` also arms the signal itself, at the top of
+its `main()` ([what the server is](#what-the-server-is-and-why-it-is-shaped-this-way)).
 
 | | |
 |---|---|
@@ -412,8 +423,9 @@ of ending the `sh`'s stdin. It logs `tether: libtether_exec.so self-test passed 
 /system/bin/sh lifeline instead`, or, when the APK has no helper, `tether: libtether_exec.so not
 found in <dir>; tethered spawns use the /system/bin/sh lifeline instead`. Either way it then ties each engine
 with a `/system/bin/sh` watcher instead (one more process per engine, counted against
-Android 12+'s phantom process limit). A daemon without that commit starts engines directly,
-and only the cgroup kill ties them.
+Android 12+'s phantom process limit). A daemon without that commit starts engines directly:
+then the cgroup kill alone ties the llama.cpp engines, and the LiteRT-LM server is also tied
+by its own signal.
 
 `node --test scripts/stage-tether-exec.test.mjs` builds the helper for the machine with `cc`
 (Linux) and runs it: a stand-in daemon's SIGKILL takes its engine; a parent that is not the
