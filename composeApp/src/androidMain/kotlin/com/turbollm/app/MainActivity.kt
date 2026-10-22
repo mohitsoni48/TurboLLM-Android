@@ -46,6 +46,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var storageAccess: StorageAccess
     /** From EngineService.activityOpened: the service ignores this activity's close once a newer one is open. */
     private var activityNumber = 0
+    /** Set by finish(), so onDestroy tells Back from a swipe from Recents. */
+    private var finishedByBack = false
 
     /** The system file picker for importing models (ModelImport). Any type: .gguf and .litertlm have no MIME type
      *  providers agree on, so ModelImport checks the name instead. */
@@ -69,7 +71,8 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         recordCrashes()
-        // First, so a stop the service began on the last Back sees at once that the app is open again (stopNow).
+        // First, so a close the service is deciding on the last Back sees at once that the app is open again and
+        // quits nothing (EngineService.appClosed).
         activityNumber = EngineService.activityOpened()
 
         // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
@@ -151,10 +154,22 @@ class MainActivity : ComponentActivity() {
         super.onPause()
     }
 
+    /** Called only for Back: DaemonWebView's BackHandlers call it, and before Android 12 so does the system's own Back
+     *  while none is composed (the splash), through onBackPressed and finishAfterTransition; from Android 12 that Back
+     *  moves the task to the back instead, which is no close. A swipe from Recents finishes the activity too, but from
+     *  the system's side, without calling this. */
+    override fun finish() {
+        finishedByBack = true
+        super.finish()
+    }
+
     override fun onDestroy() {
-        // Back, not a configuration change (those no longer recreate the activity, see the manifest).
+        // Back, not a configuration change (those no longer recreate the activity, see the manifest), and not a swipe
+        // from Recents: the service hears that one as onTaskRemoved. Sent for a swipe too, it was a second close of
+        // the same swipe, decided afresh a moment later, so a swipe with a reply running quit the app if the reply
+        // ended in between (EngineService.appClosed).
         // Android may run this only after the app was opened again, a new MainActivity included (activityNumber).
-        if (isFinishing) EngineService.activityFinished(this, activityNumber)
+        if (isFinishing && finishedByBack) EngineService.activityFinished(this, activityNumber)
         super.onDestroy()
     }
 

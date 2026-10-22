@@ -51,10 +51,10 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
    `DaemonAuth.kt` makes the app's other calls to it: the check that the daemon proves itself
    before the app sends its secret, and the authenticated requests from `EngineService.kt`
    (activity, downloads, status, and the request to write the chat database to disk before
-   Quit and before the service stops), `ModelImport.kt` (adding the imported-models folder) and
-   `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain` points at
-   `127.0.0.1:6996`; it is unused Spike A code that only the old `App()` screen, which the
-   Android app never shows, constructs.) The web UI in that WebView goes further, though: it
+   Quit and before a close with nothing running ends the app), `ModelImport.kt` (adding the
+   imported-models folder) and `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain`
+   points at `127.0.0.1:6996`; it is unused Spike A code that only the old `App()` screen, which
+   the Android app never shows, constructs.) The web UI in that WebView goes further, though: it
    loads the images its pages point at from any https host, and from any host over plain http
    on port 80. The daemon's CSP for the app allows that on purpose
    (`APP_SECRET_CSP` in its `server.ts`: images and media from `'self'`, any `https:` host,
@@ -95,10 +95,19 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
    - `INTERNET` — the above network use.
    - `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_SPECIAL_USE` — `EngineService`, a foreground
      service of type `specialUse` that keeps the daemon, the engines and a loaded model running
-     while the app is in the background. It starts when the app is opened and runs until Quit in
-     its notification (or, with notifications off, until the app is left with no model loaded and
-     nothing generating, importing or downloading). `PLAY-FGS-DECLARATION.md` has the text for
-     Play's declaration.
+     while the app is in the background. It starts when the app is opened and runs until Quit in its
+     notification, or until the app is closed (Back from its main screen, or swiped away from
+     Recents) with nothing running: no model loaded or loading, nothing generating, importing or
+     downloading, no reply waiting for an approval, no routine running, and no LAN access, remote
+     access or Turbo Link for other devices on. That close ends the app's process about 3 seconds
+     later, as Quit does (Quit too waits those 3 seconds), whether notifications are on or off;
+     opening the app again within them, or after Quit bringing it back on screen, keeps it running.
+     Closed with something running, the service keeps running after that work ends or that access is
+     turned off, until Quit or a later close with nothing running (opening the app and closing it
+     again, or swiping away the card a Back left in Recents); with notifications off there is no
+     Quit, and on Android 13+ the system's list of active apps can stop it. Routines only scheduled
+     for later do not count as running: a close with nothing running stops the routine scheduler
+     with the app. `PLAY-FGS-DECLARATION.md` has the text for Play's declaration.
    - `POST_NOTIFICATIONS` — that service's ongoing notification, which carries the Quit action and
      the "phone is hot" warning. On Android 13+ the app asks for it each time it starts until it is
      granted; Android stops showing the prompt once the user has declined it twice. The service
@@ -177,14 +186,13 @@ When the cloud backup actually runs: Android's scheduled Auto Backup takes an ap
 day, and by default only while the phone is idle, charging and on Wi-Fi (any unmetered network, or
 mobile data if the user allowed it). It also passes over an app that counts as in the foreground,
 and an app running a foreground service does. `EngineService` is one, and it runs from the moment
-the app is opened until Quit (with notifications off, until the app is left with no model loaded
-and nothing generating, importing or downloading), so while it runs Android puts TurboLLM's
-backup off and tries again 1 to 3 hours later. A phone that keeps the app open day and night can
-go a long time without a new TurboLLM backup; one is taken on a night the app is not running,
-after Quit, a reboot, or Android ending the process. Excluding the models only keeps a backup
-that does run under the 25 MB quota. `android:backupInForeground="true"` would remove the wait,
-but Android stops the app to back it up, which would unload the model and cut off a reply, so it
-is not set.
+the app is opened until Quit or until the app is closed with nothing running, so while it runs
+Android puts TurboLLM's backup off and tries again 1 to 3 hours later. A phone that keeps the app
+open day and night can go a long time without a new TurboLLM backup; one is taken on a night the
+app is not running, after Quit or such a close, a reboot, or Android ending the process.
+Excluding the models only keeps a backup that does run under the 25 MB quota.
+`android:backupInForeground="true"` would remove the wait, but Android stops the app to back it
+up, which would unload the model and cut off a reply, so it is not set.
 
 `config.json` also holds, in plaintext, every third-party credential the user has entered: the
 Hugging Face and GitHub tokens, the Cloudflare tunnel token, the ngrok authtoken, the Tavily/Kagi
