@@ -37,6 +37,9 @@ paste into a search box in three months.
   build its server with the NDK AGP already uses (`stageLitertLmEngine`, needs network on the
   first build). `-PturbollmLitertLmEngine=false` leaves it out. See
   [the LiteRT-LM engine](#the-litert-lm-engine).
+- **The engine tether?** Nothing to do — every build compiles `libtether_exec.so`, the helper
+  that makes the kernel end each engine with the app, with the same NDK (`stageTetherExec`). See
+  [the engine tether](#the-engine-tether).
 - **Before you change anything about packaging**, read
   [the platform constraint](#the-platform-constraint-that-shapes-everything). It is the
   reason the binaries are bundled rather than downloaded, the reason they are named
@@ -359,6 +362,111 @@ it doesn't.
   `/data` executable searches `/system` and `/system_ext` only, so a vendor `libOpenCL.so` may
   not be found. A GPU that cannot be initialised fails the load with the runtime's error (there
   is no automatic fallback); the app then suggests switching the model's Backend to CPU.
+
+---
+
+## The engine tether
+
+Every engine the daemon starts (the llama.cpp ones and the LiteRT-LM server) is meant to end the
+moment the app process does, however it ends. The app ships a helper for that,
+`libtether_exec.so`, and the daemon starts each engine as
+`libtether_exec.so <daemon pid> <engine> <args...>`, and each probe the same way (a short run of
+a program whose output it reads, such as an engine's version check). Only those: the helper ties
+the one program it execs, not what that program starts, so every other process the daemon ties
+to its life (an MCP stdio server, a tunnel) keeps the daemon's `/system/bin/sh` lifeline: a
+process group of its own, which a stop ends as a whole, and a watcher that kills that group
+when the daemon dies. The helper:
+
+1. arms `PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills the process the moment the thread that
+   started it ends;
+2. exits 127 without starting the engine if its parent is no longer that pid (the daemon
+   process ended between the fork and the `prctl`, so no signal would ever come). This sees the
+   process end, not the thread: had only the forking thread ended, the kernel would have moved
+   the helper to another thread of the daemon, and the signal would come when that one ends;
+   the daemon's thread ends only with the daemon;
+3. `exec`s the engine in place: the engine keeps the helper's pid, stdio and exit status, and no
+   extra process is left behind.
+
+libuv forks on the thread that calls `spawn`, the one `MainActivity` starts `node::Start` on,
+which lives exactly as long as the daemon. So whichever way the app process ends (Quit, which
+is `Process.killProcess`, a crash, Android killing the app), the kernel ends the engines with
+it at once. Behind that, system_server still kills whatever is left in the
+app's cgroup once the app process has died (AOSP 7 to 15); before the helper, that was an
+engine's only tie to the app.
+
+| | |
+|---|---|
+| Source | `engines/tether-exec/tether_exec.c` |
+| Built by | `scripts/stage-tether-exec.mjs` (`stageTetherExec` in `composeApp/build.gradle.kts`, hooked to `merge*JniLibFolders`), with the NDK's clang for API 24, as a PIE with 16 KB-aligned LOAD segments, stripped, checked with the LiteRT-LM staging's `checkElf` |
+| Output | `composeApp/build/generated/tether-exec/jniLibs/<abi>/libtether_exec.so`, about 6 KB per ABI |
+| In the APK | Always. `assemble*`/`bundle*` fail if it is missing for a shipped ABI |
+
+**The daemon's side** is TurboLLM's `util/tether.ts` (`fix(daemon): a process the daemon starts can
+be tied to its life`). It looks for the helper in `TURBOLLM_ANDROID_NATIVE_LIB_DIR` and, at each
+start, before it spawns anything, checks it by watching it work, while the app lives (a force-stop
+cannot test it: the cgroup kill would hide a helper that does nothing).
+It runs `/system/bin/sh -c '"$0" "$$" /system/bin/sleep 30 & echo "$!"; read -r _' <helper>`
+and must see `/system/bin/sleep 30` running with that `sh` as its parent, then gone within 1 s
+of ending the `sh`'s stdin. It logs `tether: libtether_exec.so self-test passed (… ms)` to
+`files/daemon.log`, or `… self-test failed: <step and reason>; tethered spawns use the
+/system/bin/sh lifeline instead`, or, when the APK has no helper, `tether: libtether_exec.so not
+found in <dir>; tethered spawns use the /system/bin/sh lifeline instead`. Either way it then ties each engine
+with a `/system/bin/sh` watcher instead (one more process per engine, counted against
+Android 12+'s phantom process limit). A daemon without that commit starts engines directly,
+and only the cgroup kill ties them.
+
+`node --test scripts/stage-tether-exec.test.mjs` builds the helper for the machine with `cc`
+(Linux) and runs it: a stand-in daemon's SIGKILL takes its engine; a parent that is not the
+given pid, or a pid that is not a number above 1, exits 127 without running anything; the pid,
+stdin, stdout, exit status and signals pass through; it passes the daemon's self-test under each
+shell found (`/bin/sh`, bash, mksh), while a helper that execs without the signal and one that
+exits 127 fail it. With an NDK (`ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or 27.0.12077973 under
+`ANDROID_HOME` or `ANDROID_SDK_ROOT`) it also builds both ABIs and checks the files.
+
+### Checking it on a device
+
+With a model loaded:
+
+```bash
+adb shell run-as com.turbollm cat files/daemon.log | grep 'tether:'   # "self-test passed"
+adb shell ps -A -o PID,PPID,NAME | grep -E 'llama_server|litertlm|tether'
+#   the engine's PPID is the app's pid, and no libtether_exec.so is listed (it exec'd the engine)
+adb shell am force-stop com.turbollm
+adb shell ps -A | grep -E 'llama_server|litertlm'                      # nothing
+```
+
+Then the same `ps` after each other way the app ends with a model loaded, loading it again
+each time: the notification's Quit (the app ends about 3 seconds after the tap), and
+`adb shell run-as com.turbollm kill -9 <app pid>` (a debug build). No engine is left after
+either. After Quit, a reply that finished just before is there when the app is opened again:
+the daemon wrote its chat database before the kill.
+
+Back from the app's main screen, or a swipe from Recents, with a model loaded does not end the
+app, by design: a loaded model counts as running, so the app and its engine stay (`ps` still
+lists the engine under the app, and the notification reads "Idle · " and the model's name)
+until Quit, or until the daemon's idle timer has unloaded the model and the app is closed again
+with nothing running (opened and closed, or the card a Back left in Recents swiped away).
+
+With nothing loaded or running, Back or a swipe from Recents ends the app about 3 seconds
+later: `adb shell pidof com.turbollm` prints nothing, and the `ps` above lists no engine. A
+reply that finished just before is there when the app is opened again.
+
+On the first launch after an install or an update, close the app only once it shows its own
+splash: the animated bolt (an orange badge that pops in, then pulses) with "Starting TurboLLM…"
+under it, not the still launcher icon Android shows before it from Android 12. Until then the app
+is still unpacking the daemon and has not started the service that hears a close, so whether a
+swipe made then ends the app is up to Android.
+
+Only the `tether:` line tests the helper itself. Every ending above would also pass on the
+cgroup kill alone.
+
+### Not yet verified
+
+No device has run it. The x86_64 NDK build was run in a chroot of the x86_64 Android 15
+emulator image (its own linker, `/system/bin/sh`, which is mksh, and toybox's `sleep`): it
+passed the self-test above, and a stand-in daemon's SIGKILL took its engine within 20 ms. The
+arm64 build has only been checked as a file (architecture, PIE, `/system/bin/linker64`,
+alignment).
 
 ---
 

@@ -100,6 +100,10 @@ val shippedAbis = listOf("arm64-v8a", "x86_64")
 // stands in for libandroid.so (liblrtandr.so). jniLibs packages everything in it.
 val litertLmJniLibs = layout.buildDirectory.dir("generated/litert-lm/jniLibs")
 
+// Where stageTetherExec puts <abi>/libtether_exec.so, the helper the daemon starts every engine through (see "The
+// engine tether" below). jniLibs packages everything in it.
+val tetherJniLibs = layout.buildDirectory.dir("generated/tether-exec/jniLibs")
+
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
     ?.takeIf { it.exists() }
@@ -232,6 +236,9 @@ android {
         // The LiteRT-LM engine, staged into the build dir by stageLitertLmEngine (below) rather
         // than src/: it is fetched and compiled on every machine, never committed.
         if (shipLitertLmEngine) jniLibs.srcDir(litertLmJniLibs)
+        // The engine tether, staged into the build dir by stageTetherExec (below): compiled on every machine, like the
+        // LiteRT-LM server, and in every build.
+        jniLibs.srcDir(tetherJniLibs)
     }
 
     // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
@@ -534,6 +541,54 @@ if (shipLitertLmEngine) {
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+// ── The engine tether ─────────────────────────────────────────────────────────────────────
+//
+// libtether_exec.so, built from engines/tether-exec/tether_exec.c by scripts/stage-tether-exec.mjs with the NDK AGP
+// resolves, as for the LiteRT-LM server. The daemon starts every engine through it: it arms PR_SET_PDEATHSIG(SIGKILL)
+// and execs the engine in place, so the kernel kills the engine the moment the daemon's thread ends, however the app
+// process ends. Before, an engine's only tie to the app was system_server killing the app's cgroup after the process
+// had died. The daemon checks the helper at boot by watching it work, and without it (missing, or failing that check)
+// it ties each engine with a /system/bin/sh watcher instead: one more process per engine, counted against Android
+// 12+'s phantom process limit. So it is in every build, whatever the engine flags say, and its absence fails the build
+// like a missing LiteRT-LM engine does. See BUILDING-ENGINES.md, "The engine tether". Hooked to merge*JniLibFolders,
+// as stageLitertLmEngine is; two clang runs of one small file, so it runs every time.
+val stageTetherExec by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds libtether_exec.so, the helper that ties each engine to the app process, into the APK's jniLibs."
+    workingDir = rootProject.projectDir
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+    val outDir = tetherJniLibs
+    outputs.upToDateWhen { false }
+    doFirst {
+        commandLine(
+            "node", "scripts/stage-tether-exec.mjs",
+            "--ndk", androidExt.ndkDirectory.absolutePath,
+            "--out", outDir.get().asFile.absolutePath,
+            "--abis", shippedAbis.joinToString(","),
+        )
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(stageTetherExec)
+}
+// The APK/AAB tasks only, as for the LiteRT-LM engine above.
+val tetherPackagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
+tasks.matching { tetherPackagingTask.matches(it.name) }.configureEach {
+    doLast {
+        for (abi in shippedAbis) {
+            val f = tetherJniLibs.get().file("$abi/libtether_exec.so").asFile
+            if (!f.exists()) {
+                throw GradleException(
+                    "Engine tether missing: ${f.absolutePath}\n" +
+                        "The daemon would tie each engine with an extra sh process instead. " +
+                        "It is built by stageTetherExec (scripts/stage-tether-exec.mjs).",
+                )
             }
         }
     }

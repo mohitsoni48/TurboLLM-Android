@@ -61,8 +61,9 @@ const WHEELS = {
 }
 const LIB_IN_WHEEL = 'litert_lm/liblitert-lm.so'
 // The app's minSdk. The server and the shims are built for it, and the NDK's stub libraries for
-// it say what every supported device provides; the library itself is built for API 23.
-const MIN_SDK = 24
+// it say what every supported device provides; the library itself is built for API 23. Also the
+// engine tether's (stage-tether-exec.mjs), as are ndkToolchain and checkElf.
+export const MIN_SDK = 24
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const serverSrc = join(appRoot, 'engines', 'litert-lm-server')
@@ -162,7 +163,7 @@ function extractFromZip(zipPath, member) {
 // ── ELF checks: right architecture, and 16 KB-aligned LOAD segments ────────────────────────
 // A 4 KB-aligned file fails to load on a 16 KB-page device, and Play rejects updates that
 // carry one (targetSdk 35+). Checked here so a bad file stops the build, not a user's launch.
-function checkElf(path, machine) {
+export function checkElf(path, machine) {
   const b = readFileSync(path)
   if (b.readUInt32BE(0) !== 0x7f454c46) fail(`${path}: not an ELF file`)
   if (b[4] !== 2) fail(`${path}: not a 64-bit ELF`)
@@ -501,7 +502,7 @@ ${functions.map((f) => `SHIM(${f})`).join('\n')}
 `
 }
 
-function ndkToolchain(ndk) {
+export function ndkToolchain(ndk) {
   const prebuilt = join(ndk, 'toolchains', 'llvm', 'prebuilt')
   const exe = process.platform === 'win32' ? 'clang.exe' : 'clang'
   const host = existsSync(prebuilt) ? readdirSync(prebuilt).find((h) => existsSync(join(prebuilt, h, 'bin', exe))) : undefined

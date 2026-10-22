@@ -187,7 +187,9 @@ class EngineService : Service() {
 
     /** "Quit" in the notification: how the user frees a loaded model's memory without going back into the app, since
      *  the service otherwise outlives the activity (with notifications off there is no Quit, see appClosed). Killing
-     *  the process takes the engine children with it (Android kills the app's whole process group).
+     *  the process takes the engines with it: the kernel kills each one when the daemon's thread ends, since the
+     *  daemon starts it through libtether_exec.so (BUILDING-ENGINES.md, "The engine tether"), and system_server then
+     *  kills whatever is left in the app's cgroup. A cgroup, not a process group: an engine may lead its own group.
      *
      *  The daemon writes its chat database to disk first (flushDatabase). The kill used to come at once, and the
      *  daemon writes the database only on its own schedule, so a reply that had just finished, or a chat started just
