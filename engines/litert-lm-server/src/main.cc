@@ -295,10 +295,10 @@ struct ModelFileInfo {
   // The decoder keeps a recurrent state besides its KV cache: LFM2's short-convolution cache (the kv_cache_c_* inputs),
   // or any linear-attention state. See GetOrCreateEngine for why that matters.
   bool recurrent_state = false;
-  // What the header's TFLite sections say, when the header could be read: for image and for audio input, the backends
-  // the file's encoder supports, the one it prefers first; none when it takes no such input.
+  // What the header's TFLite sections say, when the header could be read: for text, image and audio input, the
+  // backends the file's decoder or encoder supports, the one it prefers first; none when it takes no such input.
   bool capabilities_known = false;
-  std::vector<std::string> vision_backends, audio_backends;
+  std::vector<std::string> text_backends, vision_backends, audio_backends;
   // The model's own sampler (LlmMetadata's sampler_params): type UNSPECIFIED and zeros for a file that has none, as
   // LFM2.5-230M and gemma-3-270m-it are, as the C API's litert_lm_loaded_file_sampler_* also answer.
   LiteRtLmSamplerType sampler_type = kLiteRtLmSamplerTypeUnspecified;
@@ -567,6 +567,8 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   const uint32_t n = fb.Length(sections);
   info.capabilities_known = n > 0;
   std::optional<std::string> vision, audio;  // the encoder's backend_constraint
+  std::string text;                          // the decoder's, or the text encoder's
+  bool npu_aux = false;                      // an NPU auxiliary model, which makes NPU a text backend too
   uint64_t main_begin = 0, main_end = 0;  // the main TFLite model, as DiscoverSections picks it
   bool main_found = false, other_found = false;
   for (uint32_t k = 0; k < n && k < 4096; ++k) {
@@ -602,6 +604,8 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
       main_found |= main;
       other_found |= other;
       info.artisan |= model_type == "tf_lite_artisan_text_decoder";
+      if (main || model_type == "tf_lite_text_encoder" || model_type == "tf_lite_embedder") text = constraint;
+      npu_aux |= model_type == "tf_lite_aux";
       if (model_type == "tf_lite_vision_adapter" || model_type == "tf_lite_vision_encoder") vision = constraint;
       if (model_type == "tf_lite_audio_adapter" || model_type == "tf_lite_audio_encoder_hw" ||
           model_type == "tf_lite_audio_frontend") {
@@ -633,6 +637,18 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
     ReadTflite(model, info);
   }
   info.dynamic_context = IsMagicNumber(info.max_context);
+  // The text's backends as the C API lists them (ConfigureSupportedBackendsAndNpu), except that an Artisan text decoder
+  // puts GPU first, as `litert-lm serve` does (model.model_default_backend): LiteRT-LM runs it on GPU only, switching
+  // GPU to GPU_ARTISAN for it (engine_settings.cc).
+  info.text_backends = ConstraintBackends(text);
+  if (npu_aux && std::find(info.text_backends.begin(), info.text_backends.end(), "npu") == info.text_backends.end()) {
+    info.text_backends.push_back("npu");
+  }
+  if (info.artisan) {
+    std::vector<std::string>& text_backends = info.text_backends;
+    text_backends.erase(std::remove(text_backends.begin(), text_backends.end(), "gpu"), text_backends.end());
+    text_backends.insert(text_backends.begin(), "gpu");
+  }
   if (vision) info.vision_backends = ConstraintBackends(*vision);
   if (audio) info.audio_backends = ConstraintBackends(*audio);
   return info;
@@ -698,6 +714,8 @@ struct EngineHolder {
   bool tools_unconstrained = false;
   // What the model file says about itself (ModelFileInfo), as it was when this engine was created.
   ModelFileInfo info;
+  // The backend the engine runs on: key.backend, or CPU when the model's own backend did not start.
+  std::string backend;
   // The context window this engine has, in tokens (-1: unknown), and the larger one that was asked for, if any.
   int window = -1, window_asked = -1;
   // The model's decoder keeps a recurrent state (info.recurrent_state), and a message has been sent on this engine
@@ -807,20 +825,28 @@ int RuntimeWindow(const ModelFileInfo& info, int asked, const std::string& backe
 LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, const InputNeeds& needs) {
   EngineKey key;
   key.path = ref.path;
-  key.backend = ref.backend ? *ref.backend : (mc.backend ? Lower(*mc.backend) : "cpu");
+  key.backend = ref.backend ? *ref.backend : (mc.backend ? Lower(*mc.backend) : "");
   key.max_num_tokens = ref.max_num_tokens ? *ref.max_num_tokens : (mc.max_num_tokens ? *mc.max_num_tokens : -1);
   key.threads = mc.cpu_thread_count ? *mc.cpu_thread_count : -1;
   key.gpu_steps = mc.gpu_decode_steps_per_sync ? *mc.gpu_decode_steps_per_sync : -1;
   key.spec = mc.speculative_decoding ? (*mc.speculative_decoding ? 1 : 0) : -1;
   key.cache = CacheDirValue(mc.cache);
   if (key.cache.empty()) key.cache = FallbackCacheDir(ref.path);
-  if (key.backend != "cpu" && key.backend != "gpu" && key.backend != "npu") {
+  if (!key.backend.empty() && key.backend != "cpu" && key.backend != "gpu" && key.backend != "npu") {
     throw HttpError(500, "Failed to load engine: ValueError(\"Unsupported backend: '" + key.backend + "'\")");
   }
+  const ModelFileInfo& info = FileInfo(ref);
+  // With no backend in the model reference or the config, the model's own: the first its header lists for its text
+  // (ReadModelFileInfo: a GPU-only bundle lists gpu alone, one with no constraint [cpu, gpu]), as `litert-lm serve`
+  // picks it (model.model_default_backend: an Artisan text decoder means gpu, else the decoder section's first
+  // backend_constraint, else cpu). The server picked CPU for every model, so a GPU-only bundle sent without a backend
+  // failed to load ("Main backend constraint mismatch", engine_settings.cc). A backend the model picked that does not
+  // start falls back to the next one it lists (below); one the user set does not.
+  const bool backend_set = !key.backend.empty();
+  if (!backend_set) key.backend = info.text_backends.empty() ? "cpu" : info.text_backends.front();
   // A vision or audio executor is created only when the engine settings name a backend for it (c/engine.cc,
   // CreateEngineSettingsHelper), and none was named, so an image sent to LFM2.5-VL-450M got a 500 "Vision executor
   // should not be null, please TryLoadingVisionExecutor() first." although the model takes images.
-  const ModelFileInfo& info = FileInfo(ref);
   key.vision_backend = EncoderBackend(ref, info.vision_backends, mc.vision_backend, "vision");
   key.audio_backend = EncoderBackend(ref, info.audio_backends, mc.audio_backend, "audio");
   // An image or audio part for a model that has no such input is the request's mistake, said before anything loads.
@@ -855,28 +881,12 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
     ReleaseEngine();
   }
 
-  Log("Initializing engine for model: " + ref.path + " (backend: " + key.backend +
-      (key.vision_backend.empty() ? "" : ", vision: " + key.vision_backend) +
-      (key.audio_backend.empty() ? "" : ", audio: " + key.audio_backend) + ")");
-  auto t0 = std::chrono::steady_clock::now();
-  L.litert_lm_clear_last_error();
-  LiteRtLmEngineSettings* s = L.litert_lm_engine_settings_create(
-      ref.path.c_str(), key.backend.c_str(), key.vision_backend.empty() ? nullptr : key.vision_backend.c_str(),
-      key.audio_backend.empty() ? nullptr : key.audio_backend.c_str());
-  if (!s) {
-    std::string why = LastRuntimeError();
-    throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create engine settings for " + ref.path +
-                             (why.empty() ? "" : ": " + why) + "')");
-  }
-  L.litert_lm_engine_settings_enable_benchmark(s);
-  L.litert_lm_engine_settings_set_use_ringbuffers_local_attention(s, true);
-  if (key.backend == "cpu" && key.threads > 0) L.litert_lm_engine_settings_set_num_threads(s, key.threads);
   // A context larger than the model takes was cut to the model's by the runtime with only a WARNING in its log
   // ("Passed in max_num_tokens (8192) is larger than what the static model supports (4096). Using model limit.",
   // ClampMaxNumTokens in llm_litert_compiled_model_executor.cc), so nobody was told, and "length" was judged against
   // the size asked for: a reply cut off at the model's 4096 read "stop". Now the server gives the model its own
   // limit, says so in the log, and reports both on /v1/models and in each reply's headers. With no size asked for,
-  // the window is the one the runtime picks (RuntimeWindow).
+  // the window is the one the runtime picks (RuntimeWindow, once the backend is known).
   int window = key.max_num_tokens > 0 ? RuntimeWindow(info, key.max_num_tokens, key.backend) : -1, window_asked = -1;
   if (window > 0 && window < key.max_num_tokens) {
     window_asked = key.max_num_tokens;
@@ -889,21 +899,63 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
           " tokens); its context window is " + std::to_string(window));
     }
   }
-  if (window > 0) L.litert_lm_engine_settings_set_max_num_tokens(s, window);
-  if (window <= 0) window = RuntimeWindow(info, -1, key.backend);
-  L.litert_lm_engine_settings_set_cache_dir(s, key.cache.c_str());
-  if (key.spec >= 0) L.litert_lm_engine_settings_set_enable_speculative_decoding(s, key.spec == 1);
-  if (key.backend == "gpu" && key.gpu_steps > 0) L.litert_lm_engine_settings_set_gpu_decode_steps_per_sync(s, key.gpu_steps);
-
-  LiteRtLmEngine* e = L.litert_lm_engine_create(s);
-  L.litert_lm_engine_settings_delete(s);
-  if (!e) {
-    std::string why = LastRuntimeError();
-    throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
-                             (why.empty() ? "" : ": " + why) + "')");
+  auto t0 = std::chrono::steady_clock::now();
+  // The engine on `backend`, or null with the runtime's reason in `why`.
+  std::string why;
+  auto create = [&](const std::string& backend) -> LiteRtLmEngine* {
+    Log("Initializing engine for model: " + ref.path + " (backend: " + backend +
+        (key.vision_backend.empty() ? "" : ", vision: " + key.vision_backend) +
+        (key.audio_backend.empty() ? "" : ", audio: " + key.audio_backend) + ")");
+    L.litert_lm_clear_last_error();
+    LiteRtLmEngineSettings* s = L.litert_lm_engine_settings_create(
+        ref.path.c_str(), backend.c_str(), key.vision_backend.empty() ? nullptr : key.vision_backend.c_str(),
+        key.audio_backend.empty() ? nullptr : key.audio_backend.c_str());
+    if (!s) {
+      why = "Failed to create engine settings for " + ref.path;
+      if (std::string runtime = LastRuntimeError(); !runtime.empty()) why += ": " + runtime;
+      return nullptr;
+    }
+    L.litert_lm_engine_settings_enable_benchmark(s);
+    L.litert_lm_engine_settings_set_use_ringbuffers_local_attention(s, true);
+    if (backend == "cpu" && key.threads > 0) L.litert_lm_engine_settings_set_num_threads(s, key.threads);
+    if (window > 0) L.litert_lm_engine_settings_set_max_num_tokens(s, window);
+    L.litert_lm_engine_settings_set_cache_dir(s, key.cache.c_str());
+    if (key.spec >= 0) L.litert_lm_engine_settings_set_enable_speculative_decoding(s, key.spec == 1);
+    if (backend == "gpu" && key.gpu_steps > 0) L.litert_lm_engine_settings_set_gpu_decode_steps_per_sync(s, key.gpu_steps);
+    LiteRtLmEngine* e = L.litert_lm_engine_create(s);
+    L.litert_lm_engine_settings_delete(s);
+    if (!e) {
+      why = "Failed to create LiteRT-LM engine for " + ref.path;
+      if (std::string runtime = LastRuntimeError(); !runtime.empty()) why += ": " + runtime;
+    }
+    return e;
+  };
+  // A new engine for a fresh state (above) runs where the one before it did, so a model whose own backend fell back is
+  // not tried on that backend again for every conversation. A backend other than CPU that the model picked and that
+  // does not start falls back to the next one the model lists, and only to one it lists: a GPU-only bundle was tried
+  // on CPU, which cannot run it, and the error then gave the CPU's reason instead of the GPU's. When none starts, the
+  // error gives each one's reason.
+  std::vector<std::string> backends = {fresh_state ? g_engine.backend : key.backend};
+  if (!backend_set && backends[0] != "cpu") {
+    auto at = std::find(info.text_backends.begin(), info.text_backends.end(), backends[0]);
+    if (at != info.text_backends.end()) backends.insert(backends.end(), at + 1, info.text_backends.end());
   }
+  if (!backend_set && !fresh_state && backends[0] != "cpu") Log("Using " + ref.id + "'s own backend: " + backends[0]);
+  LiteRtLmEngine* e = nullptr;
+  std::string backend, reasons;
+  for (size_t i = 0; i < backends.size() && !e; ++i) {
+    backend = backends[i];
+    if ((e = create(backend))) break;
+    reasons += (reasons.empty() ? "" : "; ") + (backends.size() > 1 ? "on " + backend + ": " : std::string()) + why;
+    if (i + 1 < backends.size()) {
+      Log(ref.id + "'s own backend, " + backend + ", did not start (" + why + "); falling back to " + backends[i + 1]);
+    }
+  }
+  if (!e) throw HttpError(500, "Failed to load engine: RuntimeError('" + reasons + "')");
+  if (window <= 0) window = RuntimeWindow(info, -1, backend);
   g_engine.engine = e;
   g_engine.key = key;
+  g_engine.backend = backend;
   // The same model and settings again: what was found out about the model still holds.
   if (!fresh_state) g_engine.tools_unconstrained = false;
   g_engine.info = info;
@@ -1902,7 +1954,7 @@ void HandleChatCompletions(int fd, const Request& req) {
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
     LiteRtLmSessionConfig* sc = L.litert_lm_session_config_create();
-    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.key.backend, ref.id, has_sampler)) {
+    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.backend, ref.id, has_sampler)) {
       LiteRtLmSamplerParams* sp = L.litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
       L.litert_lm_sampler_params_set_top_k(sp, sampling->top_k);
       L.litert_lm_sampler_params_set_top_p(sp, sampling->top_p);

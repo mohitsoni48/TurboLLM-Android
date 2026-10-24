@@ -451,6 +451,15 @@ default for it, the largest multiple of 256 below it (below 256, the largest pow
 with none asked. A prompt that does not fit the window is a 400 that names its size; in a
 stream, already answered 200, it is the `response.error` event, with the same words.
 
+**With no backend in the model reference or the config, the model's own is used**: the first its
+header lists for its text (a GPU-only bundle, Gemma 4's `-gpu` one among them, lists gpu alone; a
+file without a backend constraint, LFM2.5-230M for one, lists cpu first; an Artisan text decoder
+puts gpu first), as `litert-lm serve` picks it. The server picked CPU for every model, so a
+GPU-only bundle sent without a backend failed to load. When the model's own backend does not
+start, the engine falls back to the next one the model lists, CPU for most, and never to one it
+does not list, and the server logs why; when none starts, the error gives each one's reason. A
+backend the user set is used as set, failing as before.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

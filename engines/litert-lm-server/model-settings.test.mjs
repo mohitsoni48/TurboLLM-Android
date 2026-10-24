@@ -908,3 +908,67 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+Object.assign(kinds, {
+  'plain-backend': [decoder],
+  'gpu-first': [tflite('tf_lite_prefill_decode', 'gpu,cpu')],
+  'gpu-only': [tflite('tf_lite_prefill_decode', 'gpu')],
+  'npu-first': [tflite('tf_lite_prefill_decode', 'npu,cpu')],
+  // An Artisan text decoder without a constraint: GPU first, as `litert-lm serve` picks it.
+  'artisan-backend': [tflite('tf_lite_artisan_text_decoder')],
+  // The stand-in cannot create an engine on gpu for these (gpu-broken), or on any backend (no-engine).
+  'gpu-broken': [decoderWith(32000, 'tf_lite_prefill_decode', 'gpu,cpu')],
+  'gpu-broken-only': [tflite('tf_lite_prefill_decode', 'gpu_artisan')],
+  'no-engine': [tflite('tf_lite_prefill_decode', 'gpu,cpu')],
+  // With an 8192-token context, which LiteRT-LM gives in full on CPU and no more than 4096 of on GPU.
+  'gpu-first-ctx8192': [tflite('tf_lite_prefill_decode', 'gpu,cpu'), contextMetadata(8192)],
+  'gpu-broken-ctx8192': [tflite('tf_lite_prefill_decode', 'gpu,cpu'), contextMetadata(8192)],
+})
+
+test('with no backend set, the model\'s own is used, and one that does not start falls back to the next it lists, logged', { skip, timeout: 60_000 }, async () => {
+  const engines = async (ref) => {
+    let reply
+    const log = await callsDuring(async () => { reply = await chat(fake, { model: ref, messages: hello }) })
+    return { status: reply.status, error: reply.error, created: log.filter((c) => c.call === 'engine_create').map((c) => c.backend) }
+  }
+  assert.deepEqual(await engines(readable('plain-backend')), { status: 200, error: undefined, created: ['cpu'] })
+  assert.deepEqual(await engines(readable('gpu-first')), { status: 200, error: undefined, created: ['gpu'] })
+  assert.deepEqual(await engines(readable('gpu-only')), { status: 200, error: undefined, created: ['gpu'] })
+  assert.deepEqual(await engines(readable('npu-first')), { status: 200, error: undefined, created: ['npu'] })
+  assert.deepEqual(await engines(readable('artisan-backend')), { status: 200, error: undefined, created: ['gpu'] })
+  assert.deepEqual(await engines(unreadable('unreadable-backend')), { status: 200, error: undefined, created: ['cpu'] })
+  // The model's own backend does not start: the next it lists, once; the next request keeps that engine.
+  assert.deepEqual(await engines(readable('gpu-broken')), { status: 200, error: undefined, created: ['gpu', 'cpu'] })
+  assert.deepEqual(await engines(readable('gpu-broken')), { status: 200, error: undefined, created: [] })
+  // Only to one it lists: a GPU-only bundle is not tried on CPU, and the error is the GPU's.
+  const path = (name) => join(work, `${name}.litertlm`)
+  assert.deepEqual(await engines(readable('gpu-broken-only')), { status: 500, created: ['gpu'],
+    error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${path('gpu-broken-only')}: UNAVAILABLE: no usable OpenCL device')` })
+  // When none starts, each one's reason.
+  assert.deepEqual(await engines(readable('no-engine')), { status: 500, created: ['gpu', 'cpu'],
+    error: `Failed to load engine: RuntimeError('on gpu: Failed to create LiteRT-LM engine for ${path('no-engine')}: INTERNAL: cannot load the model on gpu; ` +
+      `on cpu: Failed to create LiteRT-LM engine for ${path('no-engine')}: INTERNAL: cannot load the model on cpu')` })
+  // A backend the request or the config sets is used as set, and not replaced when it fails.
+  assert.deepEqual(await engines(`${readable('gpu-first')},cpu`), { status: 200, error: undefined, created: ['cpu'] })
+  const failed = await engines(`${readable('gpu-broken')},gpu`)
+  assert.deepEqual(failed, { status: 500, error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${path('gpu-broken')}: UNAVAILABLE: no usable OpenCL device')`, created: ['gpu'] })
+  const lines = await logged(fake)
+  assert.ok(lines.includes("Using gpu-first.litertlm's own backend: gpu"), fake.stderr)
+  assert.ok(lines.includes("gpu-broken.litertlm's own backend, gpu, did not start (Failed to create LiteRT-LM engine for " +
+    `${path('gpu-broken')}: UNAVAILABLE: no usable OpenCL device); falling back to cpu`), fake.stderr)
+  // The sampler follows the backend the engine runs on: CPU's no-limit top_k, not the GPU's (the vocabulary).
+  assert.equal((await samplerFor(fake, { model: readable('gpu-broken'), messages: hello, top_k: 0 })).top_k, NO_LIMIT)
+  // So does the context window with no size asked: the CPU's 8192 for a model that fell back to it, not the GPU's 4096.
+  const windowOf = async (ref) => {
+    const reply = await chat(fake, { model: ref, messages: hello })
+    assert.equal(reply.status, 200, reply.error)
+    return reply.headers.get('x-context-window')
+  }
+  assert.equal(await windowOf(readable('gpu-broken-ctx8192')), '8192')
+  assert.equal(await windowOf(readable('gpu-first-ctx8192')), '4096')
+  // A model that gets a new engine for each conversation (an LFM2 one) tries its own backend once, not every time.
+  const recurrent = litertlmFile(join(work, 'gpu-broken-lfm2.litertlm'), [tflite('tf_lite_prefill_decode', 'gpu,cpu'), llmMetadata(LFM2)])
+  assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['gpu', 'cpu'] })
+  assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
+  assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
+})

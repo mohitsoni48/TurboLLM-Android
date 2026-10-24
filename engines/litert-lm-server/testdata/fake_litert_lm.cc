@@ -11,6 +11,8 @@
 //   no-llg           has no LLGuidance constraint provider (constraint_provider_factory.cc:43-56)
 //   broken           cannot create any conversation
 //   anything else    takes both (a Gemma model whose vocabulary the FST library supports)
+// and, whatever the file's header says: an engine for gpu-broken cannot be created on gpu, as on a phone whose GPU
+// path fails, and one for no-engine on no backend at all.
 // Each conversation created is logged with what its config asked for: {"call": "conversation_create", "model": ...,
 // "config": {"sampler": {...}, ...}}.
 // A conversation answers with one chunk of text that says how it was created and sent, for example
@@ -34,7 +36,7 @@
 #include "nlohmann/json.hpp"
 
 struct LiteRtLmEngineSettings {
-  std::string model;
+  std::string model, backend;
 };
 struct LiteRtLmEngine {
   std::string model;
@@ -103,14 +105,22 @@ LiteRtLmEngineSettings* litert_lm_engine_settings_create(const char* model_path,
   auto name = [](const char* b) { return b ? nlohmann::json(b) : nlohmann::json(nullptr); };
   Record({{"call", "engine_settings_create"}, {"model", Basename(model_path)}, {"backend", name(backend)},
           {"vision_backend", name(vision_backend)}, {"audio_backend", name(audio_backend)}});
-  return new LiteRtLmEngineSettings{Basename(model_path)};
+  return new LiteRtLmEngineSettings{Basename(model_path), backend ? backend : ""};
 }
 void litert_lm_engine_settings_set_max_num_tokens(LiteRtLmEngineSettings* s, int n) {
   Record({{"call", "engine_settings_set_max_num_tokens"}, {"model", s->model}, {"max_num_tokens", n}});
 }
 void litert_lm_engine_settings_delete(LiteRtLmEngineSettings* s) { delete s; }
 LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* s) {
-  Record({{"call", "engine_create"}, {"model", s->model}});
+  Record({{"call", "engine_create"}, {"model", s->model}, {"backend", s->backend}});
+  if (Is(s->model, "gpu-broken") && s->backend == "gpu") {
+    g_error = "UNAVAILABLE: no usable OpenCL device";
+    return nullptr;
+  }
+  if (Is(s->model, "no-engine")) {
+    g_error = "INTERNAL: cannot load the model on " + s->backend;
+    return nullptr;
+  }
   return new LiteRtLmEngine{s->model};
 }
 void litert_lm_engine_delete(LiteRtLmEngine* e) { delete e; }
