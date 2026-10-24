@@ -1827,6 +1827,25 @@ void HandleChatCompletions(int fd, const Request& req) {
       max_tokens = body[k].get<int>();
     }
 
+    // What LiteRT-LM's conversation API cannot give, said rather than dropped: it returns one reply per message, with no
+    // token log-probabilities (those exist only on its lower-level session API), so n above 1 got one choice and
+    // logprobs none, both with a 200.
+    {
+      auto has = [&](const char* k) { return body.contains(k) && !body[k].is_null(); };
+      std::string why;
+      if (has("n") && !(body["n"].is_number_integer() && body["n"].get<long long>() == 1)) {
+        why = "n " + body["n"].dump() + ": this server gives one choice per request";
+      } else if (has("logprobs") && !(body["logprobs"].is_boolean() && !body["logprobs"].get<bool>())) {
+        why = "logprobs " + body["logprobs"].dump() + ": LiteRT-LM gives no token log-probabilities";
+      } else if (has("top_logprobs") && !(body["top_logprobs"].is_number_integer() && body["top_logprobs"].get<long long>() == 0)) {
+        why = "top_logprobs " + body["top_logprobs"].dump() + ": LiteRT-LM gives no token log-probabilities";
+      }
+      if (!why.empty()) {
+        SendError(fd, req, 400, "Unsupported parameter: " + why);
+        return;
+      }
+    }
+
     // openai_chat_completions.parse_sampler_config. A value the runtime cannot take is the request's mistake, a 400 that
     // names the field: it was a 500 with the runtime's words ("INVALID_ARGUMENT: p must be in [0, 1].", "Temperature
     // must be >= 0"), and a top_k or seed with a fraction was cut to an integer. top_k 0 or below is no top-k limit,

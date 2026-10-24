@@ -1045,3 +1045,19 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+test('n above 1, logprobs and top_logprobs, which LiteRT-LM cannot give, are 400s that name the field', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  for (const ok of [{ n: 1 }, { n: null }, { logprobs: false }, { top_logprobs: 0 }, { logprobs: null }]) {
+    assert.equal((await chat(fake, { model, messages: hello, ...ok })).status, 200, JSON.stringify(ok))
+  }
+  for (const [request, error] of [
+    [{ n: 2 }, 'Unsupported parameter: n 2: this server gives one choice per request'],
+    [{ n: 0 }, 'Unsupported parameter: n 0: this server gives one choice per request'],
+    [{ logprobs: true }, 'Unsupported parameter: logprobs true: LiteRT-LM gives no token log-probabilities'],
+    [{ logprobs: true, top_logprobs: 3 }, 'Unsupported parameter: logprobs true: LiteRT-LM gives no token log-probabilities'],
+    [{ top_logprobs: 3 }, 'Unsupported parameter: top_logprobs 3: LiteRT-LM gives no token log-probabilities'],
+  ]) {
+    assert.deepEqual(await chat(fake, { model, messages: hello, ...request }), { status: 400, error }, JSON.stringify(request))
+  }
+})
