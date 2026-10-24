@@ -1814,13 +1814,17 @@ void HandleChatCompletions(int fd, const Request& req) {
     // conversation.normalize_message: a bare string is a user turn.
     if (prompt.is_string()) prompt = {{"role", "user"}, {"content", prompt}};
 
+    // max_completion_tokens, or max_tokens, OpenAI's older name for it, which the server did not read: a client that
+    // sent max_tokens 5 got the whole reply. Below 1 is a 400, as OpenAI answers it: the runtime generated one token
+    // for 0 or -5 and the server called that "length".
     std::optional<int> max_tokens;
-    if (body.contains("max_completion_tokens") && !body["max_completion_tokens"].is_null()) {
-      if (!body["max_completion_tokens"].is_number_integer()) {
-        SendError(fd, req, 400, "max_completion_tokens must be an integer");
+    for (const char* k : {"max_completion_tokens", "max_tokens"}) {
+      if (max_tokens || !body.contains(k) || body[k].is_null()) continue;
+      if (!body[k].is_number_integer() || body[k].get<long long>() < 1 || body[k].get<long long>() > INT32_MAX) {
+        SendError(fd, req, 400, std::string(k) + " must be an integer of at least 1, got " + body[k].dump());
         return;
       }
-      max_tokens = body["max_completion_tokens"].get<int>();
+      max_tokens = body[k].get<int>();
     }
 
     // openai_chat_completions.parse_sampler_config. A value the runtime cannot take is the request's mistake, a 400 that

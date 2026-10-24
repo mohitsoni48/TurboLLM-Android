@@ -1004,3 +1004,44 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+test('max_completion_tokens or max_tokens caps the reply, and below 1 is a 400', { skip, timeout: 60_000 }, async () => {
+  const cap = async (request) => {
+    const log = await callsDuring(async () => {
+      const reply = await chat(fake, { model: readable('plain'), messages: hello, ...request })
+      assert.equal(reply.status, 200, reply.error)
+    })
+    return log.filter((c) => c.call === 'send_message').at(-1).args.max_output_tokens ?? null
+  }
+  assert.equal(await cap({}), null)
+  assert.equal(await cap({ max_completion_tokens: 7 }), 7)
+  assert.equal(await cap({ max_tokens: 5 }), 5)
+  assert.equal(await cap({ max_completion_tokens: 7, max_tokens: 5 }), 7)
+  assert.equal(await cap({ max_completion_tokens: null, max_tokens: 5 }), 5)
+  for (const [request, error] of [
+    [{ max_completion_tokens: 0 }, 'max_completion_tokens must be an integer of at least 1, got 0'],
+    [{ max_completion_tokens: -5 }, 'max_completion_tokens must be an integer of at least 1, got -5'],
+    [{ max_completion_tokens: 1.5 }, 'max_completion_tokens must be an integer of at least 1, got 1.5'],
+    [{ max_tokens: 0 }, 'max_tokens must be an integer of at least 1, got 0'],
+  ]) {
+    assert.deepEqual(await chat(fake, { model: readable('plain'), messages: hello, ...request }), { status: 400, error })
+  }
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model's reply is capped by max_tokens, and max_completion_tokens 0 is a 400: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = (extra) => chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Write two sentences about the sea.' }], temperature: 0, reasoning_effort: 'none', ...extra }, 300_000)
+      const capped = await ask({ max_tokens: 5 })
+      assert.equal(capped.status, 200, capped.error)
+      assert.ok(capped.usage.completion_tokens <= 5, `${capped.usage.completion_tokens} tokens`)
+      assert.equal(capped.finish, 'length')
+      assert.equal((await ask({ max_completion_tokens: 0 })).status, 400)
+    } finally {
+      stopServer(server)
+    }
+  })
+}
