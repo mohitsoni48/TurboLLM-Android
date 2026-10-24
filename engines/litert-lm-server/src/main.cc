@@ -1725,6 +1725,27 @@ void HandleChatCompletions(int fd, const Request& req) {
         if (t.is_object() && t.value("type", "") == "function") tools.push_back(t);
       }
     }
+    // tool_choice was ignored, so "none", which the daemon sends to make a model answer in text (its gateway after a
+    // repeated call, and its chat's retry after an empty answer), still offered the model the tools and got tool calls
+    // back. "none" now leaves the tools out of the conversation; the history keeps its earlier calls and results.
+    // "auto", or none at all, is what it was. LiteRT-LM 0.18.0's C API has no way to make a model call a tool (its
+    // constrained decoding keeps a call well formed, and Gemma's "function call only" mode is set by the model file,
+    // not per conversation), so "required" or a named function is a 400 that says so rather than a reply that may
+    // not call it.
+    if (body.contains("tool_choice") && !body["tool_choice"].is_null()) {
+      const json& choice = body["tool_choice"];
+      const std::string mode = choice.is_string() ? choice.get<std::string>() : "";
+      if (mode == "none") {
+        tools = json::array();
+      } else if (mode == "required" || choice.is_object()) {
+        SendError(fd, req, 400, "Invalid tool_choice: this server cannot make the model call a tool (" + choice.dump() +
+                                    "); LiteRT-LM can only offer it the tools, as tool_choice \"auto\" does");
+        return;
+      } else if (mode != "auto") {
+        SendError(fd, req, 400, "Invalid tool_choice: " + choice.dump() + " (none, auto, required or a function)");
+        return;
+      }
+    }
 
     // Absent or null is false for both, as the Python server's body.get() reads them, and as clients that write every
     // optional field send them. json's value() threw type_error on a null, and the catch below made that a 500. Any

@@ -430,6 +430,12 @@ tokens only. A repetition penalty below 1, which LiteRT-LM would clamp to 1 with
 above 0 says so in its `X-Unapplied-Parameters: min_p` header: a 400 would fail every chat whose
 saved settings have a Min P, chats that worked when it was dropped unread.
 
+**`tool_choice` "none" leaves the tools out of the conversation** (earlier calls and results
+stay in the history), and "auto" or none at all keeps them. LiteRT-LM 0.18.0's C API cannot make
+a model call a tool (constrained decoding keeps a call well formed; Gemma's "function call only"
+mode comes from the model file), so `tool_choice` "required" or a named function is a 400 that
+says so.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

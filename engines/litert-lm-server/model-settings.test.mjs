@@ -735,3 +735,63 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+const weatherTool = [{
+  type: 'function',
+  function: { name: 'get_weather', description: 'Weather in a city', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } },
+}]
+
+test('tool_choice "none" leaves the tools out, "auto" keeps them, and one LiteRT-LM cannot force is a 400', { skip, timeout: 60_000 }, async () => {
+  // The stand-in's reply says whether the conversation was given tools ("tools=1") and constrained ("constrained=1").
+  const created = async (request) => {
+    const reply = await chat(fake, { model: readable('gemma-tools'), messages: hello, tools: weatherTool, ...request })
+    assert.equal(reply.status, 200, reply.error)
+    return Object.fromEntries(reply.content.split(' ').map((kv) => kv.split('=')).filter(([k]) => k === 'tools' || k === 'constrained').map(([k, v]) => [k, Number(v)]))
+  }
+  assert.deepEqual(await created({}), { constrained: 1, tools: 1 })
+  assert.deepEqual(await created({ tool_choice: 'auto' }), { constrained: 1, tools: 1 })
+  assert.deepEqual(await created({ tool_choice: null }), { constrained: 1, tools: 1 })
+  assert.deepEqual(await created({ tool_choice: 'none' }), { constrained: 0, tools: 0 })
+  // With the earlier calls and results still in the history.
+  const history = [
+    { role: 'user', content: 'Weather in Paris?' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'Sunny, 21 C' },
+  ]
+  assert.deepEqual(await created({ tool_choice: 'none', messages: history }), { constrained: 0, tools: 0 })
+  for (const [tool_choice, said] of [['required', '"required"'], [{ type: 'function', function: { name: 'get_weather' } }, '{"function":{"name":"get_weather"},"type":"function"}']]) {
+    const reply = await chat(fake, { model: readable('gemma-tools'), messages: hello, tools: weatherTool, tool_choice })
+    assert.deepEqual(reply, { status: 400, error: `Invalid tool_choice: this server cannot make the model call a tool (${said}); LiteRT-LM can only offer it the tools, as tool_choice "auto" does` })
+  }
+  const odd = await chat(fake, { model: readable('gemma-tools'), messages: hello, tools: weatherTool, tool_choice: 'sometimes' })
+  assert.deepEqual(odd, { status: 400, error: 'Invalid tool_choice: "sometimes" (none, auto, required or a function)' })
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model calls no tool with tool_choice "none", with or without earlier calls: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = (messages, extra) => chat(server, { model: `${path},cpu`, messages, tools: weatherTool, max_completion_tokens: 96, temperature: 0, reasoning_effort: 'none', ...extra }, 300_000)
+      const question = [{ role: 'user', content: 'What is the weather in Paris?' }]
+      const history = [
+        ...question,
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'Sunny, 21 C' },
+        { role: 'user', content: 'And in Rome?' },
+      ]
+      // A template that cannot render tool turns at all (gemma-3-270m-it's: "Conversation roles must alternate")
+      // cannot render them with tool_choice "none" either; that is not this test's business.
+      const rendersHistory = !/Failed to apply template/.test((await ask(history, {})).error ?? '')
+      for (const messages of rendersHistory ? [question, history] : [question]) {
+        const reply = await ask(messages, { tool_choice: 'none' })
+        assert.equal(reply.status, 200, reply.error)
+        assert.equal(reply.tool_calls, undefined, `called ${JSON.stringify(reply.tool_calls)}`)
+        assert.ok(reply.content, 'no answer')
+      }
+    } finally {
+      stopServer(server)
+    }
+  })
+}
