@@ -972,3 +972,35 @@ test('with no backend set, the model\'s own is used, and one that does not start
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
 })
+
+test('a developer message is a system message', { skip, timeout: 60_000 }, async () => {
+  let log = await callsDuring(async () => {
+    const reply = await chat(fake, { model: readable('plain'), messages: [{ role: 'developer', content: 'Answer in one word.' }, ...hello] })
+    assert.equal(reply.status, 200, reply.error)
+  })
+  assert.deepEqual(log.filter((c) => c.call === 'conversation_create').at(-1).config.messages, [{ role: 'system', content: 'Answer in one word.' }])
+  log = await callsDuring(async () => {
+    const reply = await chat(fake, { model: readable('plain'), messages: [{ role: 'developer', content: [{ type: 'text', text: 'Be brief.' }] }] })
+    assert.equal(reply.status, 200, reply.error)
+  })
+  assert.deepEqual(log.filter((c) => c.call === 'send_message').at(-1).message, { role: 'system', content: [{ type: 'text', text: 'Be brief.' }] })
+  assert.equal((await logged(fake)).filter((l) => l === 'the developer role is read as system, its older name').length, 1)
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model follows a developer message as it follows a system one: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = async (role) => {
+        const reply = await chat(server, { model: `${path},cpu`, messages: [{ role, content: 'Answer in one word.' }, { role: 'user', content: 'What is the capital of France?' }], max_completion_tokens: 24, temperature: 0, reasoning_effort: 'none' }, 300_000)
+        assert.equal(reply.status, 200, reply.error)
+        return { content: reply.content, prompt: reply.usage.prompt_tokens }
+      }
+      assert.deepEqual(await ask('developer'), await ask('system'))
+    } finally {
+      stopServer(server)
+    }
+  })
+}

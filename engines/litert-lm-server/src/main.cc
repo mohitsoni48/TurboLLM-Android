@@ -34,6 +34,7 @@
 //   - A new engine for each conversation of a model whose decoder keeps a recurrent state (LFM2), which the runtime
 //     would otherwise carry from one conversation into the next (see GetOrCreateEngine).
 //   - An image or audio part sent to a model that takes no such input is a 400 that says so, not the runtime's 500.
+//   - The developer role, OpenAI's newer name for system, is read as system.
 //
 // Not translated: /v1/responses, /v1/embeddings and the Gemini API (TurboLLM uses none of them
 // with this engine), and image URLs other than base64 data: URLs (remote URLs, and local paths, which the Python
@@ -1049,6 +1050,16 @@ json TranslateMessage(const json& msg, const std::map<std::string, std::string>&
   if (!msg.is_object()) throw HttpError(400, "Invalid messages: Message must be an object");
   std::string role = msg.value("role", "");
   json content = msg.contains("content") ? msg["content"] : json();
+  // OpenAI's newer name for the system role. Model templates know only "system", so a developer message was rendered
+  // as an unknown role (LFM2.5-230M showed the word in its prompt) and its instructions were not followed: with
+  // developer "Answer in one word." it answered "The capital of France is Paris." where the system role gets "Paris".
+  if (role == "developer") {
+    static std::once_flag told;
+    std::call_once(told, [] { Log("the developer role is read as system, its older name"); });
+    json out = msg;
+    out["role"] = "system";
+    return TranslateMessage(out, names);
+  }
 
   if (role == "tool") {
     std::string id = msg.value("tool_call_id", "");

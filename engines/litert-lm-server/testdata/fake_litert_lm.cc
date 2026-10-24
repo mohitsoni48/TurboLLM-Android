@@ -151,6 +151,9 @@ void litert_lm_thinking_config_set_thinking_token_budget(LiteRtLmThinkingConfig*
 void litert_lm_conversation_config_set_thinking_config(LiteRtLmConversationConfig* c, const LiteRtLmThinkingConfig* t) {
   c->config["thinking"] = t->j;
 }
+void litert_lm_conversation_config_set_messages(LiteRtLmConversationConfig* c, const char* messages_json) {
+  c->config["messages"] = nlohmann::json::parse(messages_json ? messages_json : "null", nullptr, false);
+}
 void litert_lm_conversation_config_set_extra_context(LiteRtLmConversationConfig* c, const char* extra_context_json) {
   c->config["extra_context"] = nlohmann::json::parse(extra_context_json ? extra_context_json : "null", nullptr, false);
 }
