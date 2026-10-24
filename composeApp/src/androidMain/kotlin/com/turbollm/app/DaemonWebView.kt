@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
@@ -78,35 +79,45 @@ private val HANDED_OFF_SCHEMES = setOf("mailto", "xmpp", "irc", "ircs", "tel")
  *  exported activities that never declared it: ones their apps open to other apps' code, not to any link on a page. */
 private fun linkIntent(url: Uri) = Intent(Intent.ACTION_VIEW, url).addCategory(Intent.CATEGORY_BROWSABLE)
 
-/** Confirmed live (2026-09-03) via Chrome DevTools attached over the WebView's own devtools
- *  socket: this WebView (Android System WebView, Chromium 145 on this emulator) resolves ANY
- *  raw `vh`-family CSS length (`vh`/`dvh`/`svh`/`lvh`) to a literal 0px — not just on
- *  html/body/#root (the first occurrence found, fixed below by setting an explicit pixel
- *  height from `window.innerHeight`), but on ANY element anywhere in the app that uses one,
- *  including ones that only exist inside dynamically-rendered content (confirmed on a second,
- *  unrelated occurrence: the Models → Discover results list, `max-h-[45vh]`, which only
- *  renders after an async fetch completes — so a page-load-time-only fix can't reach it. DOM
- *  and CSS both load correctly (zero console errors, real data in `innerText`) but the
- *  affected subtree paints zero pixels regardless.
+/** The page is laid out at the WebView's own height because the factory gives the WebView MATCH_PARENT layout
+ *  params (TurboLLMWebView). It had none, so AndroidView's holder added it with ViewGroup's default, WRAP_CONTENT, and
+ *  Chromium lays out the page of a WebView whose layout params are WRAP_CONTENT high at height 0 (android_webview's
+ *  AwLayoutSizer turns Blink's forceZeroLayoutHeight on for it), while the view itself was measured full size and
+ *  window.innerHeight was right. Every vh, dvh, svh, lvh and vmin length, and every percentage height resolved against
+ *  the viewport (html, body and #root at 100%), was 0px. That is the "0px vh" first seen live over DevTools on
+ *  2026-09-03 and put down to the System WebView. It was worked around one class shape at a time (html/body/#root, the
+ *  Discover list's `max-h-[45vh]`, QA_BUGS.md BUG-05's `min-h-dvh`) until the model picker's
+ *  `max-h-[min(60vh,…)]` (TurboLLM #270), a shape the workaround did not cover, opened as an empty 280x10 strip.
  *
- *  Fixed generally: htmlFix pins html/body/#root's own height in pixels (unchanged from the
- *  original fix). vhClassFix separately scans element classNames for Tailwind's arbitrary-value
- *  bracket syntax (`h-[45vh]`, `max-h-[100dvh]`, `min-h-[50svh]`, …) — which is a literal
- *  substring of the class attribute, not something requiring stylesheet introspection — and
- *  overrides the corresponding CSS property with an `!important` inline pixel value computed
- *  from `window.innerHeight`. A MutationObserver re-runs it on every newly-added subtree so
- *  content rendered after page load (any async-fetched list, not just Discover) is covered
- *  too, not just what exists at `onPageFinished` time.
- *
- *  QA_BUGS.md BUG-05 (2026-09-04): the same bug also breaks Tailwind's NAMED vh-family
- *  utilities (`min-h-dvh`, `h-screen`, …), not just the bracket arbitrary-value form above —
- *  `.app-shell`'s `min-h-dvh` (Shell.tsx, document-scroll mode) collapsing to 0 left the
- *  bottom tab bar rendering right after short content instead of pinned to the real bottom of
- *  the screen. fixNamedVhClasses covers this with one small stylesheet (updated on resize)
- *  instead of per-element scanning — a CSS class selector already applies to elements added
- *  after it exists, so no MutationObserver entry is needed for this half of the fix. */
+ *  HEIGHT_FIX_JS stays as a fallback for a WebView that still lays the page out at height 0, which no device check has
+ *  ruled out yet. It measures a `height:100vh` element once per page (at the first resize that gives the window a
+ *  height, on a page that finished loading before it had one) and does nothing unless that is under 1px while
+ *  window.innerHeight is not. Then: htmlFix pins html, body and #root to window.innerHeight; every `h-[…]`,
+ *  `min-h-[…]` and `max-h-[…]` class (Tailwind's `!` included) whose value has a viewport unit, alone or anywhere
+ *  inside min()/max()/calc()/clamp(), gets that value as an `!important` inline style of the same property, each such
+ *  unit computed in px and every other term (var() ones included) left as it is, on elements added or given the class
+ *  later too (a MutationObserver). The value is the one in the class's rule, as Tailwind wrote it (it spaces out a
+ *  calc()'s operators: `h-[calc(100vh-2rem)]` is `calc(100vh - 2rem)`), or the class name's, `_` read as a space,
+ *  when no rule is found. Tailwind's named utilities (`h-dvh`, `min-h-screen`, …) get one stylesheet. All of it
+ *  follows resize. It answers whether it did this, and onPageFinished logs a warning when it did, so logcat shows a
+ *  WebView still laying pages out at height 0. scripts/webview-height-fix.test.mjs runs this string in Chromium under
+ *  both kinds of host. */
 private const val HEIGHT_FIX_JS = """
 (function() {
+  // onPageFinished can come more than once for the same page: the first run decided (or waits to), and its listeners
+  // are in place.
+  if (window.__turbollmHeightFix !== undefined) return null;
+
+  // Only a WebView that lays the page out at height 0 measures 100vh as nothing while the window has a height.
+  function zeroVh() {
+    var probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;top:0;left:0;width:0;height:100vh;visibility:hidden';
+    document.documentElement.appendChild(probe);
+    var zero = probe.getBoundingClientRect().height < 1;
+    document.documentElement.removeChild(probe);
+    return zero;
+  }
+
   function htmlFix() {
     var px = window.innerHeight + 'px';
     document.documentElement.style.height = px;
@@ -115,37 +126,89 @@ private const val HEIGHT_FIX_JS = """
     if (root) root.style.height = px;
   }
 
-  var VH_CLASS_RE = /^(min-h|max-h|h)-\[(\d+(?:\.\d+)?)(?:d|s|l)?vh\]${'$'}/;
+  // Tailwind's arbitrary-value height classes, whatever the value, with or without its `!` (important) before or after:
+  // `max-h-[60vh]`, `h-[calc(100vh-2rem)]`, `h-[50vh]!`, the model picker's
+  // `max-h-[min(60vh,var(--radix-dropdown-menu-content-available-height))]`.
+  var VH_CLASS_RE = /^!?(min-h|max-h|h)-\[(.+)\]!?${'$'}/;
   var PROP_BY_PREFIX = { 'h': 'height', 'min-h': 'min-height', 'max-h': 'max-height' };
+  // A number with a unit that is 0px or wrong here (vh and vb, which are 0, vmin, 0 as well, and vmax, the width: each
+  // also d/s/l-prefixed), as a term of its own: after the start, a space, a comma, a bracket or an operator, so the
+  // digits inside a custom property's name (var(--a-10vh)) are not one.
+  var VP_UNIT_RE = /(^|[\s,(*\/+])(-?(?:\d+\.?\d*|\.\d+))(?:d|s|l)?(vh|vb|vmin|vmax)(?![\w-])/g;
+
+  // The value of [prop] in the rule for class [cls], as Tailwind wrote it, or '' when there is none. Tailwind does not
+  // only read '_' as a space: it spaces out a calc()'s operators too (`h-[calc(100vh-2rem)]` is `calc(100vh - 2rem)`),
+  // so the class name alone is not always the CSS. Rules at the top level and in @layer blocks, where Tailwind puts its
+  // utilities, are collected again when a stylesheet comes or goes (a screen's own CSS loaded later).
+  var rules = null, ruleSheets = -1;
+  function declared(cls, prop) {
+    var sheets = document.styleSheets;
+    if (ruleSheets !== sheets.length) {
+      rules = {};
+      ruleSheets = sheets.length;
+      var collect = function(list) {
+        for (var i = 0; i < list.length; i++) {
+          var rule = list[i];
+          if (rule.selectorText !== undefined) rules[rule.selectorText] = rule.style;
+          else if (window.CSSLayerBlockRule && rule instanceof CSSLayerBlockRule) collect(rule.cssRules);
+        }
+      };
+      for (var s = 0; s < sheets.length; s++) {
+        try { collect(sheets[s].cssRules); } catch (e) {} // another origin's stylesheet cannot be read
+      }
+    }
+    var style = rules['.' + CSS.escape(cls)];
+    return style ? style.getPropertyValue(prop) : '';
+  }
+
+  // A value as a class name spells it, for a class no rule was found for: '_' is a space, '\_' an underscore, and a
+  // custom property's name keeps its underscores.
+  function decoded(raw) {
+    return raw.replace(/\\_|--[\w-]+|_/g, function(t) { return t === '_' ? ' ' : t === '\\_' ? '_' : t; });
+  }
+
+  // [value] with each viewport-unit term in px, or null when it has none.
+  function pxValue(value) {
+    var h = window.innerHeight, w = window.innerWidth;
+    var px = value.replace(VP_UNIT_RE, function(term, before, n, unit) {
+      var base = unit === 'vmin' ? Math.min(w, h) : unit === 'vmax' ? Math.max(w, h) : h;
+      return before + (parseFloat(n) / 100 * base) + 'px';
+    });
+    return px === value ? null : px;
+  }
 
   function fixVhElement(el) {
     if (!el.classList) return;
+    var next = {}, any = false;
     for (var i = 0; i < el.classList.length; i++) {
-      var m = VH_CLASS_RE.exec(el.classList[i]);
+      var cls = el.classList[i], m = VH_CLASS_RE.exec(cls);
       if (!m) continue;
       var prop = PROP_BY_PREFIX[m[1]];
-      var px = (parseFloat(m[2]) / 100 * window.innerHeight) + 'px';
-      el.style.setProperty(prop, px, 'important');
+      var px = pxValue(declared(cls, prop) || decoded(m[2]));
+      if (px) { next[prop] = px; any = true; }
     }
+    var prev = el.__turbollmVh;
+    if (!prev && !any) return;
+    // What was set for a class the element no longer has goes too, so the class's height leaves with it.
+    for (var p in prev) if (!(p in next)) el.style.removeProperty(p);
+    for (var q in next) el.style.setProperty(q, next[q], 'important');
+    el.__turbollmVh = any ? next : undefined;
   }
 
   function fixVhSubtree(node) {
     if (node.nodeType !== 1) return;
     fixVhElement(node);
-    var descendants = node.querySelectorAll ? node.querySelectorAll('[class*="vh]"]') : [];
+    var descendants = node.querySelectorAll ? node.querySelectorAll('[class*="h-["]') : [];
     for (var i = 0; i < descendants.length; i++) fixVhElement(descendants[i]);
   }
 
-  // QA_BUGS.md BUG-05: the same 0px-vh bug also breaks Tailwind's NAMED viewport-height
-  // utilities (`min-h-dvh`, `h-dvh`, `h-screen`, ...) — not just the bracket arbitrary-value
-  // form vhClassFix (above) already covers. `.app-shell` uses `min-h-dvh` in document-scroll
-  // mode (Shell.tsx) to let MobileNav stick to the true viewport bottom; with min-height
-  // collapsing to 0 the shell only grew to its own (often short) content, so the tab bar
-  // rendered right after that content instead of pinned to the screen — reported as "the
-  // tab bar floats mid-screen with a dead white gap below it" on tabs with little content.
-  // A single stylesheet, updated on resize, covers every element with these classes at
-  // once — no MutationObserver needed here, unlike vhClassFix's inline-style scan, since
-  // CSS class selectors apply to future elements automatically.
+  // QA_BUGS.md BUG-05: Tailwind's NAMED viewport-height utilities (`min-h-dvh`, `h-dvh`, `h-screen`, ...) are 0px
+  // too. `.app-shell` uses `min-h-dvh` in document-scroll mode (Shell.tsx) to let MobileNav stick to the true viewport
+  // bottom; with min-height collapsing to 0 the shell only grew to its own (often short) content, so the tab bar
+  // rendered right after that content instead of pinned to the screen — reported as "the tab bar floats mid-screen
+  // with a dead white gap below it" on tabs with little content. A single stylesheet, updated on resize, covers every
+  // element with these classes at once — no MutationObserver needed here, unlike the class scan above, since CSS
+  // class selectors apply to future elements automatically.
   var namedVhStyleEl = null;
   function fixNamedVhClasses() {
     var px = window.innerHeight + 'px';
@@ -165,24 +228,52 @@ private const val HEIGHT_FIX_JS = """
     fixNamedVhClasses();
   }
 
-  fixAll();
-  window.addEventListener('resize', fixAll);
+  function activate() {
+    fixAll();
+    window.addEventListener('resize', fixAll);
 
-  var observer = new MutationObserver(function(mutations) {
-    for (var i = 0; i < mutations.length; i++) {
-      var added = mutations[i].addedNodes;
-      for (var j = 0; j < added.length; j++) fixVhSubtree(added[j]);
-    }
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+    // Content rendered after this (an async-fetched list, a Radix portal) and a class set on an existing element later.
+    var observer = new MutationObserver(function(mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i].type === 'attributes') { fixVhElement(mutations[i].target); continue; }
+        var added = mutations[i].addedNodes;
+        for (var j = 0; j < added.length; j++) fixVhSubtree(added[j]);
+      }
+    });
+    observer.observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['class'],
+    });
+  }
+
+  // A page that finished loading before the WebView was laid out has no height yet, so 100vh is 0 whatever the WebView:
+  // it decides at the first resize that gives the window one. onPageFinished has had its answer by then, so that
+  // warning goes to the page's console.
+  if (!(window.innerHeight > 0)) {
+    window.__turbollmHeightFix = null;
+    window.addEventListener('resize', function sized() {
+      if (!(window.innerHeight > 0)) return;
+      window.removeEventListener('resize', sized);
+      window.__turbollmHeightFix = zeroVh();
+      if (!window.__turbollmHeightFix) return;
+      activate();
+      console.warn("100vh is 0px in this WebView (the page is laid out at height 0); HEIGHT_FIX_JS pins the UI's " +
+        'viewport heights to window.innerHeight');
+    });
+    return null;
+  }
+  // One probe per page: on a WebView that lays the page out at its own height, that is all the script does.
+  window.__turbollmHeightFix = zeroVh();
+  if (!window.__turbollmHeightFix) return false;
+  activate();
+  return true;
 })();
 """
 
-/** Injects the native window insets as CSS custom properties so the web UI's
- *  `var(--tllm-safe-top)` / `var(--tllm-safe-bottom)` resolve to real pixel values.
- *  Android's System WebView resolves `env(safe-area-inset-*)` to 0px on many builds,
- *  so we read the insets natively and patch them in via JS (same pattern as HEIGHT_FIX_JS).
- *  Called after HEIGHT_FIX_JS so the CSS vars are ready before the web layout reads them.
+/** Sets the web UI's safe-area padding, the `--tllm-safe-top` / `--tllm-safe-bottom` CSS custom properties, on the
+ *  page's root element, where it wins over index.css (which, below 768px wide, defaults them to
+ *  `env(safe-area-inset-*, 24px)` for a page drawn under the system bars). onPageFinished passes 0: the WebView is
+ *  already inset away from every system bar and the display cutout natively (TurboLLMWebView), so the page must not
+ *  pad for them again, whatever env() reports inside it.
  *
  *  [topPx]/[bottomPx] are PHYSICAL pixels (that's what WindowInsets reports) — CSS `px`
  *  inside the WebView is device-independent and gets multiplied by devicePixelRatio at
@@ -387,6 +478,16 @@ private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
             // not enough. Flagging the view as important for accessibility helps the
             // platform expose at least the WebView container itself to TalkBack.
             WebView(context).apply {
+                // MATCH_PARENT both ways, set before AndroidView adds the WebView (it does so right after this
+                // factory returns, here and for the WebView built again after a renderer crash). With no layout params
+                // it got ViewGroup's default WRAP_CONTENT, and Chromium lays out the page of a WebView whose height is
+                // WRAP_CONTENT at height 0: every vh unit and viewport-relative height in the UI was 0px (see
+                // HEIGHT_FIX_JS). The view's own size does not change: AndroidView measures it EXACTLY at the size
+                // its modifier gives either way.
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 webViewClient = object : WebViewClient() {
@@ -468,7 +569,19 @@ private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
 
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
-                        view.evaluateJavascript(HEIGHT_FIX_JS, null)
+                        view.evaluateJavascript(HEIGHT_FIX_JS) { activated ->
+                            // "true" only from the page's first run, and only when it found 100vh at 0px: the WebView
+                            // still lays the page out at height 0 despite its MATCH_PARENT layout params. A page that
+                            // finished loading before the WebView had a height answers null, decides at its first
+                            // resize, and warns in its own console then.
+                            if (activated == "true") {
+                                Log.w(
+                                    TAG,
+                                    "100vh is 0px in this WebView (the page is laid out at height 0); HEIGHT_FIX_JS " +
+                                        "pins the UI's viewport heights to window.innerHeight",
+                                )
+                            }
+                        }
                         // The WebView is already inset away from every system bar (the modifier above), so the
                         // web UI's own safe-area padding (Shell.tsx --tllm-safe-top/bottom) must be zero —
                         // anything else would pad twice.

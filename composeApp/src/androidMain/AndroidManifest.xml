@@ -27,10 +27,12 @@
         android:theme="@style/Theme.TurboLLM"
         android:usesCleartextTraffic="true">
         <!-- adjustResize, not the default: the whole UI is a WebView whose composer is pinned to
-             the bottom of the viewport, so the window has to actually shrink when the soft
-             keyboard opens or the keyboard simply covers the text field. Resizing is enough on
-             its own here because HEIGHT_FIX_JS (DaemonWebView.kt) re-applies window.innerHeight
-             to the shell on every resize event, so the web layout follows the new height.
+             the bottom of the viewport, so the area the WebView gets has to shrink when the soft
+             keyboard opens or the keyboard simply covers the text field. The window itself is
+             edge-to-edge (MainActivity) and is not resized: adjustResize has Android report the
+             keyboard as an inset, DaemonWebView.kt pads the WebView by WindowInsets.safeDrawing,
+             keyboard included, and as the WebView lays its page out at its own height
+             (MATCH_PARENT), the web layout follows the new height.
              configChanges: rotating, folding, or switching dark mode must not recreate the activity. A recreation
              reloads the WebView, dropping a half-typed message and the open chat's stream. -->
         <activity
