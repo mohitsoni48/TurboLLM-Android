@@ -1419,6 +1419,53 @@ std::optional<Thinking> ParseThinking(const json& body, const ModelConfig& mc) {
   return Thinking{thinking, budget, "the config's thinking"};
 }
 
+// Repetition penalties, which LiteRT-LM 0.18.0 applies per message while it decodes (RepetitionPenaltyConfig, through
+// litert_lm_conversation_optional_args_set_repetition_penalty_config; tasks.cc), and which the server dropped:
+// presence_penalty and frequency_penalty (OpenAI's: subtracted from a token's logit once, or once per occurrence) and
+// repetition_penalty, or repeat_penalty, llama.cpp's name, which the daemon sends (HuggingFace's multiplicative
+// penalty, 1 = none). Its window: repeat_last_n when the request sets it, as llama.cpp reads it (0 turns the penalties
+// off, -1 is the whole reply); else llama.cpp's own default of the last 64 tokens for a request that names the penalty
+// repeat_penalty, llama.cpp's way; else the whole reply, as OpenAI's penalties and LiteRT-LM's default are. LiteRT-LM
+// counts the tokens of the reply only, not the prompt's (repetition_penalty_config.h). A repetition penalty below 1,
+// which in llama.cpp favours repeats, LiteRT-LM clamps to 1 without a word, so it is a 400. none: no penalty.
+struct Penalties {
+  float repetition = 1, presence = 0, frequency = 0;
+  int window = 0;
+};
+
+std::optional<Penalties> ParsePenalties(const json& body) {
+  auto has = [&](const char* k) { return body.contains(k) && !body[k].is_null(); };
+  auto number = [&](const char* k) {
+    if (!body[k].is_number() || !std::isfinite(body[k].get<double>())) {
+      throw HttpError(400, std::string("Invalid sampler parameters: ValueError: ") + k + " must be a number");
+    }
+    return body[k].get<float>();
+  };
+  Penalties p;
+  const char* rep = has("repetition_penalty") ? "repetition_penalty" : has("repeat_penalty") ? "repeat_penalty" : nullptr;
+  if (rep) {
+    p.repetition = number(rep);
+    if (p.repetition < 1) {
+      throw HttpError(400, std::string("Invalid sampler parameters: ") + rep + " " + body[rep].dump() +
+                               " is below 1, which LiteRT-LM does not take (1 is no penalty)");
+    }
+  }
+  if (has("presence_penalty")) p.presence = number("presence_penalty");
+  if (has("frequency_penalty")) p.frequency = number("frequency_penalty");
+  p.window = rep && std::string(rep) == "repeat_penalty" ? 64 : 0;
+  if (has("repeat_last_n")) {
+    if (!body["repeat_last_n"].is_number_integer() || body["repeat_last_n"].get<long long>() < -1 ||
+        body["repeat_last_n"].get<long long>() > INT32_MAX) {
+      throw HttpError(400, "Invalid sampler parameters: ValueError: repeat_last_n must be an integer of -1 or more");
+    }
+    const int n = body["repeat_last_n"].get<int>();
+    if (n == 0) return std::nullopt;
+    p.window = n > 0 ? n : 0;
+  }
+  if (p.repetition == 1 && p.presence == 0 && p.frequency == 0) return std::nullopt;
+  return p;
+}
+
 // The sampler a conversation is created with. A session's sampler parameters replace the model's own entirely: the
 // runtime uses LlmMetadata's only when the session's type is UNSPECIFIED (SessionConfig::MaybeUpdateAndValidate in
 // engine_settings.cc, LiteRT-LM 0.18.0). The server used to build one only when the request set any of temperature,
@@ -1654,6 +1701,22 @@ void HandleChatCompletions(int fd, const Request& req) {
       }
     }
     std::optional<Thinking> thinking = ParseThinking(body, mc);
+    std::optional<Penalties> penalties = ParsePenalties(body);
+    std::string note_headers;  // headers that tell the client what the server did with its request
+    // min_p, which LiteRT-LM has no sampler for, was dropped without a word. A 400 for it would fail every chat of a
+    // thread or model whose saved settings have a Min P, chats that worked, so it is still not applied, but the reply
+    // says so (X-Unapplied-Parameters), and the log once per model (below, under the engine lock).
+    bool min_p_unapplied = false;
+    if (body.contains("min_p") && !body["min_p"].is_null()) {
+      if (!body["min_p"].is_number() || !std::isfinite(body["min_p"].get<double>())) {
+        SendError(fd, req, 400, "Invalid sampler parameters: ValueError: min_p must be a number");
+        return;
+      }
+      if (body["min_p"].get<double>() > 0) {
+        note_headers += "X-Unapplied-Parameters: min_p\r\n";
+        min_p_unapplied = true;
+      }
+    }
     auto constraint = ParseResponseFormat(body);
 
     json tools = json::array();
@@ -1724,6 +1787,12 @@ void HandleChatCompletions(int fd, const Request& req) {
       if (info.capabilities_known && !Thinks(info)) throw ThinkingRefused(info, *thinking, ref.id);
     }
     LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc, needs);
+    // Under the engine lock, as every other once-per-model note: each connection has its own thread, and two requests
+    // with a Min P at once (a chat and its title) inserted into this set together, which can corrupt it.
+    if (min_p_unapplied) {
+      static std::set<std::string> told;
+      if (told.insert(ref.path).second) Log("min_p is not applied to " + ref.id + ": LiteRT-LM has no min-p sampling");
+    }
 
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
@@ -1770,7 +1839,6 @@ void HandleChatCompletions(int fd, const Request& req) {
     // stop thinking there by itself (a budget of 0 sets no constraint, tasks.cc), and nothing in such a file tells the
     // two apart, so a 400 for one would refuse the other. The server says so in its log once and, since a client sees
     // nothing of that log, in every such reply's X-Thinking header ("unverified").
-    std::string note_headers;  // headers that tell the client what the server did with its request
     if (thinking) {
       const ModelFileInfo& m = g_engine.info;
       const bool thinks = Thinks(m);
@@ -1850,6 +1918,15 @@ void HandleChatCompletions(int fd, const Request& req) {
     LiteRtLmConversationOptionalArgs* oa = L.litert_lm_conversation_optional_args_create();
     if (max_tokens) L.litert_lm_conversation_optional_args_set_max_output_tokens(oa, *max_tokens);
     if (constraint) L.litert_lm_conversation_optional_args_set_constraint(oa, constraint->first, constraint->second.c_str());
+    if (penalties) {
+      LiteRtLmRepetitionPenaltyConfig* rp = L.litert_lm_repetition_penalty_config_create();
+      L.litert_lm_repetition_penalty_config_set_repetition_penalty(rp, penalties->repetition);
+      L.litert_lm_repetition_penalty_config_set_presence_penalty(rp, penalties->presence);
+      L.litert_lm_repetition_penalty_config_set_frequency_penalty(rp, penalties->frequency);
+      L.litert_lm_repetition_penalty_config_set_window_size(rp, penalties->window);
+      L.litert_lm_conversation_optional_args_set_repetition_penalty_config(oa, rp);  // copied
+      L.litert_lm_repetition_penalty_config_delete(rp);
+    }
 
     long long created = 0;
     const std::string now_str = NowStr(&created);

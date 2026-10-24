@@ -42,6 +42,7 @@
   X(litert_lm_conversation_optional_args_delete) \
   X(litert_lm_conversation_optional_args_set_constraint) \
   X(litert_lm_conversation_optional_args_set_max_output_tokens) \
+  X(litert_lm_conversation_optional_args_set_repetition_penalty_config) \
   X(litert_lm_conversation_send_message_stream) \
   X(litert_lm_engine_create) \
   X(litert_lm_engine_delete) \
@@ -55,6 +56,12 @@
   X(litert_lm_engine_settings_set_num_threads) \
   X(litert_lm_engine_settings_set_use_ringbuffers_local_attention) \
   X(litert_lm_get_last_error_message) \
+  X(litert_lm_repetition_penalty_config_create) \
+  X(litert_lm_repetition_penalty_config_delete) \
+  X(litert_lm_repetition_penalty_config_set_frequency_penalty) \
+  X(litert_lm_repetition_penalty_config_set_presence_penalty) \
+  X(litert_lm_repetition_penalty_config_set_repetition_penalty) \
+  X(litert_lm_repetition_penalty_config_set_window_size) \
   X(litert_lm_sampler_params_create) \
   X(litert_lm_sampler_params_delete) \
   X(litert_lm_sampler_params_set_seed) \

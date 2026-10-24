@@ -57,6 +57,10 @@ struct LiteRtLmConversation {
 struct LiteRtLmConversationOptionalArgs {
   LiteRtLmConstraintType type = kLiteRtLmConstraintTypeNone;
   std::string pattern;
+  nlohmann::json j = nlohmann::json::object();  // the other arguments, as logged with the message
+};
+struct LiteRtLmRepetitionPenaltyConfig {
+  nlohmann::json j = {{"repetition_penalty", 1.0}, {"presence_penalty", 0.0}, {"frequency_penalty", 0.0}, {"window_size", 0}};
 };
 struct LiteRtLmStreamChunk {
   std::string text;
@@ -177,6 +181,27 @@ LiteRtLmConversationOptionalArgs* litert_lm_conversation_optional_args_create() 
   return new LiteRtLmConversationOptionalArgs;
 }
 void litert_lm_conversation_optional_args_delete(LiteRtLmConversationOptionalArgs* a) { delete a; }
+void litert_lm_conversation_optional_args_set_max_output_tokens(LiteRtLmConversationOptionalArgs* a, int n) {
+  a->j["max_output_tokens"] = n;
+}
+LiteRtLmRepetitionPenaltyConfig* litert_lm_repetition_penalty_config_create() { return new LiteRtLmRepetitionPenaltyConfig; }
+void litert_lm_repetition_penalty_config_delete(LiteRtLmRepetitionPenaltyConfig* c) { delete c; }
+void litert_lm_repetition_penalty_config_set_repetition_penalty(LiteRtLmRepetitionPenaltyConfig* c, float v) {
+  c->j["repetition_penalty"] = v;
+}
+void litert_lm_repetition_penalty_config_set_presence_penalty(LiteRtLmRepetitionPenaltyConfig* c, float v) {
+  c->j["presence_penalty"] = v;
+}
+void litert_lm_repetition_penalty_config_set_frequency_penalty(LiteRtLmRepetitionPenaltyConfig* c, float v) {
+  c->j["frequency_penalty"] = v;
+}
+void litert_lm_repetition_penalty_config_set_window_size(LiteRtLmRepetitionPenaltyConfig* c, int n) {
+  c->j["window_size"] = n;
+}
+void litert_lm_conversation_optional_args_set_repetition_penalty_config(LiteRtLmConversationOptionalArgs* a,
+                                                                        const LiteRtLmRepetitionPenaltyConfig* c) {
+  a->j["repetition_penalty_config"] = c ? c->j : nlohmann::json(nullptr);
+}
 void litert_lm_conversation_optional_args_set_constraint(LiteRtLmConversationOptionalArgs* a,
                                                          LiteRtLmConstraintType type, const char* pattern) {
   a->type = type;
@@ -188,7 +213,8 @@ int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const
                                                LiteRtLmStreamCallback callback, void* data) {
   Record({{"call", "send_message"},
           {"message", nlohmann::json::parse(message ? message : "null", nullptr, false)},
-          {"extra_context", nlohmann::json::parse(extra_context ? extra_context : "null", nullptr, false)}});
+          {"extra_context", nlohmann::json::parse(extra_context ? extra_context : "null", nullptr, false)},
+          {"args", a ? a->j : nlohmann::json(nullptr)}});
   const LiteRtLmConstraintType type = a ? a->type : kLiteRtLmConstraintTypeNone;
   if (type == kLiteRtLmConstraintTypeRegex && a->pattern == "(") {
     g_error = "INTERNAL: Failed to create LLGuidance constraint: invalid regex \"(\": unclosed group";

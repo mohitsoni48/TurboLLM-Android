@@ -419,6 +419,17 @@ the generation is cancelled there, with `finish_reason` "stop". Text that could 
 a stop string is held back until the next chunk tells, so no part of one is ever sent. It
 applies to the reply's text only, not to its thinking or tool calls, as OpenAI's does.
 
+**Repetition penalties go through LiteRT-LM's own** (`RepetitionPenaltyConfig`, applied per
+message while it decodes): `presence_penalty` and `frequency_penalty` as OpenAI defines them,
+and `repetition_penalty`, or llama.cpp's `repeat_penalty`, which the daemon sends
+(multiplicative, 1 is none). The window is `repeat_last_n` when the request sets it, as
+llama.cpp reads it (0 turns the penalties off, -1 is the whole reply); else the last 64 tokens
+for `repeat_penalty`, llama.cpp's default; else the whole reply. LiteRT-LM counts the reply's
+tokens only. A repetition penalty below 1, which LiteRT-LM would clamp to 1 without a word, is a
+400. `min_p`, which it has no sampler for, is not applied, and a reply to a request with one
+above 0 says so in its `X-Unapplied-Parameters: min_p` header: a 400 would fail every chat whose
+saved settings have a Min P, chats that worked when it was dropped unread.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

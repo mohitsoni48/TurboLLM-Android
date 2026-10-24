@@ -657,3 +657,81 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+test('repetition penalties reach the model with llama.cpp\'s and OpenAI\'s meanings, and what LiteRT-LM cannot do is said', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const penalties = async (request) => {
+    const log = await callsDuring(async () => {
+      const reply = await chat(fake, { model, messages: hello, ...request })
+      assert.equal(reply.status, 200, reply.error)
+    })
+    return log.filter((c) => c.call === 'send_message').at(-1).args.repetition_penalty_config ?? null
+  }
+  const config = (repetition_penalty, presence_penalty, frequency_penalty, window_size) => ({ repetition_penalty, presence_penalty, frequency_penalty, window_size })
+  assert.equal(await penalties({}), null)
+  // llama.cpp's repeat_penalty, over llama.cpp's default 64 tokens unless repeat_last_n says otherwise (0: off).
+  assert.deepEqual(await penalties({ repeat_penalty: 1.3 }), config(f(1.3), 0, 0, 64))
+  assert.deepEqual(await penalties({ repeat_penalty: 1.1, presence_penalty: 0.6 }), config(f(1.1), f(0.6), 0, 64))
+  assert.deepEqual(await penalties({ repeat_penalty: 1.3, repeat_last_n: 128 }), config(f(1.3), 0, 0, 128))
+  assert.deepEqual(await penalties({ repeat_penalty: 1.3, repeat_last_n: -1 }), config(f(1.3), 0, 0, 0))
+  assert.equal(await penalties({ repeat_penalty: 1.3, repeat_last_n: 0 }), null)
+  assert.equal(await penalties({ repeat_penalty: 1 }), null)
+  // OpenAI's and HuggingFace's names, over the whole reply.
+  assert.deepEqual(await penalties({ repetition_penalty: 1.2 }), config(f(1.2), 0, 0, 0))
+  assert.deepEqual(await penalties({ presence_penalty: 0.5, frequency_penalty: 1 }), config(1, 0.5, 1, 0))
+  assert.deepEqual(await penalties({ frequency_penalty: -0.5 }), config(1, 0, -0.5, 0))
+  assert.equal(await penalties({ min_p: 0 }), null)
+  const refused = async (request) => {
+    const reply = await chat(fake, { model, messages: hello, ...request })
+    assert.equal(reply.status, 400, JSON.stringify(request))
+    return reply.error
+  }
+  assert.equal(await refused({ repeat_penalty: 0.9 }), 'Invalid sampler parameters: repeat_penalty 0.9 is below 1, which LiteRT-LM does not take (1 is no penalty)')
+  assert.equal(await refused({ presence_penalty: 'high' }), 'Invalid sampler parameters: ValueError: presence_penalty must be a number')
+  assert.equal(await refused({ repeat_penalty: 1.2, repeat_last_n: -2 }), 'Invalid sampler parameters: ValueError: repeat_last_n must be an integer of -1 or more')
+  // min_p, which LiteRT-LM has no sampler for, is not applied, and the reply says so, streamed or not (a 400 would fail
+  // every chat whose saved settings have a Min P).
+  for (const stream of [false, true]) {
+    const reply = await chat(fake, { model, messages: hello, min_p: 0.05, stream })
+    assert.equal(reply.status, 200, reply.error)
+    assert.equal(reply.headers.get('x-unapplied-parameters'), 'min_p')
+  }
+  assert.equal((await chat(fake, { model, messages: hello, min_p: 0 })).headers.get('x-unapplied-parameters'), null)
+  assert.equal(await refused({ min_p: 'low' }), 'Invalid sampler parameters: ValueError: min_p must be a number')
+  assert.equal((await logged(fake)).filter((l) => l === 'min_p is not applied to plain.litertlm: LiteRT-LM has no min-p sampling').length, 1, fake.stderr)
+})
+
+test('min_p is said once per model, by a request that is answered, also when requests with it arrive at once', { skip, timeout: 60_000 }, async () => {
+  // Each connection has its own thread. The note is taken under the engine lock, so requests refused before it (here
+  // for their response_format) never touch it, and answered ones take turns.
+  const models = Array.from({ length: 32 }, (_, i) => readable(`min-p-${i}`))
+  const replies = await Promise.all(models.map((model) => chat(fake, { model, messages: hello, min_p: 0.05, response_format: { type: 'bogus' } })))
+  assert.deepEqual(replies.map((r) => r.status), models.map(() => 400))
+  const note = (i) => `min_p is not applied to min-p-${i}.litertlm: LiteRT-LM has no min-p sampling`
+  assert.equal((await logged(fake)).filter((l) => l.startsWith('min_p is not applied to min-p-')).length, 0, fake.stderr)
+  const answered = await Promise.all([...models.slice(0, 8), ...models.slice(0, 8)].map((model) => chat(fake, { model, messages: hello, min_p: 0.05 })))
+  assert.deepEqual(answered.map((r) => [r.status, r.headers.get('x-unapplied-parameters')]), answered.map(() => [200, 'min_p']))
+  const lines = await logged(fake)
+  for (let i = 0; i < 8; i++) assert.equal(lines.filter((l) => l === note(i)).length, 1, `${note(i)}\n${fake.stderr}`)
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model's reply changes under a repetition penalty: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      // Greedy and without thinking, so only the penalty can change the reply.
+      const ask = async (extra) => {
+        const reply = await chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Write two sentences about the sea.' }], max_completion_tokens: 64, temperature: 0, reasoning_effort: 'none', ...extra }, 300_000)
+        assert.equal(reply.status, 200, reply.error)
+        return reply.content
+      }
+      const plain = await ask({})
+      assert.notEqual(await ask({ frequency_penalty: 2 }), plain, 'frequency_penalty 2 changed nothing')
+      assert.notEqual(await ask({ repeat_penalty: 1.5 }), plain, 'repeat_penalty 1.5 changed nothing')
+    } finally {
+      stopServer(server)
+    }
+  })
+}
