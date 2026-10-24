@@ -82,7 +82,11 @@ extern "C" {
 const char* litert_lm_get_last_error_message(void) { return g_error.c_str(); }
 void litert_lm_clear_last_error(void) { g_error.clear(); }
 
-LiteRtLmEngineSettings* litert_lm_engine_settings_create(const char* model_path, const char*, const char*, const char*) {
+LiteRtLmEngineSettings* litert_lm_engine_settings_create(const char* model_path, const char* backend,
+                                                         const char* vision_backend, const char* audio_backend) {
+  auto name = [](const char* b) { return b ? nlohmann::json(b) : nlohmann::json(nullptr); };
+  Record({{"call", "engine_settings_create"}, {"model", Basename(model_path)}, {"backend", name(backend)},
+          {"vision_backend", name(vision_backend)}, {"audio_backend", name(audio_backend)}});
   return new LiteRtLmEngineSettings{Basename(model_path)};
 }
 void litert_lm_engine_settings_delete(LiteRtLmEngineSettings* s) { delete s; }

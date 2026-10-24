@@ -161,45 +161,108 @@ export function calls(file) {
   return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []
 }
 
-// A stand-in .litertlm the server can read as the runtime does: "LITERTLM", three uint32 versions, padding, the
-// uint64 header end, then the header FlatBuffer (schema/core/litertlm_header_schema.fbs) listing `sections`, each
-// { type, bytes } (5 = LlmMetadataProto, 9 = ExecutorMetadataProto), which follow at 16 KiB steps as in real files.
-// The stand-in library reads only the file's name.
-export function litertlmFile(path, sections) {
-  const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b }
-  const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b }
-  const i32 = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b }
-  const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b }
-  // Laid out front to back; every uoffset points forward, as FlatBuffers requires, and each vtable sits right before
-  // its table. Fields: root.section_metadata (1), section_metadata.objects (0), SectionObject begin (1), end (2),
-  // type (3).
+// A FlatBuffer, laid out front to back from a tree of values: every uoffset points forward, as FlatBuffers requires,
+// each vtable sits right before its table, and each table starts 8-aligned. fb.table([...]) lists a table's fields by
+// index (undefined leaves one out); a field is fb.u8(v), fb.u32(v), fb.i32(v) or fb.u64(v), a string, a table, a
+// vector of tables or strings (fb.vector([...])) or of int32s (fb.ints([...])).
+export const fb = {
+  u8: (v) => ({ size: 1, put: (b, at) => b.writeUInt8(v, at) }),
+  u32: (v) => ({ size: 4, put: (b, at) => b.writeUInt32LE(v, at) }),
+  i32: (v) => ({ size: 4, put: (b, at) => b.writeInt32LE(v, at) }),
+  u64: (v) => ({ size: 8, put: (b, at) => b.writeBigUInt64LE(BigInt(v), at) }),
+  table: (fields) => ({ table: fields }),
+  vector: (items) => ({ vector: items }),
+  ints: (values) => ({ ints: values }),
+}
+export function flatbuffer(root) {
   const parts = []
   let pos = 0
   const put = (b) => { parts.push(b); pos += b.length; return pos - b.length }
-  const fixups = [] // [position of a uoffset, function returning its target]
-  put(u32(0)) // root uoffset, fixed below
-  const rootVt = put(Buffer.concat([u16(8), u16(8), u16(0), u16(4)]))
-  const rootTable = put(Buffer.concat([i32(8), u32(0)]))
-  fixups.push([rootTable + 4, () => metaTable])
-  const metaVt = put(Buffer.concat([u16(6), u16(8), u16(4), u16(0)]))
-  const metaTable = put(Buffer.concat([i32(8), u32(0)]))
-  fixups.push([metaTable + 4, () => vector])
-  const vector = put(Buffer.concat([u32(sections.length), ...sections.map(() => u32(0))]))
-  const tables = sections.map((s, k) => {
-    put(Buffer.concat([u16(12), u16(24), u16(0), u16(4), u16(12), u16(20)]))
-    const t = put(Buffer.concat([i32(12), u64(16384 * (k + 1)), u64(16384 * (k + 1) + s.bytes.length), Buffer.from([s.type, 0, 0, 0])]))
-    fixups.push([vector + 4 + 4 * k, () => t])
-    return t
+  const pad = (to, extra = 0) => { const n = (to - ((pos + extra) % to)) % to; if (n) put(Buffer.alloc(n)) }
+  const patches = [] // [position of a uoffset, position of its target]
+  // Lays out `value` (a table, vector or string) and what it points to; returns its position.
+  const place = (value) => {
+    if (typeof value === 'string') {
+      pad(4)
+      const b = Buffer.alloc(4 + Buffer.byteLength(value) + 1)
+      b.writeUInt32LE(Buffer.byteLength(value))
+      b.write(value, 4)
+      return put(b)
+    }
+    if (value.ints) {
+      pad(4)
+      const b = Buffer.alloc(4 + 4 * value.ints.length)
+      b.writeUInt32LE(value.ints.length)
+      value.ints.forEach((v, k) => b.writeInt32LE(v, 4 + 4 * k))
+      return put(b)
+    }
+    if (value.vector) {
+      pad(4)
+      const at = put(Buffer.alloc(4 + 4 * value.vector.length))
+      parts.at(-1).writeUInt32LE(value.vector.length)
+      value.vector.forEach((item, k) => patches.push([at + 4 + 4 * k, place(item)]))
+      return at
+    }
+    // A table: its soffset, then each field at its own alignment; the vtable gives each field's place in it.
+    const slots = []
+    let size = 4
+    for (const field of value.table) {
+      if (field === undefined) { slots.push(0); continue }
+      const width = field.size ?? 4
+      size += (width - (size % width)) % width
+      slots.push(size)
+      size += width
+    }
+    size += (4 - (size % 4)) % 4
+    const vtable = Buffer.alloc(4 + 2 * slots.length)
+    vtable.writeUInt16LE(vtable.length, 0)
+    vtable.writeUInt16LE(size, 2)
+    slots.forEach((at, k) => vtable.writeUInt16LE(at, 4 + 2 * k))
+    pad(8, vtable.length)
+    put(vtable)
+    const table = Buffer.alloc(size)
+    table.writeInt32LE(vtable.length, 0)
+    const at = put(table)
+    const later = []
+    value.table.forEach((field, k) => {
+      if (field === undefined) return
+      if (field.put) field.put(table, slots[k])
+      else later.push([at + slots[k], field])
+    })
+    for (const [slot, child] of later) patches.push([slot, place(child)])
+    return at
+  }
+  put(Buffer.alloc(8)) // the root uoffset, and room before the root's vtable
+  patches.push([0, place(root)])
+  const out = Buffer.concat(parts)
+  for (const [at, target] of patches) out.writeUInt32LE(target - at, at)
+  return out
+}
+
+// A stand-in .litertlm the server can read as the runtime does: "LITERTLM", three uint32 versions, padding, the
+// uint64 header end, then the header FlatBuffer (schema/core/litertlm_header_schema.fbs) listing `sections`, each
+// { type, bytes, items } (3 = TFLiteModel, 5 = LlmMetadataProto, 9 = ExecutorMetadataProto; items, the section's
+// string key-value pairs, such as model_type), whose bytes follow at 16 KiB steps as in real files. The stand-in
+// library does not read it.
+export function litertlmFile(path, sections) {
+  let next = 16384
+  const placed = sections.map((s) => {
+    const bytes = s.bytes ?? Buffer.alloc(0)
+    const begin = next
+    next = begin + Math.ceil(Math.max(bytes.length, 1) / 16384) * 16384
+    return { ...s, bytes, begin }
   })
-  assert.equal(rootVt, 4)
-  assert.ok(tables.length === sections.length && metaVt > 0)
-  const header = Buffer.concat(parts)
-  header.writeUInt32LE(rootTable, 0)
-  for (const [at, target] of fixups) header.writeUInt32LE(target() - at, at)
+  const item = ([key, value]) => fb.table([key, fb.u8(9), fb.table([value])]) // KeyValuePair, its value a StringValue
+  const header = flatbuffer(fb.table([undefined, fb.table([fb.vector(placed.map((s) => fb.table([
+    s.items ? fb.vector(Object.entries(s.items).map(item)) : undefined, fb.u64(s.begin), fb.u64(s.begin + s.bytes.length), fb.u8(s.type),
+  ])))])]))
+  assert.ok(32 + header.length <= 16384, 'the header must fit in 16 KiB')
+  const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b }
+  const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b }
   const preamble = Buffer.concat([Buffer.from('LITERTLM'), u32(1), u32(0), u32(0), u32(0), u64(32 + header.length)])
-  const file = Buffer.alloc(16384 * (sections.length + 1))
+  const file = Buffer.alloc(next)
   Buffer.concat([preamble, header]).copy(file)
-  sections.forEach((s, k) => s.bytes.copy(file, 16384 * (k + 1)))
+  for (const s of placed) s.bytes.copy(file, s.begin)
   writeFileSync(path, file)
   return path
 }

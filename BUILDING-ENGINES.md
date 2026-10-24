@@ -368,6 +368,18 @@ answers. `node --test engines/litert-lm-server/model-settings.test.mjs` checks w
 a new engine against the stand-in library, and on real models (see the file) that a
 conversation's reply does not depend on the ones before it.
 
+**A model that takes images or audio gets its encoders**, on the backend its file prefers (the
+encoder section's first `backend_constraint`, else CPU, as `litert-lm serve` chooses) or on the
+config's `vision_backend` or `audio_backend`. Without a backend named for it LiteRT-LM creates no
+vision or audio executor, and every image sent to LFM2.5-VL-450M got a 500. The encoders come
+with the engine, so a text-only chat with such a model holds them too: about 0.2 GB more
+resident memory for LFM2.5-VL-450M on CPU without the compiled-model cache; GPU unmeasured. An
+image or audio part sent to a model without that input is a 400 that says so, before anything
+loads. Which inputs a file takes, on which backends, the server reads from the file's header
+itself, as LiteRT-LM does. The C API's `litert_lm_loaded_file_*` answer the same, but read whole
+model sections into memory to do it (every vision section, and the main model when its metadata
+gives no context size): 285 MB for gemma-3-270m-it, before any engine loads.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

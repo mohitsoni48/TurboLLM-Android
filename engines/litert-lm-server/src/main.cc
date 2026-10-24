@@ -13,8 +13,8 @@
 //     The model loads lazily on the first chat request and stays loaded while requests keep
 //     naming the same model and settings (util.get_or_initialize_server_engine).
 //   - --config is the CLI's config file: {"default": {...}, "models": {"<model id>": {...}}}, of
-//     which the serve path reads backend, cpu_thread_count, max_num_tokens, cache,
-//     speculative_decoding, gpu_decode_steps_per_sync, thinking and thinking_budget.
+//     which the serve path reads backend, vision_backend, audio_backend, cpu_thread_count,
+//     max_num_tokens, cache, speculative_decoding, gpu_decode_steps_per_sync, thinking and thinking_budget.
 //   - A failed request reports the runtime's own message in the HTTP status line, as
 //     BaseHTTPRequestHandler.send_error does, because that is where the daemon's warm-up reads it.
 //
@@ -33,6 +33,7 @@
 //     the model cannot follow, or whose regex or schema cannot be compiled, is a 400, not a 500.
 //   - A new engine for each conversation of a model whose decoder keeps a recurrent state (LFM2), which the runtime
 //     would otherwise carry from one conversation into the next (see GetOrCreateEngine).
+//   - An image or audio part sent to a model that takes no such input is a 400 that says so, not the runtime's 500.
 //
 // Not translated: /v1/responses, /v1/embeddings and the Gemini API (TurboLLM uses none of them
 // with this engine), and image URLs other than base64 data: URLs (remote URLs, and local paths, which the Python
@@ -65,6 +66,7 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -150,7 +152,7 @@ std::string AbsPath(const std::string& p) {
 // ── Config (litert_lm_cli/config.py) ─────────────────────────────────────────────────────
 
 struct ModelConfig {
-  std::optional<std::string> backend;
+  std::optional<std::string> backend, vision_backend, audio_backend;
   std::optional<int> cpu_thread_count;
   std::optional<int> max_num_tokens;
   std::optional<std::string> cache;
@@ -161,6 +163,8 @@ struct ModelConfig {
 
   void MergeFrom(const ModelConfig& o) {
     if (o.backend) backend = o.backend;
+    if (o.vision_backend) vision_backend = o.vision_backend;
+    if (o.audio_backend) audio_backend = o.audio_backend;
     if (o.cpu_thread_count) cpu_thread_count = o.cpu_thread_count;
     if (o.max_num_tokens) max_num_tokens = o.max_num_tokens;
     if (o.cache) cache = o.cache;
@@ -187,6 +191,8 @@ ModelConfig ParseModelConfig(const json& j) {
     return std::nullopt;
   };
   c.backend = str("backend");
+  c.vision_backend = str("vision_backend");
+  c.audio_backend = str("audio_backend");
   c.cpu_thread_count = num("cpu_thread_count");
   c.max_num_tokens = num("max_num_tokens");
   c.cache = str("cache");
@@ -287,17 +293,21 @@ struct ModelFileInfo {
   // The decoder keeps a recurrent state besides its KV cache: LFM2's short-convolution cache (the kv_cache_c_* inputs),
   // or any linear-attention state. See GetOrCreateEngine for why that matters.
   bool recurrent_state = false;
+  // What the header's TFLite sections say, when the header could be read: for image and for audio input, the backends
+  // the file's encoder supports, the one it prefers first; none when it takes no such input.
+  bool capabilities_known = false;
+  std::vector<std::string> vision_backends, audio_backends;
 };
 
-// Bounds-checked reads of a FlatBuffer: just what the header's section list needs. Little-endian, as are the
-// FlatBuffer format and every ABI the server is built for.
+// Bounds-checked reads of a FlatBuffer of `size` bytes, through `read`: just what the server needs of the header's
+// section list. Little-endian, as are the FlatBuffer format and every ABI the server is built for.
 struct FbReader {
-  const std::string& b;
+  std::function<bool(uint64_t pos, void* out, size_t n)> read;  // called only within the bounds
+  uint64_t size;
   template <class T>
   std::optional<T> Get(uint64_t pos) const {
-    if (pos > b.size() || sizeof(T) > b.size() - pos) return std::nullopt;
     T v;
-    std::memcpy(&v, b.data() + pos, sizeof v);
+    if (pos > size || sizeof(T) > size - pos || !read(pos, &v, sizeof v)) return std::nullopt;
     return v;
   }
   // Where field i of the table at `table` is, or 0 when the table does not have it.
@@ -315,7 +325,29 @@ struct FbReader {
     auto off = pos ? Get<uint32_t>(pos) : std::nullopt;
     return off && *off ? pos + *off : 0;
   }
+  // The number of elements of the vector at `vec`, 0 when there is none.
+  uint32_t Length(uint64_t vec) const { return vec ? Get<uint32_t>(vec).value_or(0) : 0; }
+  // The scalar at `pos` (a field's place, from Field), or `missing` when the table does not have the field.
+  template <class T>
+  T Scalar(uint64_t pos, T missing) const {
+    return pos ? Get<T>(pos).value_or(missing) : missing;
+  }
+  // The string a uoffset at `pos` points to (its first 256 bytes), empty when there is none.
+  std::string String(uint64_t pos) const {
+    const uint64_t at = Follow(pos);
+    std::string out(std::min<uint32_t>(Length(at), 256), '\0');
+    if (!at || at + 4 > size || out.size() > size - at - 4 || !read(at + 4, &out[0], out.size())) return "";
+    return out;
+  }
 };
+
+FbReader MemoryReader(const std::string& b) {
+  return {[&b](uint64_t pos, void* out, size_t n) {
+            std::memcpy(out, b.data() + pos, n);
+            return true;
+          },
+          b.size()};
+}
 
 // Calls f(field number, varint value, bytes) for each top-level field of a protobuf message: the varint for wire type
 // 0, the bytes for wire type 2; fixed-width fields are skipped. False when the message is malformed.
@@ -385,19 +417,63 @@ bool HasRecurrentState(int section_type, const std::string& proto) {
   return found;
 }
 
-// `header` is the file's bytes from 32 to the header's end. A header or section this cannot read says nothing.
+// The backends a section's backend_constraint lists, in its order, as LiteRT-LM 0.18.0 reads it
+// (ParseBackendConstraint in schema/model_info/model_info.cc, what its C API's litert_lm_loaded_file_* answer): cpu
+// or cpu_artisan, gpu or gpu_artisan, npu or google_tensor_artisan; a section without one takes cpu, then gpu.
+std::vector<std::string> ConstraintBackends(const std::string& constraint) {
+  if (constraint.empty()) return {"cpu", "gpu"};
+  std::vector<std::string> out;
+  std::stringstream ss(constraint);
+  for (std::string b; std::getline(ss, b, ',');) {
+    b = Trim(b);
+    std::string name = b == "cpu" || b == "cpu_artisan" ? "cpu"
+                       : b == "gpu" || b == "gpu_artisan" ? "gpu"
+                       : b == "npu" || b == "google_tensor_artisan" ? "npu"
+                                                                   : "";
+    if (!name.empty() && std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+  }
+  return out;
+}
+
+// `header` is the file's bytes from 32 to the header's end, `in` the file. What the file takes and on which backends is
+// what its header lists, as LiteRT-LM 0.18.0 reads it (DiscoverSections in schema/model_info/model_info.cc): each
+// TFLite section's model_type and backend_constraint items, a vision or audio encoder or adapter being that input,
+// the last one listed deciding its backends. The C API's litert_lm_loaded_file_create reads the same, but also reads
+// whole sections into memory: every vision section, and the main model when LlmMetadata has no max_num_tokens
+// (GetModelInfo), so asking it which inputs gemma-3-270m-it takes raised the server's peak memory by 285 MB, the size
+// of its model, before any engine loaded, and by up to 2 GB for a larger bundle. Here nothing but the header and the
+// small protobuf sections is read. A header or section this cannot read says nothing.
 ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   ModelFileInfo info;
-  FbReader fb{header};
+  const FbReader fb = MemoryReader(header);
   const uint64_t root = fb.Get<uint32_t>(0).value_or(0);  // the root table's uoffset, from 0
   const uint64_t sections = fb.Follow(fb.Field(fb.Follow(fb.Field(root, 1)), 0));  // section_metadata.objects
-  const uint32_t n = sections ? fb.Get<uint32_t>(sections).value_or(0) : 0;
+  const uint32_t n = fb.Length(sections);
+  info.capabilities_known = n > 0;
+  std::optional<std::string> vision, audio;  // the encoder's backend_constraint
   for (uint32_t k = 0; k < n && k < 4096; ++k) {
     const uint64_t s = fb.Follow(sections + 4 + 4ull * k);
-    const uint64_t at_begin = fb.Field(s, 1), at_end = fb.Field(s, 2), at_type = fb.Field(s, 3);
-    if (!s || !at_begin || !at_end || !at_type) continue;
-    const int type = fb.Get<uint8_t>(at_type).value_or(0);
-    const uint64_t begin = fb.Get<uint64_t>(at_begin).value_or(0), end = fb.Get<uint64_t>(at_end).value_or(0);
+    if (!s) continue;
+    const int type = fb.Scalar<uint8_t>(fb.Field(s, 3), 0);
+    if (type == 3) {  // TFLiteModel
+      std::string model_type, constraint;
+      const uint64_t items = fb.Follow(fb.Field(s, 0));
+      for (uint32_t j = 0; j < fb.Length(items) && j < 256; ++j) {
+        const uint64_t item = fb.Follow(items + 4 + 4ull * j);  // a KeyValuePair, whose value is a StringValue (9)
+        if (!item || fb.Scalar<uint8_t>(fb.Field(item, 1), 0) != 9) continue;
+        const std::string key = fb.String(fb.Field(item, 0));
+        const std::string value = Lower(Trim(fb.String(fb.Field(fb.Follow(fb.Field(item, 2)), 0))));
+        if (key == "model_type") model_type = value;
+        if (key == "backend_constraint") constraint = value;
+      }
+      if (model_type == "tf_lite_vision_adapter" || model_type == "tf_lite_vision_encoder") vision = constraint;
+      if (model_type == "tf_lite_audio_adapter" || model_type == "tf_lite_audio_encoder_hw" ||
+          model_type == "tf_lite_audio_frontend") {
+        audio = constraint;
+      }
+      continue;
+    }
+    const uint64_t begin = fb.Scalar<uint64_t>(fb.Field(s, 1), 0), end = fb.Scalar<uint64_t>(fb.Field(s, 2), 0);
     if ((type != 5 && type != 9) || end <= begin || end - begin > (1u << 20)) continue;
     std::string proto(end - begin, '\0');
     in.clear();
@@ -406,17 +482,58 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
     }
     info.recurrent_state |= HasRecurrentState(type, proto);
   }
+  if (vision) info.vision_backends = ConstraintBackends(*vision);
+  if (audio) info.audio_backends = ConstraintBackends(*audio);
   return info;
+}
+
+// ModelFileInfo for the model file, read once per version of it (its size and modification time). A .litertlm starts
+// with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end offset (the same 32
+// bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32 bytes before reading
+// the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate, killing the whole
+// server, so the offset is bounded here first. The bound is the runtime's own: it reads the header from the file's
+// first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger offset can never load,
+// yet would still cost an allocation up to the file's size (hundreds of MB on a phone). Checked before the loaded
+// engine is released, which a bad file then leaves in place. A file that can't be read or lacks the magic is left to
+// the runtime, which reports it cleanly and more precisely (e.g. "Permission denied"), and says nothing here. Caller
+// holds g_engine_mu.
+const ModelFileInfo& FileInfo(const ModelRef& ref) {
+  struct Cached {
+    long long size = -1, mtime = -1;
+    ModelFileInfo info;
+  };
+  static std::map<std::string, Cached> cache;
+  struct stat st {};
+  unsigned char h[32] = {};
+  std::ifstream in(ref.path, std::ios::binary);
+  bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
+            std::memcmp(h, "LITERTLM", 8) == 0;
+  uint64_t header_end = 0;
+  for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
+  constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
+  if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
+    throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
+                             ": invalid .litertlm header')");
+  }
+  Cached& c = cache[ref.path];
+  if (c.size == static_cast<long long>(st.st_size) && c.mtime == static_cast<long long>(st.st_mtime)) return c.info;
+  c = Cached{static_cast<long long>(st.st_size), static_cast<long long>(st.st_mtime), ModelFileInfo()};
+  if (!ok) return c.info;
+  std::string header(header_end - 32, '\0');
+  if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) c.info = ReadModelFileInfo(in, header);
+  return c.info;
 }
 
 // ── Engine lifetime (util.get_or_initialize_server_engine) ─────────────────────────────────
 
 struct EngineKey {
   std::string path, backend, cache;
+  std::string vision_backend, audio_backend;  // empty: no vision or audio executor
   int max_num_tokens = -1, threads = -1, gpu_steps = -1, spec = -1;
   bool operator==(const EngineKey& o) const {
-    return path == o.path && backend == o.backend && cache == o.cache && max_num_tokens == o.max_num_tokens &&
-           threads == o.threads && gpu_steps == o.gpu_steps && spec == o.spec;
+    return path == o.path && backend == o.backend && cache == o.cache && vision_backend == o.vision_backend &&
+           audio_backend == o.audio_backend && max_num_tokens == o.max_num_tokens && threads == o.threads &&
+           gpu_steps == o.gpu_steps && spec == o.spec;
   }
 };
 
@@ -477,8 +594,38 @@ void ReleaseEngine() {
   }
 }
 
+// The backend for a model's vision or audio encoder: the config's vision_backend or audio_backend when it sets one,
+// else the one the file prefers, as `litert-lm serve` chooses them (util.get_or_initialize_server_engine and
+// model.parse_backend: the config key, else the encoder section's first backend_constraint, else cpu, which is also
+// what ReadModelFileInfo lists first). Empty for a model without that input: LiteRT-LM then creates no executor for it.
+std::string EncoderBackend(const ModelRef& ref, const std::vector<std::string>& supported,
+                           const std::optional<std::string>& configured, const char* input) {
+  if (supported.empty()) {
+    if (configured) {
+      static std::set<std::string> told;
+      if (told.insert(ref.path + input).second) {
+        Log(std::string(input) + "_backend in the config is not used for " + ref.id + ": it takes no " + input +
+            " input");
+      }
+    }
+    return "";
+  }
+  if (!configured) return supported.front();
+  std::string b = Lower(*configured);
+  if (b != "cpu" && b != "gpu" && b != "npu") {
+    throw HttpError(500, "Failed to load engine: ValueError(\"Unsupported " + std::string(input) + " backend: '" + b +
+                             "'\")");
+  }
+  return b;
+}
+
+// What a request's messages hold besides text, which only a model with that input can take.
+struct InputNeeds {
+  bool image = false, audio = false;
+};
+
 // Caller holds g_engine_mu.
-LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
+LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, const InputNeeds& needs) {
   EngineKey key;
   key.path = ref.path;
   key.backend = ref.backend ? *ref.backend : (mc.backend ? Lower(*mc.backend) : "cpu");
@@ -490,6 +637,20 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   if (key.cache.empty()) key.cache = FallbackCacheDir(ref.path);
   if (key.backend != "cpu" && key.backend != "gpu" && key.backend != "npu") {
     throw HttpError(500, "Failed to load engine: ValueError(\"Unsupported backend: '" + key.backend + "'\")");
+  }
+  // A vision or audio executor is created only when the engine settings name a backend for it (c/engine.cc,
+  // CreateEngineSettingsHelper), and none was named, so an image sent to LFM2.5-VL-450M got a 500 "Vision executor
+  // should not be null, please TryLoadingVisionExecutor() first." although the model takes images.
+  const ModelFileInfo& info = FileInfo(ref);
+  key.vision_backend = EncoderBackend(ref, info.vision_backends, mc.vision_backend, "vision");
+  key.audio_backend = EncoderBackend(ref, info.audio_backends, mc.audio_backend, "audio");
+  // An image or audio part for a model that has no such input is the request's mistake, said before anything loads.
+  // When the server could not read the file's header, the runtime is left to say it.
+  if (info.capabilities_known && needs.image && key.vision_backend.empty()) {
+    throw HttpError(400, "Invalid messages: " + ref.id + " takes no image input");
+  }
+  if (info.capabilities_known && needs.audio && key.audio_backend.empty()) {
+    throw HttpError(400, "Invalid messages: " + ref.id + " takes no audio input");
   }
 
   // A model whose decoder keeps a recurrent state gets a new engine for every conversation after the first. LiteRT-LM
@@ -503,34 +664,6 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   // no way to reset that state, so the engine is created again, with the same settings.
   const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.recurrent_state && g_engine.state_used;
   if (g_engine.engine && g_engine.key == key && !fresh_state) return g_engine.engine;
-  // A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end
-  // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32
-  // bytes before reading the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate,
-  // killing the whole server, so the offset is bounded here first. The bound is the runtime's own: it reads the header
-  // from the file's first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger
-  // offset can never load, yet would still cost an allocation up to the file's size (hundreds of MB on a phone).
-  // Checked before the loaded engine is released, which a bad file then leaves in place.
-  // A file that can't be read or lacks the magic is left to the runtime, which reports it cleanly and more precisely
-  // (e.g. "Permission denied"). A header that passes is read for ModelFileInfo.
-  ModelFileInfo info;
-  {
-    struct stat st {};
-    unsigned char h[32] = {};
-    std::ifstream in(ref.path, std::ios::binary);
-    bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
-              std::memcmp(h, "LITERTLM", 8) == 0;
-    uint64_t header_end = 0;
-    for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
-    constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
-    if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
-      throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
-                               ": invalid .litertlm header')");
-    }
-    if (ok) {
-      std::string header(header_end - 32, '\0');
-      if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) info = ReadModelFileInfo(in, header);
-    }
-  }
   if (fresh_state) {
     static std::set<std::string> told;  // once per model file, not per conversation
     if (told.insert(ref.path).second) {
@@ -543,10 +676,14 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
     ReleaseEngine();
   }
 
-  Log("Initializing engine for model: " + ref.path + " (backend: " + key.backend + ")");
+  Log("Initializing engine for model: " + ref.path + " (backend: " + key.backend +
+      (key.vision_backend.empty() ? "" : ", vision: " + key.vision_backend) +
+      (key.audio_backend.empty() ? "" : ", audio: " + key.audio_backend) + ")");
   auto t0 = std::chrono::steady_clock::now();
   L.litert_lm_clear_last_error();
-  LiteRtLmEngineSettings* s = L.litert_lm_engine_settings_create(ref.path.c_str(), key.backend.c_str(), nullptr, nullptr);
+  LiteRtLmEngineSettings* s = L.litert_lm_engine_settings_create(
+      ref.path.c_str(), key.backend.c_str(), key.vision_backend.empty() ? nullptr : key.vision_backend.c_str(),
+      key.audio_backend.empty() ? nullptr : key.audio_backend.c_str());
   if (!s) {
     std::string why = LastRuntimeError();
     throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create engine settings for " + ref.path +
@@ -1268,8 +1405,21 @@ void HandleChatCompletions(int fd, const Request& req) {
       }
     }
 
+    // The parts TranslateMessage made of image_url and input_audio parts, or that the client sent as LiteRT-LM's own.
+    InputNeeds needs;
+    auto note_parts = [&](const json& m) {
+      if (!m.is_object() || !m.contains("content") || !m["content"].is_array()) return;
+      for (const auto& part : m["content"]) {
+        if (!part.is_object() || !part.contains("type") || !part["type"].is_string()) continue;
+        needs.image |= part["type"] == "image";
+        needs.audio |= part["type"] == "audio";
+      }
+    };
+    for (const auto& m : translated) note_parts(m);
+    note_parts(prompt);
+
     std::lock_guard<std::mutex> engine_lock(g_engine_mu);
-    LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc);
+    LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc, needs);
 
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
