@@ -413,6 +413,12 @@ stop such a model from thinking (a budget of 0 sets no constraint), and nothing 
 the two apart, so a 400 for one would refuse the other. The server logs that once, and every such
 reply carries `X-Thinking: unverified`, since a client sees nothing of the server's log.
 
+**OpenAI's `stop` is applied by the server**, which the C API cannot do (it knows only the
+model's stop tokens): the reply's text ends before the first stop string, streamed or not, and
+the generation is cancelled there, with `finish_reason` "stop". Text that could be the start of
+a stop string is held back until the next chunk tells, so no part of one is ever sent. It
+applies to the reply's text only, not to its thinking or tool calls, as OpenAI's does.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

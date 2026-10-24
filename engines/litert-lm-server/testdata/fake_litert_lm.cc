@@ -15,7 +15,8 @@
 // "config": {"sampler": {...}, ...}}.
 // A conversation answers with one chunk of text that says how it was created and sent, for example
 // "constrained=1 tools=1 provider=0 constraint=0 creates=3", where creates counts every litert_lm_conversation_create
-// call in the process. A regex that does not compile fails the send as llguidance does
+// call in the process; a message whose text starts with "say:" is answered with the rest of its text instead, three
+// bytes to a chunk, as a model streams. A regex that does not compile fails the send as llguidance does
 // (llg_constraint_provider.cc:155-160).
 //
 // With FAKE_LITERT_LM_CALLS set to a file, the calls that say what the server asked the runtime for are appended to it,
@@ -169,6 +170,7 @@ LiteRtLmConversation* litert_lm_conversation_create(LiteRtLmEngine* engine, Lite
   return nullptr;
 }
 void litert_lm_conversation_delete(LiteRtLmConversation* conv) { delete conv; }
+void litert_lm_conversation_cancel_process(LiteRtLmConversation*) { Record({{"call", "cancel_process"}}); }
 LiteRtLmBenchmarkInfo* litert_lm_conversation_get_benchmark_info(LiteRtLmConversation*) { return nullptr; }
 
 LiteRtLmConversationOptionalArgs* litert_lm_conversation_optional_args_create() {
@@ -196,9 +198,23 @@ int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const
   std::string text = "constrained=" + std::to_string(c.constrained) + " tools=" + std::to_string(c.tools) +
                      " provider=" + std::to_string(c.provider) + " constraint=" + std::to_string(type) +
                      " creates=" + std::to_string(g_creates);
-  LiteRtLmStreamChunk reply{"{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" + text + "\"}]}",
-                            nullptr, false};
-  callback(data, &reply);
+  nlohmann::json m = nlohmann::json::parse(message ? message : "null", nullptr, false);
+  std::string said;
+  if (m.is_object() && m.contains("content")) {
+    const nlohmann::json& content = m["content"];
+    if (content.is_string()) said = content.get<std::string>();
+    if (content.is_array() && !content.empty() && content[0].is_object()) said = content[0].value("text", "");
+  }
+  std::vector<std::string> chunks = {text};
+  if (said.rfind("say:", 0) == 0) {
+    chunks.clear();
+    for (size_t i = 4; i < said.size(); i += 3) chunks.push_back(said.substr(i, 3));
+  }
+  for (const auto& piece : chunks) {
+    nlohmann::json out = {{"role", "assistant"}, {"content", {{{"type", "text"}, {"text", piece}}}}};
+    LiteRtLmStreamChunk reply{out.dump(), nullptr, false};
+    callback(data, &reply);
+  }
   LiteRtLmStreamChunk end{"", nullptr, true};
   callback(data, &end);
   return 0;

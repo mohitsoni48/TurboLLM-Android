@@ -599,3 +599,61 @@ for (const path of thinkingModels.length ? thinkingModels : ['<model>']) {
     }
   })
 }
+
+test('a stop string ends the reply before it, streamed or not, and stops the generation', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const say = (text) => [{ role: 'user', content: `say:${text}` }] // the stand-in streams it back, three bytes a chunk
+  for (const stream of [false, true]) {
+    const ask = async (text, stop) => {
+      const reply = await chat(fake, { model, messages: say(text), stop, stream })
+      assert.equal(reply.status, 200, reply.error)
+      return reply
+    }
+    let stopped
+    const log = await callsDuring(async () => { stopped = await ask('The sea is a vast ocean that never ends.', ['ocean']) })
+    assert.equal(stopped.content, 'The sea is a vast ', `stream ${stream}`)
+    assert.equal(stopped.finish, 'stop')
+    assert.ok(log.some((c) => c.call === 'cancel_process'), 'the generation was not cancelled')
+    if (stream) {
+      // Nothing of the stop string went out, not even the part of it that came in one chunk ("oce").
+      const sent = stopped.chunks.map((c) => c.choices[0]?.delta?.content ?? '')
+      assert.ok(sent.every((t) => !t.includes('oc')), JSON.stringify(sent))
+    }
+    assert.equal((await ask('The sea is calm.', ['xyz'])).content, 'The sea is calm.')
+    // A reply that only looked as if it might become one ends whole.
+    assert.equal((await ask('It ends with oc', ['ocean'])).content, 'It ends with oc')
+    assert.equal((await ask('The sea is calm.', 'is')).content, 'The sea ')
+    assert.equal((await ask('The sea is a vast ocean.', ['vast', 'sea'])).content, 'The ')
+    assert.equal((await ask('Hello', ['', 'xyz'])).content, 'Hello')
+  }
+  for (const stop of [5, [1], [{}]]) {
+    const reply = await chat(fake, { model, messages: say('x'), stop })
+    assert.deepEqual(reply, { status: 400, error: 'stop must be a string or an array of strings' })
+  }
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model's reply ends before a stop string, streamed or not: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      // Seeded, and without thinking, so the reply is text and the same each time.
+      const ask = (extra) => chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Write one sentence about the sea.' }], max_completion_tokens: 48, seed: 1, reasoning_effort: 'none', ...extra }, 300_000)
+      const whole = await ask({})
+      assert.equal(whole.status, 200, whole.error)
+      const words = whole.content.split(/\s+/).filter((w) => /^[a-z]{3,}$/.test(w))
+      assert.ok(words.length >= 2, `too short: ${whole.content}`)
+      const stop = words[1]
+      const expected = whole.content.slice(0, whole.content.indexOf(stop))
+      for (const stream of [false, true]) {
+        const reply = await ask({ stop: [stop], stream })
+        assert.equal(reply.status, 200, reply.error)
+        assert.equal(reply.content, expected, `stop ${JSON.stringify(stop)}, stream ${stream}`)
+        assert.equal(reply.finish, 'stop')
+      }
+    } finally {
+      stopServer(server)
+    }
+  })
+}

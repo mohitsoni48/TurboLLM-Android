@@ -1685,6 +1685,20 @@ void HandleChatCompletions(int fd, const Request& req) {
         include_usage = so.at("include_usage").get<bool>();
       }
     }
+    // OpenAI's stop: a string or an array of them. It was read nowhere, so the user's stop sequences (the daemon sends
+    // a thread's) and API clients' were silently ignored. The C API has no stop strings of its own, only the model's
+    // stop tokens, so the server ends the reply at the first of them itself, in the drain loop below.
+    std::vector<std::string> stops;
+    if (body.contains("stop") && !body["stop"].is_null()) {
+      const json& st = body["stop"];
+      for (const json& one : st.is_array() ? st : json::array({st})) {
+        if (!one.is_string()) {
+          SendError(fd, req, 400, "stop must be a string or an array of strings");
+          return;
+        }
+        if (!one.get<std::string>().empty()) stops.push_back(one.get<std::string>());
+      }
+    }
 
     // The parts TranslateMessage made of image_url and input_audio parts, or that the client sent as LiteRT-LM's own.
     InputNeeds needs;
@@ -1883,6 +1897,40 @@ void HandleChatCompletions(int fd, const Request& req) {
     std::optional<std::string> error;
     bool client_gone = false;
     bool cancelled = false;
+    // The stop strings apply to the reply's text only, as OpenAI's do, not to its thinking or its tool calls. Text that
+    // could be the start of one is held back until the next chunk tells; at a stop string the reply ends before it,
+    // never showing it, and the generation is cancelled, which the loop below then takes as the quiet end it is.
+    std::string held;
+    bool stopped = false;
+    auto apply_stops = [&](std::string text) {
+      if (stops.empty()) return text;
+      if (stopped) return std::string();
+      held += text;
+      size_t at = std::string::npos;
+      for (const auto& stop : stops) at = std::min(at, held.find(stop));
+      if (at != std::string::npos) {
+        text = held.substr(0, at);
+        held.clear();
+        stopped = true;
+        if (!cancelled) {
+          cancelled = true;
+          L.litert_lm_conversation_cancel_process(conv.get());
+        }
+        return text;
+      }
+      size_t keep = 0;
+      for (const auto& stop : stops) {
+        for (size_t n = std::min(stop.size() - 1, held.size()); n > keep; --n) {
+          if (held.compare(held.size() - n, n, stop, 0, n) == 0) {
+            keep = n;
+            break;
+          }
+        }
+      }
+      text = held.substr(0, held.size() - keep);
+      held.erase(0, held.size() - keep);
+      return text;
+    };
 
     // Drain the callback queue until the final chunk. Meanwhile watch the client, at most every 200 ms: a closed
     // connection cancels the generation (the Python server only noticed on its next write). Checked between chunks
@@ -1944,6 +1992,8 @@ void HandleChatCompletions(int fd, const Request& req) {
         break;
       }
       Piece p = ParseChunk(item.text);
+      p.text = apply_stops(p.text);
+      if (stopped) p.tool_calls = json::array();
       if (!p.reasoning.empty()) ++reasoning_tokens;
       // The runtime sends each tool-call block as its own chunk once the block closes, so parallel calls from a model
       // that writes one block per call (Qwen's <tool_call>) arrive in several chunks. An OpenAI stream numbers a turn's
@@ -1976,6 +2026,13 @@ void HandleChatCompletions(int fd, const Request& req) {
       reasoning_all += p.reasoning;
       done = item.final;
     }
+    // The end of a reply that only looked as if it might become a stop string.
+    if (!held.empty() && !error) {
+      if (stream && !client_gone) {
+        SendAll(fd, Sse(make_chunk(json::array({{{"index", 0}, {"delta", {{"content", held}}}, {"finish_reason", nullptr}}}))));
+      }
+      text_all += held;
+    }
     if (client_gone) {
       Log("client disconnected — generation cancelled");
       return;
@@ -1987,7 +2044,7 @@ void HandleChatCompletions(int fd, const Request& req) {
     // take while writing it.
     if (!error) {
       UsageAndTimings(conv.get(), reasoning_tokens, usage, timings);
-      if (finish == "stop" && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
+      if (finish == "stop" && !stopped && max_tokens && usage["completion_tokens"].get<int>() >= *max_tokens) finish = "length";
       // A full context window ends the turn with an ordinary final chunk: the conversation API reports it as an error
       // only with return_error_on_max_tokens_reached, which defaults to off and which LiteRT-LM 0.18.0's C API has no
       // way to turn on. So it is told from the counts. The runtime stops once the KV cache holds max_num_tokens, and
@@ -1995,7 +2052,7 @@ void HandleChatCompletions(int fd, const Request& req) {
       // reply. Only a limit this server set is known: a bundle whose own cache is smaller caps the window lower, and
       // a reply cut off there still reads "stop".
       const int window = g_engine.key.max_num_tokens;
-      if (finish == "stop" && window > 0 && usage["total_tokens"].get<int>() >= window) finish = "length";
+      if (finish == "stop" && !stopped && window > 0 && usage["total_tokens"].get<int>() >= window) finish = "length";
     }
 
     if (stream) {
