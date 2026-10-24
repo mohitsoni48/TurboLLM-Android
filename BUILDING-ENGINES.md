@@ -331,6 +331,23 @@ for thinking-channel text, `finish_reason: "length"` when the token budget runs 
 cancels a generation when its client disconnects. Not ported: `/v1/responses`,
 `/v1/embeddings` and http(s) image URLs (TurboLLM uses none of them with this engine).
 
+**Constrained decoding is on only for a request with tools**, which is all it is for: the data
+processors that support it (Gemma 3's, Gemma 4's and FunctionGemma's) then constrain the model's
+tool calls to the tools given; the others, Qwen3's for one, never do. The Python server turns it
+on for every request (0.18.0 and upstream's main), and some data processors refuse it whatever
+the request: LFM2's always, and Gemma 3's, Gemma 4's and FunctionGemma's when the FST constraint
+library rejects the model's vocabulary (gemma-3-270m-it's does). Every request to such a model
+fails with `litert-lm serve`, and did here. A request with tools to such a model is now answered
+without the constraint (the model's own tool-call parsing still applies, and a call it writes in
+a form that parsing cannot read fails the request, as for any model whose calls are not
+constrained), and the server logs once per load that the model cannot constrain tool calls. A
+`response_format` has its own constraint (llguidance) and works on these models too; one the
+model cannot follow, or whose regex or JSON schema llguidance rejects, gets a 400 that names the
+reason instead of a 500. `node --test engines/litert-lm-server/constrained-decoding.test.mjs`
+checks this against a stand-in `liblitert-lm.so` that answers as 0.18.0 does for those models,
+and on real models when `LITERT_LM_TEST_LIBRARY` and `LITERT_LM_TEST_MODELS` are set (see the
+file).
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker
@@ -370,13 +387,17 @@ it doesn't.
 
 ### Not yet verified
 
-- **No phone has run it successfully.** On the owner's phone the wheel's library failed to load,
-  which is why it now has [a shim](#libandroidso-and-its-shim); no phone has run the patched one
-  yet. The patched library was run in a chroot of the x86_64 Android 15 emulator image's system
-  and vendor partitions, with that image's linker and its generated `/linkerconfig`: it loads
-  and answers a chat request on CPU, and still does with `libstagefright.so` removed from the
-  image, where the unpatched one fails with the owner's message. The code uses only
-  POSIX/bionic APIs available at API 24.
+- **No phone has answered a chat yet.** On the owner's phone the wheel's library failed to load,
+  which is why it now has [a shim](#libandroidso-and-its-shim). With the patched one the same
+  phone (Mali-G715) loaded LFM2.5-230M, and then the daemon's one-token warm-up request failed
+  because constrained decoding was on for every request (see above), so the model never finished
+  loading. The patched library was run in a chroot of the x86_64 Android 15 emulator image's
+  system and vendor partitions, with that image's linker and its generated `/linkerconfig`: it
+  loads and answers a chat request on CPU, and still does with `libstagefright.so` removed from
+  the image, where the unpatched one fails to load as it did on the owner's phone. In that chroot
+  (image unmodified) it also answers LFM2.5-230M, gemma-3-270m-it, gemma-3-1b-it, a FunctionGemma
+  270M and Qwen3-0.6B on CPU, streamed or not, with tools and with a `response_format`. The code
+  uses only POSIX/bionic APIs available at API 24.
 - GPU speed versus Termux on the same phone, and whether every GPU path (OpenCL, WebGPU/Vulkan)
   loads from an app-spawned process the way it does from Termux. The linker namespace of a
   `/data` executable searches `/system` and `/system_ext` only, so a vendor `libOpenCL.so` may

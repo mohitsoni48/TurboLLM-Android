@@ -28,6 +28,9 @@
 //   - A client that disconnects cancels its generation instead of letting it run on.
 //   - Requests are served concurrently; only inference itself is serialized (the engine is one
 //     shared resource, exactly as in the Python server, which serialized everything).
+//   - Constrained decoding only for requests with tools, and none for a model that refuses it, so
+//     LFM2 models answer at all (the Python server fails every request to one). A response_format
+//     the model cannot follow, or whose regex or schema cannot be compiled, is a 400, not a 500.
 //
 // Not translated: /v1/responses, /v1/embeddings and the Gemini API (TurboLLM uses none of them
 // with this engine), and image URLs other than base64 data: URLs (remote URLs, and local paths, which the Python
@@ -287,6 +290,10 @@ struct EngineHolder {
   LiteRtLmEngine* engine = nullptr;
   EngineKey key;
   double init_seconds = 0;
+  // Set once a conversation with constrained decoding failed to be created for this engine's model and one without
+  // it was created: its data processor cannot constrain tool calls (see HandleChatCompletions), so its later requests
+  // with tools are created without it at once. Cleared when another engine is loaded.
+  bool tools_unconstrained = false;
 };
 
 std::mutex g_engine_mu;  // held for the whole of every inference: the engine is one shared resource
@@ -402,6 +409,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   }
   g_engine.engine = e;
   g_engine.key = key;
+  g_engine.tools_unconstrained = false;
   g_engine.init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   Log("Engine ready in " + std::to_string(g_engine.init_seconds) + " s");
   return e;
@@ -1100,7 +1108,8 @@ void HandleChatCompletions(int fd, const Request& req) {
     std::lock_guard<std::mutex> engine_lock(g_engine_mu);
     LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc);
 
-    // Engine.create_conversation, with exactly the options the serve path passes.
+    // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
+    // (below).
     LiteRtLmSessionConfig* sc = L.litert_lm_session_config_create();
     if (has_sampler) {
       LiteRtLmSamplerParams* sp = L.litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
@@ -1121,7 +1130,20 @@ void HandleChatCompletions(int fd, const Request& req) {
     if (!context.empty()) L.litert_lm_conversation_config_set_messages(cc, context_str.c_str());
     std::string tools_str = tools.dump();
     if (!tools.empty()) L.litert_lm_conversation_config_set_tools(cc, tools_str.c_str());
-    L.litert_lm_conversation_config_set_enable_constrained_decoding(cc, true);
+    // Constrained decoding is for tools only: with it, a data processor that can (Gemma 3's, Gemma 4's and
+    // FunctionGemma's, with the FST constraint library) builds a constraint from the tools so that the calls the model
+    // writes fit them (Conversation::CreateDecodeConfig, runtime/conversation/conversation.cc:401-413 in LiteRT-LM
+    // 0.18.0); the others build none (Qwen3's and the generic one never do: model_data_processor.h:101-103), and
+    // without tools none is built. A response_format does not use it: its constraint comes from the provider set
+    // below (conversation.cc:397-400). The Python server turns it on for every request, as this one did, and
+    // Conversation::Create passes it to the data processor, which may refuse it: LFM2's always does
+    // ("FAILED_PRECONDITION: Constrained decoding is not supported for Lfm2DataProcessor.",
+    // lfm2_data_processor.cc:53-56), and Gemma 3's, Gemma 4's and FunctionGemma's ("INTERNAL: Failed to create
+    // GemmaModelConstraintProvider.", gemma3_data_processor.cc:146-150, gemma4_data_processor.cc:96-101 and
+    // function_gemma_data_processor.cc:219-224) when the FST constraint library rejects the model's vocabulary, as it
+    // does gemma-3-270m-it's. Every request to such a model failed with a 500 before anything was generated.
+    const bool constrain_tools = !tools.empty() && !g_engine.tools_unconstrained;
+    L.litert_lm_conversation_config_set_enable_constrained_decoding(cc, constrain_tools);
     LiteRtLmConstraintProviderType provider = kLiteRtLmConstraintProviderTypeLlGuidance;
     if (constraint) L.litert_lm_conversation_config_set_constraint_provider(cc, &provider);
     if (thinking) {
@@ -1134,9 +1156,40 @@ void HandleChatCompletions(int fd, const Request& req) {
     // after a chunk marked final (see the error branch of the drain loop below).
     auto q_owner = std::make_unique<StreamQueue>();
     StreamQueue& q = *q_owner;
-    L.litert_lm_clear_last_error();
-    std::unique_ptr<LiteRtLmConversation, ConvDeleter> conv(L.litert_lm_conversation_create(engine, cc));
+    auto create = [&] {
+      L.litert_lm_clear_last_error();
+      return std::unique_ptr<LiteRtLmConversation, ConvDeleter>(L.litert_lm_conversation_create(engine, cc));
+    };
+    std::unique_ptr<LiteRtLmConversation, ConvDeleter> conv = create();
+    if (!conv && constrain_tools) {
+      // A model that refuses it still takes tools, unconstrained: the model writes its calls freely and its data
+      // processor parses them as always, as under `litert-lm run`, which never turns it on. Whether the flag was the
+      // cause is told by creating the conversation without it, not from the message, which differs by model.
+      std::string why = LastRuntimeError();
+      L.litert_lm_conversation_config_set_enable_constrained_decoding(cc, false);
+      conv = create();
+      if (conv) {
+        g_engine.tools_unconstrained = true;
+        Log("constrained decoding is not available for " + ref.id + (why.empty() ? "" : " (" + why + ")") +
+            "; its tool calls are not constrained");
+      }
+    }
+    std::optional<std::string> provider_refused;
+    if (!conv && constraint) {
+      // A response_format needs the LLGuidance constraint provider, which Conversation::Create builds from the model's
+      // tokenizer and stop tokens (conversation.cc:433-440) and which fails for a model with no single-token stop
+      // sequence (constraint_provider_factory.cc:43-56) or a tokenizer llguidance cannot take
+      // (llg_constraint_provider.cc:127-132). If the conversation can be created without it, the request asked for
+      // what this model cannot do: a 400 that says why, not a 500.
+      std::string why = LastRuntimeError();
+      L.litert_lm_conversation_config_set_constraint_provider(cc, nullptr);
+      if (create()) provider_refused = why;
+    }
     L.litert_lm_conversation_config_delete(cc);
+    if (provider_refused) {
+      throw HttpError(400, "Invalid response_format parameters: this model cannot follow a response_format" +
+                               (provider_refused->empty() ? "" : ": " + *provider_refused));
+    }
     if (!conv) {
       std::string why = LastRuntimeError();
       throw HttpError(500, "RuntimeError: Failed to create conversation" + (why.empty() ? "" : ": " + why));
@@ -1166,6 +1219,13 @@ void HandleChatCompletions(int fd, const Request& req) {
     if (rc != 0) {
       guard.Finished(); // nothing was started
       std::string why = LastRuntimeError();
+      // A response_format whose regex or JSON schema the provider cannot compile fails here, before anything is
+      // generated: the constraint is built as the message is sent (conversation.cc:397-400), and the provider reports
+      // "Failed to create LLGuidance constraint: <why>" (llg_constraint_provider.cc:155-160), so the request is at
+      // fault: a 400, not a 500.
+      if (constraint && why.find("Failed to create LLGuidance constraint") != std::string::npos) {
+        throw HttpError(400, "Invalid response_format parameters: " + why);
+      }
       throw HttpError(500, "RuntimeError: litert_lm_conversation_send_message_stream failed" + (why.empty() ? "" : ": " + why));
     }
 
