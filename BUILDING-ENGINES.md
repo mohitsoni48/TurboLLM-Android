@@ -390,7 +390,11 @@ k, which its sampler clamps to the vocabulary; on GPU the model's vocabulary siz
 logits), and the server logs it once per model. The CPU sampler implements only TOP_P, so a
 model whose own type is TOP_K gets TOP_P with p 1. On NPU, and for an Artisan text decoder on GPU
 (which LiteRT-LM runs as GPU_ARTISAN; Gemma 4's `-gpu` bundles have one), nothing is set unless
-the request sets a field, as before: LiteRT-LM leaves sampling to the model there.
+the request sets a field, as before: LiteRT-LM leaves sampling to the model there. A `top_k` of 0
+or below means no top-k limit, as in llama.cpp (TurboLLM's Top K 0 means disabled), and one above
+0 is passed as set, on GPU too, where LiteRT-LM 0.18.0 sets no limit of its own; a `top_p`
+outside 0 to 1, a negative `temperature`, and a `top_k` or `seed` with a fraction are a 400 that
+names the field instead of the runtime's 500.
 
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++

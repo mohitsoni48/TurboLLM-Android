@@ -412,3 +412,47 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     }
   })
 }
+
+test('top_k 0 or below is no top-k limit, and a sampler value the runtime cannot take is a 400 that names it', { skip, timeout: 60_000 }, async () => {
+  const k = async (request, backend = 'cpu') => (await samplerFor(fake, { model: `${readable('sampler-topp')},${backend}`, messages: hello, ...request }))?.top_k
+  assert.equal(await k({ top_k: 0 }), NO_LIMIT)
+  assert.equal(await k({ top_k: -1, temperature: 0.7 }), NO_LIMIT)
+  assert.equal(await k({ top_k: 40.0 }), 40)
+  // On GPU no limit is the model's vocabulary, and a top_k above 0 is used as set: LiteRT-LM sets no limit there.
+  const gpu = async (request) => (await samplerFor(fake, { model: `${readable('plain-vocabulary')},gpu`, messages: hello, ...request }))?.top_k
+  assert.equal(await gpu({ top_k: 0 }), 32000)
+  assert.equal(await gpu({ top_k: 65 }), 65)
+  assert.equal(await gpu({ top_k: 100000 }), 100000)
+  const lines = await logged(fake)
+  assert.equal(lines.filter((l) => l === 'top_k 0 is no top-k limit: top_k 2147483647 for sampler-topp.litertlm (the CPU sampler takes the whole vocabulary)').length, 1, fake.stderr)
+  assert.ok(lines.includes('top_k 0 is no top-k limit: top_k 32000 for plain-vocabulary.litertlm (its vocabulary)'), fake.stderr)
+  const refused = async (request, backend = 'cpu') => {
+    const reply = await chat(fake, { model: `${readable('sampler-topp')},${backend}`, messages: hello, ...request })
+    assert.equal(reply.status, 400, JSON.stringify(request))
+    return reply.error
+  }
+  assert.equal(await refused({ top_p: 1.5 }), 'Invalid sampler parameters: ValueError: top_p must be between 0 and 1, got 1.5')
+  assert.equal(await refused({ top_p: -0.1 }), 'Invalid sampler parameters: ValueError: top_p must be between 0 and 1, got -0.1')
+  assert.equal(await refused({ temperature: -1 }), 'Invalid sampler parameters: ValueError: temperature must be at least 0, got -1')
+  assert.equal(await refused({ top_k: 2.5 }), 'Invalid sampler parameters: ValueError: top_k must be an integer, got 2.5')
+  assert.equal(await refused({ seed: 1.5 }), 'Invalid sampler parameters: ValueError: seed must be an integer, got 1.5')
+  assert.equal(await refused({ seed: 1e12 }), 'Invalid sampler parameters: ValueError: seed must be an integer, got 1000000000000')
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model takes top_k 0 and -1 as no limit, and refuses a top_p it cannot take with a 400: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = (extra) => chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Say hello.' }], max_completion_tokens: 8, ...extra }, 300_000)
+      for (const extra of [{ top_k: 0 }, { top_k: -1, temperature: 0.7 }]) {
+        const reply = await ask(extra)
+        assert.equal(reply.status, 200, `${JSON.stringify(extra)}: ${reply.error}`)
+      }
+      for (const extra of [{ top_p: 1.5 }, { temperature: -1 }]) assert.equal((await ask(extra)).status, 400, JSON.stringify(extra))
+    } finally {
+      stopServer(server)
+    }
+  })
+}

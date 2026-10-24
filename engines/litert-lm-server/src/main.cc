@@ -58,6 +58,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -1397,7 +1398,20 @@ std::optional<Sampling> SamplingFor(const json& body, const ModelFileInfo& model
   if (has("temperature")) s.temperature = body["temperature"].get<float>();
   if (has("top_p")) s.top_p = body["top_p"].get<float>();
   if (has("top_k")) {
-    s.top_k = body["top_k"].get<int>();
+    const int k = static_cast<int>(body["top_k"].get<double>());
+    if (k <= 0) {
+      s.top_k = NoTopKLimit(backend, model);
+      static std::set<std::string> told;
+      if (told.insert(model_id + "," + backend).second) {
+        const char* what = s.top_k != INT32_MAX ? " (its vocabulary)"
+                           : backend == "cpu"   ? " (the CPU sampler takes the whole vocabulary)"
+                                                : " (its vocabulary is unknown)";
+        Log("top_k " + std::to_string(k) + " is no top-k limit: top_k " + std::to_string(s.top_k) + " for " + model_id +
+            what);
+      }
+    } else {
+      s.top_k = k;  // as set, on GPU too (see NoTopKLimit)
+    }
   } else if (s.top_k == 1 && ((has("temperature") && s.temperature > 0) || (has("top_p") && s.top_p < 1))) {
     // k 1 picks the likeliest token whatever the temperature or top_p, so the request's would have no effect: the
     // model's default here is greedy decoding, and the request asks to sample. It gets no top-k limit.
@@ -1411,7 +1425,7 @@ std::optional<Sampling> SamplingFor(const json& body, const ModelFileInfo& model
     }
   }
   if (has("seed")) {
-    s.seed = body["seed"].get<int>();
+    s.seed = static_cast<int>(body["seed"].get<double>());
   } else {
     // The CPU sampler seeds std::default_random_engine (minstd_rand0) with it, which takes 0 and 1 alike, so the
     // range starts at 1; each conversation seeds its own generator (CreateNewContext).
@@ -1539,12 +1553,25 @@ void HandleChatCompletions(int fd, const Request& req) {
       max_tokens = body["max_completion_tokens"].get<int>();
     }
 
-    // openai_chat_completions.parse_sampler_config
+    // openai_chat_completions.parse_sampler_config. A value the runtime cannot take is the request's mistake, a 400 that
+    // names the field: it was a 500 with the runtime's words ("INVALID_ARGUMENT: p must be in [0, 1].", "Temperature
+    // must be >= 0"), and a top_k or seed with a fraction was cut to an integer. top_k 0 or below is no top-k limit,
+    // as in llama.cpp (TurboLLM's Top K 0 means disabled; vLLM uses -1): see SamplingFor.
     bool has_sampler = false;
     for (const char* k : {"temperature", "top_p", "top_k", "seed"}) {
       if (body.contains(k) && !body[k].is_null()) {
         if (!body[k].is_number()) {
           SendError(fd, req, 400, std::string("Invalid sampler parameters: ValueError: ") + k + " must be a number");
+          return;
+        }
+        const double v = body[k].get<double>();
+        const bool integral = std::isfinite(v) && v == std::floor(v) && v >= INT32_MIN && v <= INT32_MAX;
+        std::string why;
+        if (std::string(k) == "temperature" && !(v >= 0)) why = "temperature must be at least 0";
+        if (std::string(k) == "top_p" && !(v >= 0 && v <= 1)) why = "top_p must be between 0 and 1";
+        if ((std::string(k) == "top_k" || std::string(k) == "seed") && !integral) why = std::string(k) + " must be an integer";
+        if (!why.empty()) {
+          SendError(fd, req, 400, "Invalid sampler parameters: ValueError: " + why + ", got " + body[k].dump());
           return;
         }
         has_sampler = true;
