@@ -1,7 +1,7 @@
 // Tests which conversations the LiteRT-LM server asks the runtime for, and what it answers when one cannot be made
 // (src/main.cc, HandleChatCompletions):
 //   node --test engines/litert-lm-server/constrained-decoding.test.mjs
-// The server is built for this machine with c++, as in parent-death.test.mjs, and runs against
+// The server is built for this machine with c++, as in parent-death.test.mjs (testdata/harness.mjs), and runs against
 // testdata/fake_litert_lm.cc, a stand-in liblitert-lm.so that answers the conversation calls as LiteRT-LM 0.18.0 does
 // for an LFM2 model, for Gemma models and for a few failures, and whose reply says how its conversation was created.
 // Linux only, like that test, and skipped without a C and a C++ compiler. Building takes a few seconds.
@@ -15,39 +15,21 @@
 // bounded (the compiler check, the build, a server's start, each request, each test), so a server that hangs fails the
 // test by name instead of holding the run.
 import assert from 'node:assert/strict'
-import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:net'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { buildServer, chat, killServers, logged, realLibrary, realModels, skip, skipReal, startServer, stopServer } from './testdata/harness.mjs'
 
-const root = fileURLToPath(new URL('.', import.meta.url))
 const work = mkdtempSync(join(tmpdir(), 'litert-lm-server-cd-test-'))
-const servers = []
 // What before() is still doing. With a --test-name-pattern that leaves no test in this file, node runs after() while
 // before() is starting the server, and removing `work` under it failed the file (spawn ... ENOENT); so after() waits.
 let ready = Promise.resolve()
 after(async () => {
   await ready.catch(() => {})
-  for (const s of servers) {
-    try {
-      process.kill(s.pid, 'SIGKILL')
-    } catch {}
-  }
+  killServers()
   rmSync(work, { recursive: true, force: true })
 })
-
-// A compiler that does not answer in 10 s counts as missing (the timeout sets .error), so the file skips cleanly.
-const missing = ['cc', 'c++'].filter((c) => spawnSync(c, ['--version'], { stdio: 'ignore', timeout: 10_000 }).error)
-const skip = process.platform !== 'linux' ? 'the server is tested on Linux only'
-  : missing.length ? `no ${missing.join(' or ')} on this machine` : false
-const realLibrary = process.env.LITERT_LM_TEST_LIBRARY
-const realModels = (process.env.LITERT_LM_TEST_MODELS ?? '').split(',').filter(Boolean)
-const skipReal = skip || (!realLibrary || !realModels.length
-  ? 'set LITERT_LM_TEST_LIBRARY and LITERT_LM_TEST_MODELS to run the server on real models' : false)
-const binary = join(work, 'litertlm_server')
 
 // One file per kind of model the stand-in knows (see testdata/fake_litert_lm.cc); it reads only the name. None starts
 // with "LITERTLM", so the server leaves it to the runtime.
@@ -57,124 +39,15 @@ const model = (kind) => {
   return path
 }
 
+let binary
 let fake
 
 before(() => (ready = (async () => {
   if (skip) return
-  // The stand-in: testdata/fake_litert_lm.cc, and every other function the server resolves (src/litert_lm_api.h) as
-  // one that does nothing.
-  const header = readFileSync(join(root, 'src', 'litert_lm_api.h'), 'utf8')
-  const names = [...header.matchAll(/^\s*X\((\w+)\)/gm)].map((m) => m[1])
-  assert.ok(names.length > 40, 'the C API list in litert_lm_api.h was not found')
-  const source = readFileSync(join(root, 'testdata', 'fake_litert_lm.cc'), 'utf8')
-  const defined = new Set([...source.matchAll(/^\S.*?\b(litert_lm_\w+)\(/gm)].map((m) => m[1]))
-  writeFileSync(join(work, 'rest.c'), names.filter((n) => !defined.has(n)).map((n) => `void ${n}(void) {}\n`).join(''))
-  // Each build is bounded by itself: spawnSync holds the event loop, so the hook's own timeout cannot end one.
-  const cxx = (args) => {
-    const r = spawnSync('c++', args, { encoding: 'utf8', timeout: 120_000 })
-    assert.equal(r.status, 0, r.error ? `c++: ${r.error.message}` : r.stderr)
-  }
-  cxx([
-    '-std=c++17', '-shared', '-fPIC', '-x', 'c++', join(root, 'testdata', 'fake_litert_lm.cc'), '-x', 'c', join(work, 'rest.c'),
-    '-I', join(root, 'third_party', 'litert_lm'), '-o', join(work, 'liblitert-lm.so'),
-  ])
-  cxx([
-    '-std=c++17', '-O0', '-w', '-I', join(root, 'third_party', 'litert_lm'), '-I', join(root, 'third_party'),
-    '-DLITERT_LM_VERSION="test"', join(root, 'src', 'main.cc'), join(root, 'src', 'litert_lm_api.cc'),
-    '-ldl', '-pthread', '-o', binary,
-  ])
-  // Beside the server, where LoadLiteRtLm looks first after LITERT_LM_LIBRARY. --verbose for logged() below.
-  fake = await startServer({ ...process.env, LITERT_LM_LIBRARY: '' }, ['--verbose'])
+  binary = buildServer(work)
+  // --verbose for logged().
+  fake = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: '' }, ['--verbose'])
 })()), { timeout: 300_000 })
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const s = createServer().once('error', reject)
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address()
-      s.close(() => resolve(port))
-    })
-  })
-}
-
-async function startServer(env, args = []) {
-  const port = await freePort()
-  const child = spawn(binary, ['serve', '--host', '127.0.0.1', '--port', String(port), ...args], { env, stdio: ['ignore', 'ignore', 'pipe'] })
-  servers.push(child)
-  const server = { port, stderr: '', child }
-  child.stderr.setEncoding('utf8')
-  child.stderr.on('data', (d) => { server.stderr += d })
-  await new Promise((resolve, reject) => {
-    // It logs this before it loads any model, so 30 s is plenty; the server is killed when the tests end.
-    const timer = setTimeout(() => reject(new Error(`the server did not start in 30 s: ${server.stderr}`)), 30_000)
-    const onData = () => {
-      if (server.stderr.includes('Starting OpenAI-compatible API server')) {
-        clearTimeout(timer)
-        resolve()
-      }
-    }
-    child.stderr.on('data', onData)
-    child.once('exit', (code) => {
-      clearTimeout(timer)
-      reject(new Error(`the server exited ${code}: ${server.stderr}`))
-    })
-  })
-  return server
-}
-
-// fetch, bounded: without a signal undici waits 300 s for a reply's headers and then says only "fetch failed".
-async function request(url, init, ms) {
-  const signal = AbortSignal.timeout(ms)
-  try {
-    const res = await fetch(url, { ...init, signal })
-    return { status: res.status, text: await res.text() }
-  } catch (err) {
-    if (!signal.aborted) throw err
-    throw new Error(`${init?.method ?? 'GET'} ${url} ${init?.body ?? ''}: no reply in ${ms / 1000} s`)
-  }
-}
-
-// A stand-in answers at once; the real-model test gives each request longer, since a model loads on its first one.
-async function chat(server, body, ms = 30_000) {
-  const res = await request(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  }, ms)
-  const text = res.text
-  if (body.stream && res.status === 200) {
-    const events = text.split('\n\n').filter((e) => e.startsWith('data: ')).map((e) => e.slice(6))
-    assert.equal(events.at(-1), '[DONE]', text)
-    const chunks = events.slice(0, -1).map((e) => JSON.parse(e))
-    return {
-      status: res.status,
-      content: chunks.map((c) => c.choices[0]?.delta?.content ?? '').join(''),
-      reasoning: chunks.map((c) => c.choices[0]?.delta?.reasoning_content ?? '').join(''),
-      finish: chunks.at(-1).choices[0].finish_reason,
-    }
-  }
-  const json = JSON.parse(text)
-  if (res.status !== 200) return { status: res.status, error: json.error.message }
-  return {
-    status: res.status,
-    content: json.choices[0].message.content ?? '',
-    reasoning: json.choices[0].message.reasoning_content ?? '',
-    tool_calls: json.choices[0].message.tool_calls,
-    finish: json.choices[0].finish_reason,
-  }
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-// What the server has logged, all of it up to now: a reply can arrive before the lines logged while it was made. With
-// --verbose the server logs each request as it reads it, so once a GET /health made now shows up, all are in.
-async function logged(server) {
-  const marks = () => server.stderr.split('\n').filter((l) => l === 'GET /health').length
-  const seen = marks()
-  assert.equal((await request(`http://127.0.0.1:${server.port}/health`, undefined, 5000)).status, 200)
-  for (const end = Date.now() + 5000; marks() === seen && Date.now() < end;) await sleep(10)
-  assert.ok(marks() > seen, 'the server did not log GET /health')
-  return server.stderr.split('\n')
-}
 
 // The stand-in's reply: how the conversation was created and sent, and how many conversations the process has created.
 function created(reply) {
@@ -282,7 +155,7 @@ for (const path of realModels.length ? realModels : ['<model>']) {
     // No compiled-model cache: by default the runtime writes one beside the model, as large as the model.
     const config = join(work, 'no-cache.json')
     writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
-    const real = await startServer({ ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    const real = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
     try {
       const ms = 300_000 // per request: the first one loads the model
       const ref = `${path},cpu`
@@ -301,10 +174,7 @@ for (const path of realModels.length ? realModels : ['<model>']) {
       assert.equal(badRegex.status, 400)
       assert.match(badRegex.error, /^Invalid response_format parameters: INTERNAL: Failed to create LLGuidance constraint: /)
     } finally {
-      // This model's server goes now, not when the file ends: each one holds its model in memory.
-      try {
-        process.kill(real.child.pid, 'SIGKILL')
-      } catch {}
+      stopServer(real) // now, not when the file ends: each one holds its model in memory
     }
   })
 }

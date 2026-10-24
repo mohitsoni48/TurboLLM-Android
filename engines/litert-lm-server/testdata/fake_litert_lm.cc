@@ -15,12 +15,19 @@
 // "constrained=1 tools=1 provider=0 constraint=0 creates=3", where creates counts every litert_lm_conversation_create
 // call in the process. A regex that does not compile fails the send as llguidance does
 // (llg_constraint_provider.cc:155-160).
+//
+// With FAKE_LITERT_LM_CALLS set to a file, the calls that say what the server asked the runtime for are appended to it,
+// one JSON object per line ({"call": "<function without litert_lm_>", ...its arguments}), for
+// model-settings.test.mjs to read.
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 
 #include "c/conversation.h"
 #include "c/engine.h"
 #include "c/error_reporter.h"
+#include "nlohmann/json.hpp"
 
 struct LiteRtLmEngineSettings {
   std::string model;
@@ -50,6 +57,17 @@ namespace {
 std::string g_error;
 int g_creates = 0;
 
+void Record(const nlohmann::json& call) {
+  static std::mutex mu;
+  const char* path = std::getenv("FAKE_LITERT_LM_CALLS");
+  if (!path || !*path) return;
+  std::lock_guard<std::mutex> lock(mu);
+  if (FILE* f = std::fopen(path, "a")) {
+    std::fputs((call.dump() + "\n").c_str(), f);
+    std::fclose(f);
+  }
+}
+
 bool Is(const std::string& model, const char* kind) { return model.rfind(kind, 0) == 0; }
 
 std::string Basename(const char* path) {
@@ -68,7 +86,10 @@ LiteRtLmEngineSettings* litert_lm_engine_settings_create(const char* model_path,
   return new LiteRtLmEngineSettings{Basename(model_path)};
 }
 void litert_lm_engine_settings_delete(LiteRtLmEngineSettings* s) { delete s; }
-LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* s) { return new LiteRtLmEngine{s->model}; }
+LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* s) {
+  Record({{"call", "engine_create"}, {"model", s->model}});
+  return new LiteRtLmEngine{s->model};
+}
 void litert_lm_engine_delete(LiteRtLmEngine* e) { delete e; }
 
 LiteRtLmSessionConfig* litert_lm_session_config_create() { return new LiteRtLmSessionConfig; }

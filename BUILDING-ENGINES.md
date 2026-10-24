@@ -348,6 +348,26 @@ checks this against a stand-in `liblitert-lm.so` that answers as 0.18.0 does for
 and on real models when `LITERT_LM_TEST_LIBRARY` and `LITERT_LM_TEST_MODELS` are set (see the
 file).
 
+**A model whose decoder keeps a recurrent state gets a new engine for each conversation after
+the first.** LiteRT-LM 0.18.0 starts every new conversation on an engine at step 0 with the
+executor's buffers as the last one left them: right for a KV cache, whose entries past the step
+are masked, but not for LFM2's short-convolution cache, which is read as it is, so each chat
+turn (each is a new request, and the daemon's title, memory and compaction requests come in
+between) began from the end of the one before (LiteRT-LM #3165). The server tells such a model
+by its own header: LlmMetadata's model type is LFM2, or ExecutorMetadata declares a
+linear-attention state or LFM2's `kv_cache_c_*` caches (files packed as `generic_model` declare
+those too). The C API cannot reset that state, so the engine is created again with the same
+settings: 0.13 to 0.17 s per conversation for LFM2.5-230M on a 4-core x86-64 CPU with the
+compiled-model cache, 0.9 s without it, and about 1.5 s for LFM2.5-VL-450M with the cache (its
+decoder, not its vision encoder, takes that long); GPU unmeasured. The daemon's title, memory
+and compaction requests are conversations too, and each pays it. Sending a request that only
+extends the previous conversation to that conversation instead is not done: LiteRT-LM's own
+multi-turn continuation does not prefill the tokens a fresh render of the same history does
+(other token counts, other replies, for Gemma models too), so it would change what the model
+answers. `node --test engines/litert-lm-server/model-settings.test.mjs` checks which models get
+a new engine against the stand-in library, and on real models (see the file) that a
+conversation's reply does not depend on the ones before it.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

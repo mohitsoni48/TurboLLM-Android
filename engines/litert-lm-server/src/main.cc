@@ -31,6 +31,8 @@
 //   - Constrained decoding only for requests with tools, and none for a model that refuses it, so
 //     LFM2 models answer at all (the Python server fails every request to one). A response_format
 //     the model cannot follow, or whose regex or schema cannot be compiled, is a 400, not a 500.
+//   - A new engine for each conversation of a model whose decoder keeps a recurrent state (LFM2), which the runtime
+//     would otherwise carry from one conversation into the next (see GetOrCreateEngine).
 //
 // Not translated: /v1/responses, /v1/embeddings and the Gemini API (TurboLLM uses none of them
 // with this engine), and image URLs other than base64 data: URLs (remote URLs, and local paths, which the Python
@@ -67,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -275,6 +278,137 @@ ModelRef ParseModelParameter(const std::string& raw) {
   return ref;
 }
 
+// ── What the model file says about itself ─────────────────────────────────────────────────
+// After the 32-byte preamble a .litertlm has a FlatBuffer header (schema/core/litertlm_header_schema.fbs in LiteRT-LM
+// 0.18.0) that lists its sections with their byte ranges in the file. Two are small protobufs the runtime reads at load:
+// LlmMetadata (runtime/proto/llm_metadata.proto) and ExecutorMetadata (executor_metadata.proto).
+
+struct ModelFileInfo {
+  // The decoder keeps a recurrent state besides its KV cache: LFM2's short-convolution cache (the kv_cache_c_* inputs),
+  // or any linear-attention state. See GetOrCreateEngine for why that matters.
+  bool recurrent_state = false;
+};
+
+// Bounds-checked reads of a FlatBuffer: just what the header's section list needs. Little-endian, as are the
+// FlatBuffer format and every ABI the server is built for.
+struct FbReader {
+  const std::string& b;
+  template <class T>
+  std::optional<T> Get(uint64_t pos) const {
+    if (pos > b.size() || sizeof(T) > b.size() - pos) return std::nullopt;
+    T v;
+    std::memcpy(&v, b.data() + pos, sizeof v);
+    return v;
+  }
+  // Where field i of the table at `table` is, or 0 when the table does not have it.
+  uint64_t Field(uint64_t table, int i) const {
+    auto back = Get<int32_t>(table);
+    if (!back || static_cast<int64_t>(table) - *back < 0) return 0;
+    uint64_t vtable = static_cast<uint64_t>(static_cast<int64_t>(table) - *back);
+    auto vsize = Get<uint16_t>(vtable);
+    if (!vsize || 4u + 2u * i + 2u > *vsize) return 0;
+    auto at = Get<uint16_t>(vtable + 4 + 2 * i);
+    return at && *at ? table + *at : 0;
+  }
+  // The table or vector a uoffset at `pos` points to, or 0.
+  uint64_t Follow(uint64_t pos) const {
+    auto off = pos ? Get<uint32_t>(pos) : std::nullopt;
+    return off && *off ? pos + *off : 0;
+  }
+};
+
+// Calls f(field number, varint value, bytes) for each top-level field of a protobuf message: the varint for wire type
+// 0, the bytes for wire type 2; fixed-width fields are skipped. False when the message is malformed.
+template <class F>
+bool ForEachProtoField(const std::string& m, F f) {
+  size_t i = 0;
+  auto varint = [&](uint64_t& v) {
+    v = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+      if (i >= m.size()) return false;
+      unsigned char c = static_cast<unsigned char>(m[i++]);
+      v |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (c < 0x80) return true;
+    }
+    return false;
+  };
+  while (i < m.size()) {
+    uint64_t key, v;
+    if (!varint(key)) return false;
+    const int field = static_cast<int>(key >> 3);
+    switch (key & 7) {
+      case 0:
+        if (!varint(v)) return false;
+        f(field, v, std::string());
+        break;
+      case 2:
+        if (!varint(v) || v > m.size() - i) return false;
+        f(field, 0, m.substr(i, v));
+        i += v;
+        break;
+      case 1:
+        i += 8;
+        break;
+      case 5:
+        i += 4;
+        break;
+      default:
+        return false;
+    }
+    if (i > m.size()) return false;
+  }
+  return true;
+}
+
+// LlmMetadata names the model type LFM2 (llm_model_type, field 6, with its lfm2 member, field 11), or ExecutorMetadata
+// declares a state buffer that is a linear-attention state (StateBuffer.type 5) or LFM2's conv cache (kv_cache_c_*,
+// which the runtime keeps among its KV buffers: GetKVCacheRootNames in litert_compiled_model_executor_utils.cc). The
+// type alone misses files packed with generic_model, as litert-community's LFM2.5-230M was before 2026-10-14 and a
+// third-party LFM2.5-VL-3B is; their ExecutorMetadata still declares the conv caches.
+bool HasRecurrentState(int section_type, const std::string& proto) {
+  bool found = false;
+  if (section_type == 5) {  // LlmMetadataProto
+    ForEachProtoField(proto, [&](int field, uint64_t, const std::string& type) {
+      if (field == 6) ForEachProtoField(type, [&](int member, uint64_t, const std::string&) { found |= member == 11; });
+    });
+  } else if (section_type == 9) {  // ExecutorMetadataProto
+    ForEachProtoField(proto, [&](int field, uint64_t, const std::string& llm) {
+      if (field != 1) return;
+      ForEachProtoField(llm, [&](int field, uint64_t, const std::string& buffer) {
+        if (field != 2) return;  // state_buffers
+        ForEachProtoField(buffer, [&](int field, uint64_t v, const std::string& name) {
+          found |= (field == 6 && v == 5) || ((field == 1 || field == 3) && name.rfind("kv_cache_c_", 0) == 0);
+        });
+      });
+    });
+  }
+  return found;
+}
+
+// `header` is the file's bytes from 32 to the header's end. A header or section this cannot read says nothing.
+ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
+  ModelFileInfo info;
+  FbReader fb{header};
+  const uint64_t root = fb.Get<uint32_t>(0).value_or(0);  // the root table's uoffset, from 0
+  const uint64_t sections = fb.Follow(fb.Field(fb.Follow(fb.Field(root, 1)), 0));  // section_metadata.objects
+  const uint32_t n = sections ? fb.Get<uint32_t>(sections).value_or(0) : 0;
+  for (uint32_t k = 0; k < n && k < 4096; ++k) {
+    const uint64_t s = fb.Follow(sections + 4 + 4ull * k);
+    const uint64_t at_begin = fb.Field(s, 1), at_end = fb.Field(s, 2), at_type = fb.Field(s, 3);
+    if (!s || !at_begin || !at_end || !at_type) continue;
+    const int type = fb.Get<uint8_t>(at_type).value_or(0);
+    const uint64_t begin = fb.Get<uint64_t>(at_begin).value_or(0), end = fb.Get<uint64_t>(at_end).value_or(0);
+    if ((type != 5 && type != 9) || end <= begin || end - begin > (1u << 20)) continue;
+    std::string proto(end - begin, '\0');
+    in.clear();
+    if (!in.seekg(static_cast<std::streamoff>(begin)) || !in.read(&proto[0], static_cast<std::streamsize>(proto.size()))) {
+      continue;
+    }
+    info.recurrent_state |= HasRecurrentState(type, proto);
+  }
+  return info;
+}
+
 // ── Engine lifetime (util.get_or_initialize_server_engine) ─────────────────────────────────
 
 struct EngineKey {
@@ -294,6 +428,10 @@ struct EngineHolder {
   // it was created: its data processor cannot constrain tool calls (see HandleChatCompletions), so its later requests
   // with tools are created without it at once. Cleared when another engine is loaded.
   bool tools_unconstrained = false;
+  // The model's decoder keeps a recurrent state (ModelFileInfo), and a message has been sent on this engine since it
+  // was created, so that state is no longer the initial one.
+  bool recurrent_state = false;
+  bool state_used = false;
 };
 
 std::mutex g_engine_mu;  // held for the whole of every inference: the engine is one shared resource
@@ -354,7 +492,17 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
     throw HttpError(500, "Failed to load engine: ValueError(\"Unsupported backend: '" + key.backend + "'\")");
   }
 
-  if (g_engine.engine && g_engine.key == key) return g_engine.engine;
+  // A model whose decoder keeps a recurrent state gets a new engine for every conversation after the first. LiteRT-LM
+  // 0.18.0 starts each new conversation on an engine at step 0 and keeps the executor's buffers as they are there
+  // (RestoreContext in llm_litert_compiled_model_executor.cc), which is right for a KV cache, whose entries past the
+  // step are masked, but not for LFM2's short-convolution cache: it is read as it is, so every conversation after the
+  // first began from the end of the one before. On one engine LFM2.5-230M answered [system "Answer in one word.",
+  // user "What is the capital of France?", assistant "Paris", user "And of Italy?"] with "Paris is the capital of
+  // France." after that same question's first turn and a title request, and with "The capital of Italy is **Rome**."
+  // on a fresh one (LiteRT-LM #3165; the model card says to create a new Engine for each conversation). The C API has
+  // no way to reset that state, so the engine is created again, with the same settings.
+  const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.recurrent_state && g_engine.state_used;
+  if (g_engine.engine && g_engine.key == key && !fresh_state) return g_engine.engine;
   // A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end
   // offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32
   // bytes before reading the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate,
@@ -363,7 +511,8 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   // offset can never load, yet would still cost an allocation up to the file's size (hundreds of MB on a phone).
   // Checked before the loaded engine is released, which a bad file then leaves in place.
   // A file that can't be read or lacks the magic is left to the runtime, which reports it cleanly and more precisely
-  // (e.g. "Permission denied").
+  // (e.g. "Permission denied"). A header that passes is read for ModelFileInfo.
+  ModelFileInfo info;
   {
     struct stat st {};
     unsigned char h[32] = {};
@@ -377,8 +526,19 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
       throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
                                ": invalid .litertlm header')");
     }
+    if (ok) {
+      std::string header(header_end - 32, '\0');
+      if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) info = ReadModelFileInfo(in, header);
+    }
   }
-  if (g_engine.engine) {
+  if (fresh_state) {
+    static std::set<std::string> told;  // once per model file, not per conversation
+    if (told.insert(ref.path).second) {
+      Log(ref.id + " keeps a recurrent state that LiteRT-LM carries from one conversation to the next on an engine; "
+                   "its engine is created again for each conversation");
+    }
+    ReleaseEngine();
+  } else if (g_engine.engine) {
     Log("Re-initializing engine (model: " + ref.id + ", backend: " + key.backend + ")");
     ReleaseEngine();
   }
@@ -409,7 +569,10 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc) {
   }
   g_engine.engine = e;
   g_engine.key = key;
-  g_engine.tools_unconstrained = false;
+  // The same model and settings again: what was found out about the model still holds.
+  if (!fresh_state) g_engine.tools_unconstrained = false;
+  g_engine.recurrent_state = info.recurrent_state;
+  g_engine.state_used = false;
   g_engine.init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   Log("Engine ready in " + std::to_string(g_engine.init_seconds) + " s");
   return e;
@@ -1212,6 +1375,7 @@ void HandleChatCompletions(int fd, const Request& req) {
 
     std::string msg_str = prompt.dump();
     L.litert_lm_clear_last_error();
+    g_engine.state_used = true;  // even a send that fails may have prefilled part of the message
     int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), "{}", oa, StreamCallback, &q);
     L.litert_lm_conversation_optional_args_delete(oa);
     // Declared after the queue and the conversation, so it runs before either is destroyed.
