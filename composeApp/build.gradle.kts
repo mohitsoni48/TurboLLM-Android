@@ -395,7 +395,9 @@ tasks.matching { it.name == "generateReleasePlayResources" }.configureEach {
 // through whenever Gradle skipped straight to the merge.
 //
 // The staged directory is gitignored build output; the script rebuilds the daemon bundle each
-// time (~200 ms) so the APK can never ship a daemon older than the source.
+// time (~200 ms) so the APK can never ship a daemon older than the source, and the web UI
+// whenever turbollm/web is not what it was last built from, so it never ships an older web UI
+// either (a web build takes 40-55 s; checking costs a hash of web/, under 50 ms).
 val stagedDaemonAssets = layout.projectDirectory.dir("src/androidMain/assets/daemon")
 
 val stageDaemonAssets by tasks.registering(Exec::class) {
