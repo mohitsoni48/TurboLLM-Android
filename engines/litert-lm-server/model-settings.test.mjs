@@ -22,8 +22,8 @@ import { basename, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { after, before, test } from 'node:test'
 import {
-  buildServer, calls, chat, fb, flatbuffer, killServers, litertlmFile, logged, proto, realLibrary, realModels, skip,
-  skipReal, startServer, stopServer,
+  buildServer, calls, chat, fb, flatbuffer, killServers, litertlmFile, logged, proto, realLibrary, realModels, request,
+  skip, skipReal, startServer, stopServer,
 } from './testdata/harness.mjs'
 
 const visionModels = (process.env.LITERT_LM_TEST_VISION_MODELS ?? '').split(',').filter(Boolean)
@@ -790,6 +790,119 @@ for (const path of realModels.length ? realModels : ['<model>']) {
         assert.equal(reply.tool_calls, undefined, `called ${JSON.stringify(reply.tool_calls)}`)
         assert.ok(reply.content, 'no answer')
       }
+    } finally {
+      stopServer(server)
+    }
+  })
+}
+
+// The loaded model's entry on /v1/models.
+async function modelsEntry(server) {
+  const res = await request(`http://127.0.0.1:${server.port}/v1/models`, undefined, 5000)
+  assert.equal(res.status, 200)
+  return JSON.parse(res.text).data[0]
+}
+
+// LlmMetadata's max_num_tokens (field 5), the model's context, which a prime above 10 marks as dynamic; and a main
+// model whose LlmMetadata gives none, from whose prefill signature's "mask" input, [1, 1, 32, context], LiteRT-LM
+// reads it instead (gemma-3-270m-it's is read so).
+const contextMetadata = (n, ...more) => ({ type: 5, bytes: Buffer.concat([proto.varint(5, n), ...more]) })
+const decoderWithMask = (context) => ({
+  ...decoder,
+  bytes: flatbuffer(fb.table([undefined, undefined, fb.vector([fb.table([fb.vector([fb.table([fb.ints([1, 32])]), fb.table([fb.ints([1, 1, 32, context])])])])]),
+    undefined, undefined, undefined, undefined,
+    fb.vector([fb.table([fb.vector([fb.table(['tokens', fb.u32(0)]), fb.table(['mask', fb.u32(1)])]), undefined, 'prefill_32', undefined, fb.u32(0)])])])),
+})
+Object.assign(kinds, {
+  ctx4096: [decoder, contextMetadata(4096)],
+  ctx8192: [decoder, contextMetadata(8192)],
+  dyn32k: [decoder, contextMetadata(32771)],
+  dyn251: [decoder, contextMetadata(251)],
+  'ctx-prefill': [decoderWithMask(2048)],
+  'ctx-prefill-8k': [decoderWithMask(8192)],
+  'ctx4096-lfm2': [decoder, contextMetadata(4096, proto.field(6, proto.field(LFM2, [])))],
+})
+
+test('a context larger than the model takes is cut to the model\'s, logged and reported, never silently', { skip, timeout: 60_000 }, async () => {
+  const fixed = readable('ctx4096')
+  const window = async (ref) => {
+    let reply
+    const log = await callsDuring(async () => {
+      reply = await chat(fake, { model: ref, messages: hello })
+      assert.equal(reply.status, 200, reply.error)
+    })
+    const set = log.filter((c) => c.call === 'engine_settings_set_max_num_tokens').map((c) => c.max_num_tokens)
+    const entry = await modelsEntry(fake)
+    return {
+      set,
+      header: reply.headers.get('x-context-window'),
+      asked: reply.headers.get('x-context-window-requested'),
+      max_model_len: entry.max_model_len,
+      max_model_len_requested: entry.max_model_len_requested,
+    }
+  }
+  assert.deepEqual(await window(`${fixed},cpu,8192`), { set: [4096], header: '4096', asked: '8192', max_model_len: 4096, max_model_len_requested: 8192 })
+  assert.deepEqual(await window(`${fixed},cpu,2048`), { set: [2048], header: '2048', asked: null, max_model_len: 2048, max_model_len_requested: undefined })
+  assert.deepEqual(await window(`${fixed},cpu`), { set: [], header: '4096', asked: null, max_model_len: 4096, max_model_len_requested: undefined })
+  // A dynamic context (a magic number, 32771) is made for the size asked when it is less, and for LiteRT-LM's default
+  // for it otherwise, the largest multiple of 256 below it (32768), with none asked too; below 256, a power of two.
+  const dynamic = readable('dyn32k')
+  assert.deepEqual(await window(`${dynamic},cpu,65536`), { set: [32768], header: '32768', asked: '65536', max_model_len: 32768, max_model_len_requested: 65536 })
+  assert.deepEqual(await window(`${dynamic},cpu,32771`), { set: [32768], header: '32768', asked: '32771', max_model_len: 32768, max_model_len_requested: 32771 })
+  assert.deepEqual(await window(`${dynamic},cpu,32770`), { set: [32770], header: '32770', asked: null, max_model_len: 32770, max_model_len_requested: undefined })
+  assert.deepEqual(await window(`${dynamic},cpu`), { set: [], header: '32768', asked: null, max_model_len: 32768, max_model_len_requested: undefined })
+  assert.equal((await window(`${readable('dyn251')},cpu`)).header, '128')
+  // With none asked, on GPU no more than 4096, as LiteRT-LM sets it there.
+  assert.deepEqual(await window(`${readable('ctx8192')},cpu`), { set: [], header: '8192', asked: null, max_model_len: 8192, max_model_len_requested: undefined })
+  assert.deepEqual(await window(`${readable('ctx8192')},gpu`), { set: [], header: '4096', asked: null, max_model_len: 4096, max_model_len_requested: undefined })
+  assert.equal((await window(`${readable('ctx8192')},gpu,8192`)).header, '8192')
+  assert.equal((await window(`${dynamic},gpu`)).header, '4096')
+  // From the prefill signature, for a file whose LlmMetadata gives none; with none asked, LiteRT-LM gives such a file
+  // 4096 at most.
+  assert.deepEqual(await window(`${readable('ctx-prefill')},cpu,8192`), { set: [2048], header: '2048', asked: '8192', max_model_len: 2048, max_model_len_requested: 8192 })
+  assert.equal((await window(`${readable('ctx-prefill')},cpu`)).header, '2048')
+  assert.equal((await window(`${readable('ctx-prefill-8k')},cpu`)).header, '4096')
+  assert.equal((await window(`${readable('ctx-prefill-8k')},cpu,8192`)).header, '8192')
+  // A model that gets a new engine for each conversation (an LFM2 one) is told about once, not once per engine.
+  for (let i = 0; i < 3; i++) assert.equal((await window(`${readable('ctx4096-lfm2')},cpu,8192`)).header, '4096')
+  const lines = await logged(fake)
+  assert.ok(lines.includes('max_num_tokens 8192 is more than ctx4096.litertlm takes (its fixed context is 4096 tokens); its context window is 4096'), fake.stderr)
+  assert.ok(lines.includes('max_num_tokens 65536 is more than dyn32k.litertlm takes (its dynamic context takes fewer than 32771 tokens); its context window is 32768'), fake.stderr)
+  assert.equal(lines.filter((l) => l.startsWith('max_num_tokens 8192 is more than ctx4096-lfm2.litertlm takes')).length, 1, fake.stderr)
+  // A stream says it in its headers too.
+  const streamed = await chat(fake, { model: `${fixed},cpu,8192`, messages: hello, stream: true })
+  assert.equal(streamed.headers.get('x-context-window'), '4096')
+  assert.equal(streamed.headers.get('x-context-window-requested'), '8192')
+})
+
+test('a prompt that does not fit the context window is a 400 that says the window', { skip, timeout: 60_000 }, async () => {
+  const reply = await chat(fake, { model: `${readable('ctx4096')},cpu`, messages: [{ role: 'user', content: 'too long' }] })
+  assert.deepEqual(reply, { status: 400, error: "Invalid messages: the prompt does not fit the model's context window of 4096 tokens " +
+    '(INVALID_ARGUMENT: Input token ids are too long. Exceeding the maximum number of tokens allowed: 4209 >= 4096)' })
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model's context window is its own when more is asked, and a reply that fills it ends with "length": ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      // Ask for 64k, more than the static files here take, and a reply long enough to fill what they do.
+      const numbers = Array.from({ length: 700 }, (_, i) => i + 1).join(', ')
+      const reply = await chat(server, { model: `${path},cpu,65536`, messages: [{ role: 'user', content: `Continue this list forever: ${numbers}` }], max_completion_tokens: 60000, temperature: 0, reasoning_effort: 'none' }, 600_000)
+      assert.equal(reply.status, 200, reply.error)
+      const window = Number(reply.headers.get('x-context-window'))
+      assert.ok(window > 0 && window < 65536, `window ${window}`)
+      assert.equal(reply.headers.get('x-context-window-requested'), '65536')
+      const entry = await modelsEntry(server)
+      assert.equal(entry.max_model_len, window)
+      assert.equal(entry.max_model_len_requested, 65536)
+      // A reply cut off by the window reads "length" (a model that stops on its own first reads "stop").
+      assert.ok(!(reply.finish === 'stop' && reply.usage.total_tokens >= window), `${reply.usage.total_tokens} tokens of ${window}, "stop"`)
+      const long = Array.from({ length: window + 100 }, () => 'word').join(' ')
+      const tooLong = await chat(server, { model: `${path},cpu,65536`, messages: [{ role: 'user', content: long }], max_completion_tokens: 8 }, 300_000)
+      assert.equal(tooLong.status, 400, tooLong.error)
+      assert.match(tooLong.error, new RegExp(`^Invalid messages: the prompt does not fit the model's context window of ${window} tokens`))
     } finally {
       stopServer(server)
     }

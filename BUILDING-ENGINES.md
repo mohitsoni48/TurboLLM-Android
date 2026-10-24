@@ -436,6 +436,21 @@ a model call a tool (constrained decoding keeps a call well formed; Gemma's "fun
 mode comes from the model file), so `tool_choice` "required" or a named function is a 400 that
 says so.
 
+**A context larger than the model takes is cut to the model's, and said.** The runtime used the
+model's own limit with only a warning in its log (LFM2.5-230M has a fixed 4096), and "length"
+was judged against the size asked for. Now the engine is given the model's limit (its
+LlmMetadata's `max_num_tokens`, or where that is missing, as in gemma-3-270m-it, the size of its
+prefill signature's mask, which is where LiteRT-LM reads it), the server logs that once per
+model and size asked, and it reports the window in each chat reply's `X-Context-Window` header
+and as `max_model_len` on `/v1/models`, with `X-Context-Window-Requested` and
+`max_model_len_requested` when more was asked. That window is the one LiteRT-LM gives the
+engine, worked out as it does: with no size asked for, the model's own, but 4096 for a file that
+gives none and on GPU no more than 4096; for a model with a dynamic context (a prime above 10,
+its magic number), the size asked when it is below that number, and otherwise LiteRT-LM's
+default for it, the largest multiple of 256 below it (below 256, the largest power of two), also
+with none asked. A prompt that does not fit the window is a 400 that names its size; in a
+stream, already answered 200, it is the `response.error` event, with the same words.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

@@ -24,7 +24,7 @@
 //     benchmark counters, so speed is measured rather than derived from time-to-first-token.
 //   - Thinking-channel text streamed as `reasoning_content` instead of being dropped.
 //   - "length" as the finish reason when the reply is cut off: by max_completion_tokens, or by the
-//     context window when the model reference or the config sets its size (max_num_tokens).
+//     context window LiteRT-LM gives the engine, which each reply's X-Context-Window header names.
 //   - A client that disconnects cancels its generation instead of letting it run on.
 //   - Requests are served concurrently; only inference itself is serialized (the engine is one
 //     shared resource, exactly as in the Python server, which serialized everything).
@@ -314,6 +314,11 @@ struct ModelFileInfo {
   // whether it has a channel, the thinking one being the first (Conversation::CreateDecodeConfig).
   std::optional<bool> supports_thinking;
   bool thinking_switch = false, channel = false;
+  // The context the file takes, as the C API's litert_lm_loaded_file_max_context_tokens and _is_dynamic_context read
+  // it: a static model's fixed size, or a dynamic one's magic number (see RuntimeWindow); 0 when unknown. And
+  // LlmMetadata's own max_num_tokens, which the runtime starts from when it is not given one: 0 when it has none.
+  int max_context = 0, metadata_context = 0;
+  bool dynamic_context = false;
 };
 
 // Bounds-checked reads of a FlatBuffer of `size` bytes, through `read`: just what the server needs of the header's
@@ -458,6 +463,22 @@ void ReadSampler(const std::string& llm_metadata, ModelFileInfo& info) {
   });
 }
 
+// LlmMetadata's max_num_tokens (field 5): the model's context, which a prime number above 10 marks as dynamic, as
+// LiteRT-LM reads it (IsMagicNumber in schema/model_info/model_info.cc).
+void ReadContext(const std::string& llm_metadata, ModelFileInfo& info) {
+  ForEachProtoField(llm_metadata, [&](int field, uint64_t v, const std::string&) {
+    if (field == 5) info.max_context = info.metadata_context = static_cast<int>(std::min<uint64_t>(v, INT32_MAX));
+  });
+}
+
+bool IsMagicNumber(int64_t n) {
+  if (n < 11 || n % 2 == 0) return false;
+  for (int64_t i = 3; i * i <= n; i += 2) {
+    if (n % i == 0) return false;
+  }
+  return true;
+}
+
 void ReadThinking(const std::string& llm_metadata, ModelFileInfo& info) {
   ForEachProtoField(llm_metadata, [&](int field, uint64_t v, const std::string& bytes) {
     if (field == 11) info.supports_thinking = v != 0;
@@ -470,7 +491,9 @@ void ReadThinking(const std::string& llm_metadata, ModelFileInfo& info) {
 // SignatureDef inputs 0, outputs 1, signature_key 2, subgraph_index 4; TensorMap name 0, tensor_index 1; SubGraph
 // tensors 0; Tensor shape 0), read through `m` where it lies in the file, a few tables of it and never the whole: the
 // number of logits the decode signature outputs (the last dimension of its "logits", which is what the runtime sizes
-// its sampler by: GetVocabSize in llm_litert_compiled_model_executor.cc).
+// its sampler by: GetVocabSize in llm_litert_compiled_model_executor.cc); and, for a file whose LlmMetadata gives no
+// max_num_tokens, the context: the last dimension of the first mask input of the first prefill signature that has one
+// (ExtractContextTokensFromTfliteBuffer in schema/model_info/model_info.cc, which the C API reads it with).
 void ReadTflite(const FbReader& m, ModelFileInfo& info) {
   const uint64_t model = m.Get<uint32_t>(0).value_or(0);  // the root table's uoffset, from 0
   const uint64_t subgraphs = m.Follow(m.Field(model, 2)), signatures = m.Follow(m.Field(model, 7));
@@ -485,9 +508,20 @@ void ReadTflite(const FbReader& m, ModelFileInfo& info) {
     const uint32_t rank = m.Length(shape);
     return rank ? m.Get<int32_t>(shape + 4 + 4ull * (rank - 1)).value_or(0) : 0;
   };
+  const bool want_context = info.max_context == 0;
   for (uint32_t k = 0; k < m.Length(signatures) && k < 256; ++k) {
     const uint64_t signature = m.Follow(signatures + 4 + 4ull * k);
-    if (!signature || m.String(m.Field(signature, 2)) != "decode") continue;
+    const std::string key = signature ? m.String(m.Field(signature, 2)) : "";
+    if (want_context && info.max_context == 0 && key.rfind("prefill", 0) == 0) {
+      const uint64_t inputs = m.Follow(m.Field(signature, 0));
+      for (uint32_t j = 0; j < m.Length(inputs) && j < 4096 && info.max_context == 0; ++j) {
+        const uint64_t input = m.Follow(inputs + 4 + 4ull * j);
+        if (input && m.String(m.Field(input, 0)).find("mask") != std::string::npos) {
+          info.max_context = std::max(0, last_dimension(signature, input));
+        }
+      }
+    }
+    if (key != "decode") continue;
     const uint64_t outputs = m.Follow(m.Field(signature, 1));
     for (uint32_t j = 0; j < m.Length(outputs) && j < 4096; ++j) {
       const uint64_t output = m.Follow(outputs + 4 + 4ull * j);
@@ -586,6 +620,7 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
     if (type == 5) {
       ReadSampler(proto, info);
       ReadThinking(proto, info);
+      ReadContext(proto, info);
     }
   }
   if (main_end > main_begin) {
@@ -597,6 +632,7 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
                          main_end - main_begin};
     ReadTflite(model, info);
   }
+  info.dynamic_context = IsMagicNumber(info.max_context);
   if (vision) info.vision_backends = ConstraintBackends(*vision);
   if (audio) info.audio_backends = ConstraintBackends(*audio);
   return info;
@@ -662,6 +698,8 @@ struct EngineHolder {
   bool tools_unconstrained = false;
   // What the model file says about itself (ModelFileInfo), as it was when this engine was created.
   ModelFileInfo info;
+  // The context window this engine has, in tokens (-1: unknown), and the larger one that was asked for, if any.
+  int window = -1, window_asked = -1;
   // The model's decoder keeps a recurrent state (info.recurrent_state), and a message has been sent on this engine
   // since it was created, so that state is no longer the initial one.
   bool state_used = false;
@@ -740,6 +778,31 @@ struct InputNeeds {
   bool image = false, audio = false;
 };
 
+// The context window LiteRT-LM 0.18.0 gives an engine of this model on `backend` when `asked` tokens are asked for
+// (0 or less: none), worked out as it does, so that the window the server reports and judges "length" by is the
+// engine's; 0 when the file does not say. With none asked, the runtime takes LlmMetadata's max_num_tokens, or 4096
+// for a file without one, and on GPU no more than 4096 (EngineSettings::MaybeUpdateAndValidate, engine_settings.cc;
+// an Artisan decoder runs as GPU_ARTISAN, which that cap leaves out). A static model's window is then cut to the
+// model's own (ClampMaxNumTokens, llm_litert_compiled_model_executor.cc). A dynamic one, whose context is a magic
+// number M, is made for that many tokens when they are fewer than M, and otherwise for LiteRT-LM's default for M: the
+// largest multiple of 256 below it, or below 256 the largest power of two (GetTargetNumber and GetDefaultTargetNumber,
+// magic_number_configs_helper.cc). So M itself, which the server reported, is never what such a model gets.
+int RuntimeWindow(const ModelFileInfo& info, int asked, const std::string& backend) {
+  if (info.max_context <= 0) return std::max(asked, 0);
+  int n = asked;
+  if (n <= 0) {
+    n = info.metadata_context > 0 ? info.metadata_context : 4096;
+    if (backend == "gpu" && !info.artisan && n > 4096) n = 4096;
+  }
+  if (!info.dynamic_context) return std::min(n, info.max_context);
+  const int m = info.max_context;
+  if (n < m) return n;
+  if (m > 256) return m / 256 * 256;
+  int t = 256;
+  while (t > m) t /= 2;
+  return t;
+}
+
 // Caller holds g_engine_mu.
 LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, const InputNeeds& needs) {
   EngineKey key;
@@ -808,7 +871,26 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   L.litert_lm_engine_settings_enable_benchmark(s);
   L.litert_lm_engine_settings_set_use_ringbuffers_local_attention(s, true);
   if (key.backend == "cpu" && key.threads > 0) L.litert_lm_engine_settings_set_num_threads(s, key.threads);
-  if (key.max_num_tokens > 0) L.litert_lm_engine_settings_set_max_num_tokens(s, key.max_num_tokens);
+  // A context larger than the model takes was cut to the model's by the runtime with only a WARNING in its log
+  // ("Passed in max_num_tokens (8192) is larger than what the static model supports (4096). Using model limit.",
+  // ClampMaxNumTokens in llm_litert_compiled_model_executor.cc), so nobody was told, and "length" was judged against
+  // the size asked for: a reply cut off at the model's 4096 read "stop". Now the server gives the model its own
+  // limit, says so in the log, and reports both on /v1/models and in each reply's headers. With no size asked for,
+  // the window is the one the runtime picks (RuntimeWindow).
+  int window = key.max_num_tokens > 0 ? RuntimeWindow(info, key.max_num_tokens, key.backend) : -1, window_asked = -1;
+  if (window > 0 && window < key.max_num_tokens) {
+    window_asked = key.max_num_tokens;
+    // Once per model and size: a model that gets a new engine for each conversation (LFM2) would log it every time.
+    static std::set<std::string> told;
+    if (told.insert(ref.path + "," + std::to_string(window_asked)).second) {
+      Log("max_num_tokens " + std::to_string(window_asked) + " is more than " + ref.id + " takes (" +
+          (info.dynamic_context ? "its dynamic context takes fewer than " + std::to_string(info.max_context)
+                                : "its fixed context is " + std::to_string(info.max_context)) +
+          " tokens); its context window is " + std::to_string(window));
+    }
+  }
+  if (window > 0) L.litert_lm_engine_settings_set_max_num_tokens(s, window);
+  if (window <= 0) window = RuntimeWindow(info, -1, key.backend);
   L.litert_lm_engine_settings_set_cache_dir(s, key.cache.c_str());
   if (key.spec >= 0) L.litert_lm_engine_settings_set_enable_speculative_decoding(s, key.spec == 1);
   if (key.backend == "gpu" && key.gpu_steps > 0) L.litert_lm_engine_settings_set_gpu_decode_steps_per_sync(s, key.gpu_steps);
@@ -825,6 +907,8 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // The same model and settings again: what was found out about the model still holds.
   if (!fresh_state) g_engine.tools_unconstrained = false;
   g_engine.info = info;
+  g_engine.window = window > 0 ? window : -1;
+  g_engine.window_asked = window_asked;
   g_engine.state_used = false;
   g_engine.init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   Log("Engine ready in " + std::to_string(g_engine.init_seconds) + " s");
@@ -1981,9 +2065,13 @@ void HandleChatCompletions(int fd, const Request& req) {
       throw HttpError(500, "RuntimeError: litert_lm_conversation_send_message_stream failed" + (why.empty() ? "" : ": " + why));
     }
 
+    // The context window the reply was made in, and the larger one asked for, if any, for the daemon to show.
+    std::string window_headers;
+    if (g_engine.window > 0) window_headers += "X-Context-Window: " + std::to_string(g_engine.window) + "\r\n";
+    if (g_engine.window_asked > 0) window_headers += "X-Context-Window-Requested: " + std::to_string(g_engine.window_asked) + "\r\n";
     if (stream) {
       std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n" +
-                         note_headers + CorsHeaders(req) + "\r\n";
+                         note_headers + window_headers + CorsHeaders(req) + "\r\n";
       headers_sent = true;
       SendAll(fd, head + Sse(make_chunk(json::array({{{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}}}))));
     }
@@ -1995,6 +2083,7 @@ void HandleChatCompletions(int fd, const Request& req) {
     std::optional<std::string> error;
     bool client_gone = false;
     bool cancelled = false;
+    bool prompt_too_long = false;
     // The stop strings apply to the reply's text only, as OpenAI's do, not to its thinking or its tool calls. Text that
     // could be the start of one is held back until the next chunk tells; at a stop string the reply ends before it,
     // never showing it, and the generation is cancelled, which the loop below then takes as the quiet end it is.
@@ -2080,6 +2169,12 @@ void HandleChatCompletions(int fd, const Request& req) {
         // output, which may contain these words.
         if (item.text.rfind("CANCELLED:", 0) == 0) {
           // a cancelled turn ends quietly, as in the Python client
+        } else if (item.text.rfind("INVALID_ARGUMENT: Input token ids are too long", 0) == 0) {
+          // The prompt alone does not fit the context window: the request's mistake, said with the window's size.
+          prompt_too_long = true;
+          error = "the prompt does not fit the model's context window" +
+                  (g_engine.window > 0 ? " of " + std::to_string(g_engine.window) + " tokens" : std::string()) + " (" +
+                  item.text + ")";
         } else if (item.text.rfind("RESOURCE_EXHAUSTED: Max number of tokens reached", 0) == 0) {
           // A full context window, from a runtime that reports it as an error. LiteRT-LM 0.18.0's C API never does
           // (see the token-count check below).
@@ -2147,9 +2242,9 @@ void HandleChatCompletions(int fd, const Request& req) {
       // only with return_error_on_max_tokens_reached, which defaults to off and which LiteRT-LM 0.18.0's C API has no
       // way to turn on. So it is told from the counts. The runtime stops once the KV cache holds max_num_tokens, and
       // this request's conversation is new, so its cache holds just this prompt (earlier messages included) and the
-      // reply. Only a limit this server set is known: a bundle whose own cache is smaller caps the window lower, and
-      // a reply cut off there still reads "stop".
-      const int window = g_engine.key.max_num_tokens;
+      // reply. The window is the engine's own, the one LiteRT-LM gives it (RuntimeWindow): the model's size when it is
+      // smaller than what was asked, and what the runtime picks when nothing was asked.
+      const int window = g_engine.window;
       if (finish == "stop" && !stopped && window > 0 && usage["total_tokens"].get<int>() >= window) finish = "length";
     }
 
@@ -2175,6 +2270,7 @@ void HandleChatCompletions(int fd, const Request& req) {
       return;
     }
 
+    if (error && prompt_too_long) throw HttpError(400, "Invalid messages: " + *error);
     if (error) throw HttpError(500, "RuntimeError: " + *error);
     json message = {{"role", "assistant"}, {"content", text_all.empty() ? json(nullptr) : json(text_all)}};
     if (!reasoning_all.empty()) message["reasoning_content"] = reasoning_all;
@@ -2186,7 +2282,7 @@ void HandleChatCompletions(int fd, const Request& req) {
                  {"choices", json::array({{{"index", 0}, {"message", message}, {"finish_reason", finish}}})},
                  {"usage", usage},
                  {"timings", timings}};
-    SendJson(fd, req, 200, resp, note_headers);
+    SendJson(fd, req, 200, resp, note_headers + window_headers);
   } catch (const HttpError& e) {
     Log("request failed: " + std::string(e.what()));
     if (!headers_sent) SendError(fd, req, e.status, e.what());
@@ -2204,7 +2300,11 @@ void HandleModels(int fd, const Request& req) {
   if (g_engine.engine) {
     struct stat st {};
     long long mtime = ::stat(g_engine.key.path.c_str(), &st) == 0 ? static_cast<long long>(st.st_mtime) : 0;
-    data.push_back({{"id", g_engine.key.path}, {"object", "model"}, {"created", mtime}, {"owned_by", "litert-lm"}});
+    json entry = {{"id", g_engine.key.path}, {"object", "model"}, {"created", mtime}, {"owned_by", "litert-lm"}};
+    // The loaded model's context window (vLLM's name for it), and the larger one that was asked for, if any.
+    if (g_engine.window > 0) entry["max_model_len"] = g_engine.window;
+    if (g_engine.window_asked > 0) entry["max_model_len_requested"] = g_engine.window_asked;
+    data.push_back(entry);
   }
   SendJson(fd, req, 200, {{"object", "list"}, {"data", data}});
 }

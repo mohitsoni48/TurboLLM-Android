@@ -16,7 +16,8 @@
 // A conversation answers with one chunk of text that says how it was created and sent, for example
 // "constrained=1 tools=1 provider=0 constraint=0 creates=3", where creates counts every litert_lm_conversation_create
 // call in the process; a message whose text starts with "say:" is answered with the rest of its text instead, three
-// bytes to a chunk, as a model streams. A regex that does not compile fails the send as llguidance does
+// bytes to a chunk, as a model streams, and one whose text is "too long" fails as a prompt longer than the context
+// window does. A regex that does not compile fails the send as llguidance does
 // (llg_constraint_provider.cc:155-160).
 //
 // With FAKE_LITERT_LM_CALLS set to a file, the calls that say what the server asked the runtime for are appended to it,
@@ -103,6 +104,9 @@ LiteRtLmEngineSettings* litert_lm_engine_settings_create(const char* model_path,
   Record({{"call", "engine_settings_create"}, {"model", Basename(model_path)}, {"backend", name(backend)},
           {"vision_backend", name(vision_backend)}, {"audio_backend", name(audio_backend)}});
   return new LiteRtLmEngineSettings{Basename(model_path)};
+}
+void litert_lm_engine_settings_set_max_num_tokens(LiteRtLmEngineSettings* s, int n) {
+  Record({{"call", "engine_settings_set_max_num_tokens"}, {"model", s->model}, {"max_num_tokens", n}});
 }
 void litert_lm_engine_settings_delete(LiteRtLmEngineSettings* s) { delete s; }
 LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* s) {
@@ -230,6 +234,13 @@ int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const
     const nlohmann::json& content = m["content"];
     if (content.is_string()) said = content.get<std::string>();
     if (content.is_array() && !content.empty() && content[0].is_object()) said = content[0].value("text", "");
+  }
+  if (said == "too long") {
+    LiteRtLmStreamChunk failed{"", "INVALID_ARGUMENT: Input token ids are too long. Exceeding the maximum number of "
+                                   "tokens allowed: 4209 >= 4096",
+                               true};
+    callback(data, &failed);
+    return 0;
   }
   std::vector<std::string> chunks = {text};
   if (said.rfind("say:", 0) == 0) {
