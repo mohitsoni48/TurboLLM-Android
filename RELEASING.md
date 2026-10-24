@@ -45,8 +45,9 @@ The script refuses to overwrite an existing keystore for the same reason.
 ```
 
 That single command also stages the Node daemon into the APK (`stageDaemonAssets`), which
-rebuilds the daemon bundle from the `turbollm` checkout first. If turbollm is not a sibling
-directory, pass `-Pturbollm.dir=<path>`.
+rebuilds the daemon bundle from the `turbollm` checkout first, and its web UI too whenever
+`turbollm/web` has changed since the web UI was last built there (BUILDING-ENGINES.md, "The
+daemon payload"). If turbollm is not a sibling directory, pass `-Pturbollm.dir=<path>`.
 
 Use `:composeApp:assembleRelease` instead if you want an installable `.apk` (for sideloading a
 beta build); Play takes the `.aab`.
@@ -185,12 +186,12 @@ still on Gradle 8.x. Revisit the version once the toolchain itself moves to Grad
 `.github/workflows/pr-alpha.yml` builds a signed release bundle and runs `publishReleaseBundle`
 against the **alpha** track on every PR open / push / reopen (markdown-only changes and fork PRs
 are skipped; a newer push cancels an in-flight build for the same PR). It fetches the TurboLLM
-daemon from `mohitsoni48/TurboLLM@main`, builds its web UI, fetches `libnode.so` with
-`scripts/fetch-libnode.mjs` (the digidem 16 KB-aligned nodejs-mobile build, verified against the
-SHA-256s in the script and PROVENANCE.md), stages the LiteRT-LM engine from PyPI, and uses the
-tracked CPU llama.cpp engine in `jniLibs/`. The Vulkan engine is not built in CI. Because the daemon
-comes from TurboLLM `main`, a PR here that needs daemon changes builds a working alpha only once
-those daemon changes are merged.
+daemon from `mohitsoni48/TurboLLM@main` and installs its packages (staging builds its web UI),
+fetches `libnode.so` with `scripts/fetch-libnode.mjs` (the digidem 16 KB-aligned nodejs-mobile build,
+verified against the SHA-256s in the script and PROVENANCE.md), stages the LiteRT-LM engine from
+PyPI, and uses the tracked CPU llama.cpp engine in `jniLibs/`. The Vulkan engine is not built in CI.
+Because the daemon comes from TurboLLM `main`, a PR here that needs daemon changes builds a working
+alpha only once those daemon changes are merged.
 
 Secrets live in the **`play-alpha` environment** (Settings → Environments), not as repo secrets. That environment requires the owner's approval for every run, `main` requires an owner-approved PR (`.github/CODEOWNERS`), and fork PRs never get secrets. Already created:
 

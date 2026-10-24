@@ -16,11 +16,12 @@ paste into a search box in three months.
 ## What you actually need to do
 
 - **Just building the app?** Nothing special — `./gradlew assembleDebug` stages the Node
-  daemon into the APK for you (`stageDaemonAssets`). It only needs the `turbollm` checkout
-  beside this repo, or `-Pturbollm.dir=<path>`. See
-  [the daemon payload](#the-daemon-payload--what-makes-the-apk-self-sufficient) — read that
-  before touching anything about how the daemon is packaged, because the failure mode is an
-  APK that builds and installs cleanly and then dies at first launch.
+  daemon into the APK for you (`stageDaemonAssets`), and builds the web UI again first
+  whenever `turbollm/web` has changed since its last build. It only needs the `turbollm`
+  checkout beside this repo, or `-Pturbollm.dir=<path>`, with `npm ci` run in it and in its
+  `web/`. See [the daemon payload](#the-daemon-payload--what-makes-the-apk-self-sufficient)
+  — read that before touching anything about how the daemon is packaged, because the failure
+  mode is an APK that builds and installs cleanly and then dies at first launch.
 - **Shipping a new CPU engine?** You don't build it by hand. Bump `LLAMA_BUILD` in
   `turbollm/src/engines/download.ts`, push to `main`, and the
   [`android-llama-build.yml`](../.github/workflows/android-llama-build.yml) workflow
@@ -67,8 +68,17 @@ The script expects the `turbollm` checkout as a sibling of this repo. If it live
 ```
 
 It rebuilds the daemon bundle every time (~200 ms) rather than trusting what is on disk, so the
-APK can never ship a daemon older than the source. It does **not** rebuild the web UI — that is
-slower and changes less often, so run `npm run build` in `turbollm/web` when the UI changes.
+APK can never ship a daemon older than the source. The web UI (`turbollm/src/webdist`, which git
+does not hold) takes 40-55 s to build, so the script builds it only when `turbollm/web` is not
+what it was last built from: it hashes every file under `web/` but `node_modules`,
+dot-directories and test output (under 50 ms) and compares that with `build-inputs.json`, the
+stamp it writes into `webdist` after each web build it runs. When they differ (after a pull or a
+branch switch, or when the web UI was built by hand, which leaves no stamp) it runs
+`npm run build` in `turbollm/web` before staging, so an APK never carries a web UI older than its
+checkout. **You never need to build the web UI yourself for the app.** It does need
+`turbollm/web/node_modules` as `turbollm/web/package-lock.json` has it: when that is missing or
+out of date the build stops and names the command to run, `npm --prefix "<turbollm>/web" ci`.
+`node --test scripts/stage-daemon-assets.test.mjs` covers the check on a stand-in checkout.
 
 ### Why the payload is built specially instead of just copying `dist/`
 
