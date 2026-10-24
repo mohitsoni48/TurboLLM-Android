@@ -92,13 +92,15 @@ jobs:
       - name: Fetch libnode (nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }}, digidem 16 KB build)
         run: node scripts/fetch-libnode.mjs
 
-      # Daemon + web UI. stage-daemon-assets.mjs rebuilds the Android daemon bundle itself but
-      # deliberately not the web UI, so that is built here first (into turbollm/src/webdist).
-      - name: Build the TurboLLM web UI and install daemon deps
+      # Daemon + web UI packages. stage-daemon-assets.mjs builds both itself: the Android daemon
+      # bundle every time, and the web UI (into turbollm/src/webdist) whenever web/ is not what it
+      # was last built from there, which on this fresh checkout is always. A web build here would
+      # leave no record of its sources, so staging would build it a second time.
+      - name: Install the TurboLLM daemon and web UI packages
         working-directory: turbollm-src/turbollm
         run: |
           npm ci
-          (cd web && npm ci && npm run build)
+          (cd web && npm ci)
 
       - name: Materialise signing + Play credentials
         env:

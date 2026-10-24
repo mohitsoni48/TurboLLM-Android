@@ -16,11 +16,12 @@ paste into a search box in three months.
 ## What you actually need to do
 
 - **Just building the app?** Nothing special — `./gradlew assembleDebug` stages the Node
-  daemon into the APK for you (`stageDaemonAssets`). It only needs the `turbollm` checkout
-  beside this repo, or `-Pturbollm.dir=<path>`. See
-  [the daemon payload](#the-daemon-payload--what-makes-the-apk-self-sufficient) — read that
-  before touching anything about how the daemon is packaged, because the failure mode is an
-  APK that builds and installs cleanly and then dies at first launch.
+  daemon into the APK for you (`stageDaemonAssets`), and builds the web UI again first
+  whenever `turbollm/web` has changed since its last build. It only needs the `turbollm`
+  checkout beside this repo, or `-Pturbollm.dir=<path>`, with `npm ci` run in it and in its
+  `web/`. See [the daemon payload](#the-daemon-payload--what-makes-the-apk-self-sufficient)
+  — read that before touching anything about how the daemon is packaged, because the failure
+  mode is an APK that builds and installs cleanly and then dies at first launch.
 - **Shipping a new CPU engine?** You don't build it by hand. Bump `LLAMA_BUILD` in
   `turbollm/src/engines/download.ts`, push to `main`, and the
   [`android-llama-build.yml`](../.github/workflows/android-llama-build.yml) workflow
@@ -37,6 +38,9 @@ paste into a search box in three months.
   build its server with the NDK AGP already uses (`stageLitertLmEngine`, needs network on the
   first build). `-PturbollmLitertLmEngine=false` leaves it out. See
   [the LiteRT-LM engine](#the-litert-lm-engine).
+- **The engine tether?** Nothing to do — every build compiles `libtether_exec.so`, the helper
+  that makes the kernel end each engine with the app, with the same NDK (`stageTetherExec`). See
+  [the engine tether](#the-engine-tether).
 - **Before you change anything about packaging**, read
   [the platform constraint](#the-platform-constraint-that-shapes-everything). It is the
   reason the binaries are bundled rather than downloaded, the reason they are named
@@ -64,8 +68,17 @@ The script expects the `turbollm` checkout as a sibling of this repo. If it live
 ```
 
 It rebuilds the daemon bundle every time (~200 ms) rather than trusting what is on disk, so the
-APK can never ship a daemon older than the source. It does **not** rebuild the web UI — that is
-slower and changes less often, so run `npm run build` in `turbollm/web` when the UI changes.
+APK can never ship a daemon older than the source. The web UI (`turbollm/src/webdist`, which git
+does not hold) takes 40-55 s to build, so the script builds it only when `turbollm/web` is not
+what it was last built from: it hashes every file under `web/` but `node_modules`,
+dot-directories and test output (under 50 ms) and compares that with `build-inputs.json`, the
+stamp it writes into `webdist` after each web build it runs. When they differ (after a pull or a
+branch switch, or when the web UI was built by hand, which leaves no stamp) it runs
+`npm run build` in `turbollm/web` before staging, so an APK never carries a web UI older than its
+checkout. **You never need to build the web UI yourself for the app.** It does need
+`turbollm/web/node_modules` as `turbollm/web/package-lock.json` has it: when that is missing or
+out of date the build stops and names the command to run, `npm --prefix "<turbollm>/web" ci`.
+`node --test scripts/stage-daemon-assets.test.mjs` covers the check on a stand-in checkout.
 
 ### Why the payload is built specially instead of just copying `dist/`
 
@@ -87,14 +100,15 @@ about 220 MB of which is `@earendil-works/pi-*` plus its `@mistralai`/`@google`/
 `turbollm/tsup.android.config.ts` is a **separate build pass** that bundles the dependencies in.
 Total payload: **14.5 MB**.
 
-Four things in that config are load-bearing, each one a crash that was hit and fixed:
+Four things in that build are load-bearing, each one a crash that was hit and fixed. The first
+three are set in that config; the last is written by `stage-daemon-assets.mjs`:
 
 | Setting | Without it |
 |---|---|
 | `target: 'node18'` | nodejs-mobile embeds Node **18.20.4**, not the 22 the desktop package targets — syntax the phone cannot parse |
 | `banner` defines `require` | bundled CommonJS keeps esbuild's `__require` shim, which throws: `Dynamic require of "assert" is not supported` (undici) |
 | `banner` defines `__dirname` | `ReferenceError: __dirname is not defined in ES module scope` — sql.js locates its own `.wasm` that way |
-| `dist/package.json` = `{"type":"module"}` | Node decides ESM by walking up for the nearest `package.json`; without one above the extracted bundle it reads the ESM entrypoint as CommonJS and dies on `import` |
+| `daemon/package.json` = `{"type":"module","version":…}` | Node decides ESM by walking up for the nearest `package.json`; without one above the extracted bundle it reads the ESM entrypoint as CommonJS and dies on `import`. The daemon also reads its version from the file's `version` field (`dist/../package.json`) and reports 0.1.1 when that field is missing |
 
 Two files cannot be bundled and are staged beside the bundle instead:
 
@@ -126,11 +140,38 @@ adb install composeApp/build/outputs/apk/debug/composeApp-debug.apk
 adb shell am start -n com.turbollm/com.turbollm.app.MainActivity
 # then, with NOTHING pushed:
 adb logcat -d | grep -E "E nodejs|TurboLLM:"
-adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/api/v1/engines
+adb forward tcp:7799 tcp:7000 && curl -s http://127.0.0.1:7799/healthz   # {"status":"ok","version":…}
+adb shell "run-as com.turbollm cat files/daemon.log" | grep "registered bundled engine"
 ```
 
-Last run of exactly that: daemon booted, UI served HTTP 200, and both engines registered
-(`llama-server-android` and `llama-server-android-vulkan`).
+Last recorded run (before the app secret, when the check still read `/api/v1/engines`): daemon
+booted, UI served HTTP 200, and both engines registered (`llama-server-android` and
+`llama-server-android-vulkan`).
+
+`/api/v1/engines` over the adb forward now answers 401, and that is not a failed boot. The app
+starts the daemon with a per-launch secret (`TURBOLLM_APP_SECRET`) that only the app's own
+WebView and client carry, so adb, curl and Termux count as another app on the phone and need an
+API key like any LAN client. `/healthz` stays open, and on the first launch after a clean
+install, as in the procedure above, the daemon logs one `android: registered bundled engine …`
+line per engine to `files/daemon.log`. Only that launch registers them: later boots log
+`android: refreshed bundled engine …` or `android: repaired stale engine path …` for an engine
+whose path or version changed and nothing for the others, and `daemon.log` is truncated each
+time Node starts. So on a phone that already had the app, an empty grep does not mean the
+engines are missing. Uninstalling first does not always make the next launch a first one
+either: Android restores an app's Auto Backup whenever it is installed, `adb install` included,
+if the backup was made by an APK signed with the same key (for the debug APK above, one of your
+own earlier debug builds). On such a phone the restored `.turbollm/config.json` already lists
+the engines, at the old install's library path. That launch then logs the `refreshed …` or
+`repaired …` line for an engine whose path or version changed and nothing for the others, and
+the grep above finds nothing. To keep the check a first registration, turn install-time restore
+off around it: note what `adb shell settings get secure backup_auto_restore` prints (`1`, or
+`null` if it was never changed, means on), run `adb shell bmgr autorestore false` before
+`adb install`, and once done run `adb shell bmgr autorestore true` only if it was on, since it
+is the phone's own Automatic restore setting. Or read the engines from the API. To query the
+API itself, create a key in the app (Customize → Connect → API keys) and send it as
+`X-TurboLLM-Auth: <key>`. Only a debug build lets an adb host skip the key: its WebView accepts
+Chrome DevTools over adb, and script run there acts as the app. Release builds turn WebView
+debugging off.
 
 ---
 
@@ -199,18 +240,76 @@ Termux users get their best speed from LiteRT-LM, which TurboLLM runs there as
 `python -m litert_lm_cli.main serve`. The app can't: it has no Python, and it may only execute
 files that shipped in its APK. But that Python server is a thin layer — every inference call
 goes through ctypes into **one** native library, `liblitert-lm.so`, the only binary in Google's
-`litert-lm-api` wheel. So the app ships that same library unchanged and replaces only the layer
-above it:
+`litert-lm-api` wheel. So the app ships that same library, with one dependency renamed (see
+[libandroid.so and its shim](#libandroidso-and-its-shim)), and replaces only the layer above it:
 
 | File (jniLibs/&lt;abi&gt;/) | What it is | Where it comes from |
 |---|---|---|
-| `liblitert-lm.so` | Google's LiteRT-LM runtime (CPU + GPU) | Extracted from the `litert-lm-api` 0.18.0 Android wheel on PyPI, **sha256-pinned** in `scripts/stage-litert-lm-engine.mjs`. Byte-identical to what Termux runs. Apache-2.0. |
+| `liblitert-lm.so` | Google's LiteRT-LM runtime (CPU + GPU) | Extracted from the `litert-lm-api` 0.18.0 Android wheel on PyPI, **sha256-pinned** in `scripts/stage-litert-lm-engine.mjs`. The build renames its `libandroid.so` dependency to `liblrtandr.so` (7 bytes of `.dynstr`) and checks the result against a second pinned hash; otherwise byte-identical to what Termux runs. Apache-2.0. |
 | `liblitertlm_server.so` | Native port of `litert-lm serve` — an executable named like a library so Android installs it | Built from `engines/litert-lm-server/` with the NDK on every build |
+| `liblrtandr.so` | Stands in for `libandroid.so`, which the engine process cannot load | Generated from the library's own imports and built with the NDK on every build |
 
-`stageLitertLmEngine` (`composeApp/build.gradle.kts`) does both, then checks each file's ELF
+`stageLitertLmEngine` (`composeApp/build.gradle.kts`) does all three, then checks each file's ELF
 architecture and that every LOAD segment is 16 KB-aligned (the wheel's library already is).
 Output goes to `composeApp/build/generated/litert-lm/jniLibs/`, never into `src/`. Cost: about
 14 MB compressed per ABI.
+
+### libandroid.so and its shim
+
+`liblitert-lm.so` is built for apps, which load it into their own process, and it lists
+`libandroid.so` among its dependencies. The server is not an app process: the daemon executes it
+from `nativeLibraryDir`, and in a freshly executed process the linker has to find all of
+`libandroid.so`'s dependencies itself (`libandroid_runtime`, `libhwui`, the media stack), which an
+app, forked from the zygote, already has loaded. On the owner's phone that failed and no
+`.litertlm` ever loaded:
+
+```
+cannot load liblitert-lm.so:
+  .../lib/arm64/liblitert-lm.so: dlopen failed: library "libstagefright.so" not found: needed by /system/lib64/libmediandk.so in namespace (default)
+```
+
+The library uses `libandroid.so` only to read APK assets (`AAssetManager_*`, `AAsset_*`), and the
+server loads models from file paths. So `scripts/stage-litert-lm-engine.mjs` replaces that
+dependency, working from the library it ships rather than from a list written for one version:
+
+1. It reads the library's dynamic section: its `DT_NEEDED` entries and every undefined dynamic
+   symbol with its binding and type. `LOADABLE_LIBS` names the libraries a standalone process can
+   load (bionic's, `liblog`, `libz`, EGL/GLES/Vulkan/`libnativewindow`); every other `DT_NEEDED`
+   entry is replaced. Today that is `libandroid.so` alone.
+2. Against the NDK's stub libraries, at every API level from the app's minSdk (24) to the newest
+   the NDK has, it takes the GLOBAL imports only a replaced library provides (today 8 functions:
+   `AAssetManager_fromJava`, `AAssetManager_open`, `AAssetManager_openDir`,
+   `AAssetDir_getNextFileName`, `AAssetDir_close`, `AAsset_close`, `AAsset_getBuffer`,
+   `AAsset_getLength`). The build fails, naming the symbols, if one of them is data rather than a
+   function, if a GLOBAL import has no provider at all, if a GLOBAL import comes from both a
+   replaced and a loadable library, if a WEAK one comes only from a replaced library, or if a
+   replaced library's imports carry symbol versions, at any of those levels: a WEAK import that
+   `libandroid.so` gained some levels before `libnativewindow.so` did would be unresolved on the
+   devices in between, even though the minSdk and the newest stubs agree.
+3. It writes a C shim per replaced library into the build directory and builds it with the NDK's
+   clang: one function per import, each of which, if it is ever called, writes
+   `liblitert-lm.so called <function>(), which libandroid.so provides, but libandroid.so cannot be
+   loaded in the engine process (liblrtandr.so stands in for it); stopping.` to stderr (which the
+   daemon shows when the engine exits) and to logcat, then calls `abort()`. None returns a value.
+   The shim's file name has the replaced name's length, fits `lib*.so` and starts with `liblr`;
+   the build checks that it exports exactly those functions and needs only loadable libraries. A
+   shim an earlier run staged and this one does not is removed; nothing else in the output
+   directory is touched, so pointing `--out` at `composeApp/src/androidMain/jniLibs` by hand
+   leaves the llama.cpp engines there alone.
+4. It renames the `DT_NEEDED` string in place (refusing if it is the tail of a longer string or
+   if any symbol, version entry or other dynamic tag shares its bytes; the second copy of
+   `libandroid.so` in `.rodata`, next to TFLite's NNAPI strings, is left alone) and checks the
+   file against `patchedSha256`.
+5. It links a probe executable against the staged library, the shim and the NDK stubs of the
+   library's other dependencies with `-Wl,--no-allow-shlib-undefined`, so a GLOBAL import nothing
+   in the library's dependency list provides fails the build with the linker's own message.
+
+WEAK imports get no shim function: the library allows them to be absent. `AHardwareBuffer_*` is
+the case that matters: `libandroid.so` defines those too from API 26, and with it gone they bind to
+`libnativewindow.so`'s, which `libEGL.so` needs (checked on the Android 15 emulator image).
+
+`node --test scripts/stage-litert-lm-engine.test.mjs` covers the reading, the checks, the rename,
+the naming and the removal of stale shims on synthetic ELF files.
 
 ### What the server is, and why it is shaped this way
 
@@ -239,6 +338,16 @@ satisfied the server's `std::runtime_error`/`__cxa_*` references from those expo
 AddressSanitizer caught an exception being destroyed by the other runtime. See
 `src/litert_lm_api.h`.
 
+**It ends with whatever started it.** The first thing `main()` does is arm
+`PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills the server the moment the thread that started it
+ends, and it exits 1 without starting when its parent is already init (the starter died before
+the `prctl`). The daemon's [engine tether](#the-engine-tether) does the same before it execs the
+server; this covers a server started any other way: by a daemon without the tether, through the
+daemon's `/system/bin/sh` fallback, or by hand. `node --test
+engines/litert-lm-server/parent-death.test.mjs` builds the server for the machine (Linux, `cc`
+and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing, and checks that a
+stand-in daemon's SIGKILL takes the listening server with it and that an orphaned start exits.
+
 ### GPU
 
 The app reads the GPU's name from a throwaway GL context (`MainActivity.gpuEnv`) and passes it
@@ -251,7 +360,9 @@ system Vulkan/OpenCL/GL libraries.
 ### Bumping LiteRT-LM
 
 Change `LITERT_LM_VERSION` and both wheel hashes in `scripts/stage-litert-lm-engine.mjs`
-(PyPI publishes them at `https://pypi.org/pypi/litert-lm-api/<version>/json`), refresh
+(PyPI publishes them at `https://pypi.org/pypi/litert-lm-api/<version>/json`), then both
+`patchedSha256` values: the build stops with the new hash once the shim, its checks and the link
+probe have passed, and a changed list of shimmed functions is worth a look. Refresh
 `engines/litert-lm-server/third_party/litert_lm/c/*.h` from the matching
 `google-ai-edge/LiteRT-LM` tag, and check that every function listed in
 `src/litert_lm_api.h` still exists — the server refuses to start, naming the missing ones, if
@@ -259,11 +370,125 @@ it doesn't.
 
 ### Not yet verified
 
-- **No device has run it.** The NDK cross-compile itself was not run while writing it (no NDK
-  was available); the first `assembleDebug` is that check. The code uses only POSIX/bionic
-  APIs available at API 24.
+- **No phone has run it successfully.** On the owner's phone the wheel's library failed to load,
+  which is why it now has [a shim](#libandroidso-and-its-shim); no phone has run the patched one
+  yet. The patched library was run in a chroot of the x86_64 Android 15 emulator image's system
+  and vendor partitions, with that image's linker and its generated `/linkerconfig`: it loads
+  and answers a chat request on CPU, and still does with `libstagefright.so` removed from the
+  image, where the unpatched one fails with the owner's message. The code uses only
+  POSIX/bionic APIs available at API 24.
 - GPU speed versus Termux on the same phone, and whether every GPU path (OpenCL, WebGPU/Vulkan)
-  loads from an app-spawned process the way it does from Termux.
+  loads from an app-spawned process the way it does from Termux. The linker namespace of a
+  `/data` executable searches `/system` and `/system_ext` only, so a vendor `libOpenCL.so` may
+  not be found. A GPU that cannot be initialised fails the load with the runtime's error (there
+  is no automatic fallback); the app then suggests switching the model's Backend to CPU.
+
+---
+
+## The engine tether
+
+Every engine the daemon starts (the llama.cpp ones and the LiteRT-LM server) is meant to end the
+moment the app process does, however it ends. The app ships a helper for that,
+`libtether_exec.so`, and the daemon starts each engine as
+`libtether_exec.so <daemon pid> <engine> <args...>`, and each probe the same way (a short run of
+a program whose output it reads, such as an engine's version check). Only those: the helper ties
+the one program it execs, not what that program starts, so every other process the daemon ties
+to its life (an MCP stdio server, a tunnel) keeps the daemon's `/system/bin/sh` lifeline: a
+process group of its own, which a stop ends as a whole, and a watcher that kills that group
+when the daemon dies. The helper:
+
+1. arms `PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills the process the moment the thread that
+   started it ends;
+2. exits 127 without starting the engine if its parent is no longer that pid (the daemon
+   process ended between the fork and the `prctl`, so no signal would ever come). This sees the
+   process end, not the thread: had only the forking thread ended, the kernel would have moved
+   the helper to another thread of the daemon, and the signal would come when that one ends;
+   the daemon's thread ends only with the daemon;
+3. `exec`s the engine in place: the engine keeps the helper's pid, stdio and exit status, and no
+   extra process is left behind.
+
+libuv forks on the thread that calls `spawn`, the one `MainActivity` starts `node::Start` on,
+which lives exactly as long as the daemon. So whichever way the app process ends (Quit, which
+is `Process.killProcess`, a crash, Android killing the app), the kernel ends the engines with
+it at once. Behind that, system_server still kills whatever is left in the
+app's cgroup once the app process has died (AOSP 7 to 15); before the helper, that was an
+engine's only tie to the app. `liblitertlm_server.so` also arms the signal itself, at the top of
+its `main()` ([what the server is](#what-the-server-is-and-why-it-is-shaped-this-way)).
+
+| | |
+|---|---|
+| Source | `engines/tether-exec/tether_exec.c` |
+| Built by | `scripts/stage-tether-exec.mjs` (`stageTetherExec` in `composeApp/build.gradle.kts`, hooked to `merge*JniLibFolders`), with the NDK's clang for API 24, as a PIE with 16 KB-aligned LOAD segments, stripped, checked with the LiteRT-LM staging's `checkElf` |
+| Output | `composeApp/build/generated/tether-exec/jniLibs/<abi>/libtether_exec.so`, about 6 KB per ABI |
+| In the APK | Always. `assemble*`/`bundle*` fail if it is missing for a shipped ABI |
+
+**The daemon's side** is TurboLLM's `util/tether.ts` (`fix(daemon): a process the daemon starts can
+be tied to its life`). It looks for the helper in `TURBOLLM_ANDROID_NATIVE_LIB_DIR` and, at each
+start, before it spawns anything, checks it by watching it work, while the app lives (a force-stop
+cannot test it: the cgroup kill would hide a helper that does nothing).
+It runs `/system/bin/sh -c '"$0" "$$" /system/bin/sleep 30 & echo "$!"; read -r _' <helper>`
+and must see `/system/bin/sleep 30` running with that `sh` as its parent, then gone within 1 s
+of ending the `sh`'s stdin. It logs `tether: libtether_exec.so self-test passed (… ms)` to
+`files/daemon.log`, or `… self-test failed: <step and reason>; tethered spawns use the
+/system/bin/sh lifeline instead`, or, when the APK has no helper, `tether: libtether_exec.so not
+found in <dir>; tethered spawns use the /system/bin/sh lifeline instead`. Either way it then ties each engine
+with a `/system/bin/sh` watcher instead (one more process per engine, counted against
+Android 12+'s phantom process limit). A daemon without that commit starts engines directly:
+then the cgroup kill alone ties the llama.cpp engines, and the LiteRT-LM server is also tied
+by its own signal.
+
+`node --test scripts/stage-tether-exec.test.mjs` builds the helper for the machine with `cc`
+(Linux) and runs it: a stand-in daemon's SIGKILL takes its engine; a parent that is not the
+given pid, or a pid that is not a number above 1, exits 127 without running anything; the pid,
+stdin, stdout, exit status and signals pass through; it passes the daemon's self-test under each
+shell found (`/bin/sh`, bash, mksh), while a helper that execs without the signal and one that
+exits 127 fail it. With an NDK (`ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or 27.0.12077973 under
+`ANDROID_HOME` or `ANDROID_SDK_ROOT`) it also builds both ABIs and checks the files.
+
+### Checking it on a device
+
+With a model loaded:
+
+```bash
+adb shell run-as com.turbollm cat files/daemon.log | grep 'tether:'   # "self-test passed"
+adb shell ps -A -o PID,PPID,NAME | grep -E 'llama_server|litertlm|tether'
+#   the engine's PPID is the app's pid, and no libtether_exec.so is listed (it exec'd the engine)
+adb shell am force-stop com.turbollm
+adb shell ps -A | grep -E 'llama_server|litertlm'                      # nothing
+```
+
+Then the same `ps` after each other way the app ends with a model loaded, loading it again
+each time: the notification's Quit (the app ends about 3 seconds after the tap), and
+`adb shell run-as com.turbollm kill -9 <app pid>` (a debug build). No engine is left after
+either. After Quit, a reply that finished just before is there when the app is opened again:
+the daemon wrote its chat database before the kill.
+
+Back from the app's main screen, or a swipe from Recents, with a model loaded does not end the
+app, by design: a loaded model counts as running, so the app and its engine stay (`ps` still
+lists the engine under the app, and the notification reads "Idle · " and the model's name)
+until Quit, or until the daemon's idle timer has unloaded the model and the app is closed again
+with nothing running (opened and closed, or the card a Back left in Recents swiped away).
+
+With nothing loaded or running, Back or a swipe from Recents ends the app about 3 seconds
+later: `adb shell pidof com.turbollm` prints nothing, and the `ps` above lists no engine. A
+reply that finished just before is there when the app is opened again.
+
+On the first launch after an install or an update, close the app only once it shows its own
+splash: the animated bolt (an orange badge that pops in, then pulses) with "Starting TurboLLM…"
+under it, not the still launcher icon Android shows before it from Android 12. Until then the app
+is still unpacking the daemon and has not started the service that hears a close, so whether a
+swipe made then ends the app is up to Android.
+
+Only the `tether:` line tests the helper itself. Every ending above would also pass on the
+cgroup kill alone.
+
+### Not yet verified
+
+No device has run it. The x86_64 NDK build was run in a chroot of the x86_64 Android 15
+emulator image (its own linker, `/system/bin/sh`, which is mksh, and toybox's `sleep`): it
+passed the self-test above, and a stand-in daemon's SIGKILL took its engine within 20 ms. The
+arm64 build has only been checked as a file (architecture, PIE, `/system/bin/linker64`,
+alignment).
 
 ---
 
@@ -421,8 +646,19 @@ wsl -d Ubuntu-24.04 -u root -- bash "/mnt/d/llama-turbo/TurboLLM Android/scripts
 DRY_RUN=1 bash scripts/build-static-engine.sh   # resolved paths + the commands, builds nothing
 ```
 
-It is the WSL original plus the four things that original did not do, each of which exists
-because of something that went wrong:
+A Windows checkout that had the scripts before `.gitattributes` pinned them and `gradlew` to LF
+still has the CRLF copies Git for Windows wrote by default (`core.autocrlf=true`), and bash stops
+at the first `\r`: "set: pipefail: invalid option name". Pulling does not rewrite them, since
+their contents did not change, and `git status` stays clean. Write them again once, with Git for
+Windows in that checkout (this discards uncommitted edits to those four files, nothing else):
+
+```bash
+git rm -q --cached -- "scripts/*.sh" gradlew
+git checkout HEAD -- "scripts/*.sh" gradlew
+```
+
+The script is the WSL original plus the four things that original did not do, each of which
+exists because of something that went wrong:
 
 - **Builds ONE static binary** — `-DBUILD_SHARED_LIBS=OFF` with `-DGGML_BACKEND_DL=OFF`, since
   the runtime backend loader is a shared-library mechanism and the two are incompatible. Same

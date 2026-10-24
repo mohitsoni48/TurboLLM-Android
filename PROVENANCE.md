@@ -44,6 +44,18 @@ Not vendored: `scripts/stage-litert-lm-engine.mjs` fetches it at build time from
 The extracted arm64 `liblitert-lm.so` (39.9 MB, sha256 `3d591b09…dfd9`) is byte-identical to the
 one the Termux path installs. License: Apache-2.0 (google-ai-edge/LiteRT-LM).
 
+The APK carries it with one change. The engine process cannot load `libandroid.so`, so the script
+renames that `DT_NEEDED` entry in place to `liblrtandr.so` (7 bytes of `.dynstr`; nothing else
+differs, the `readelf -d -V --dyn-syms` output only in that line) and ships `liblrtandr.so`, a shim
+it generates from the library's imports and builds with the NDK: each of its functions aborts with
+a message if called (BUILDING-ENGINES.md, "libandroid.so and its shim"). The patched file is
+pinned as well, and the build refuses any other result:
+
+| ABI | SHA-256 (`liblitert-lm.so` from the wheel) | SHA-256 (as shipped) |
+|---|---|---|
+| arm64-v8a | `3d591b09116e7be3ab6b2b5b1a27bb3079dda0eb66550271533e6aee19e2dfd9` | `ae7e50538d9298e113686bc2ac07ebf33aac1325e6e3cbff299a1024a1b16d6a` |
+| x86_64 | `cc8fdef43d1900234d3bebecd29b3610a7b09c62e0a3b3cdb08499e4b8e8e4c7` | `681f770323d7021ca47a0481ae49744699d80a62c79f759cd1ce443e21becb22` |
+
 Vendored in `engines/litert-lm-server/third_party/`: LiteRT-LM's C API headers from tag
 `v0.18.0` (`c/engine.h`, `c/conversation.h`, `c/error_reporter.h`, `c/api_export.h`;
 Apache-2.0, LICENSE alongside) and nlohmann/json 3.11.3 (`json.hpp`, sha256 `9bea4c80…3ea6`; MIT,

@@ -96,8 +96,13 @@ val shipLitertLmEngine: Boolean =
 // never disagree about which engine builds exist.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
 
-// Where stageLitertLmEngine puts <abi>/{liblitert-lm.so, liblitertlm_server.so}.
+// Where stageLitertLmEngine puts <abi>/{liblitert-lm.so, liblitertlm_server.so} and the shim that
+// stands in for libandroid.so (liblrtandr.so). jniLibs packages everything in it.
 val litertLmJniLibs = layout.buildDirectory.dir("generated/litert-lm/jniLibs")
+
+// Where stageTetherExec puts <abi>/libtether_exec.so, the helper the daemon starts every engine through (see "The
+// engine tether" below). jniLibs packages everything in it.
+val tetherJniLibs = layout.buildDirectory.dir("generated/tether-exec/jniLibs")
 
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
@@ -231,6 +236,9 @@ android {
         // The LiteRT-LM engine, staged into the build dir by stageLitertLmEngine (below) rather
         // than src/: it is fetched and compiled on every machine, never committed.
         if (shipLitertLmEngine) jniLibs.srcDir(litertLmJniLibs)
+        // The engine tether, staged into the build dir by stageTetherExec (below): compiled on every machine, like the
+        // LiteRT-LM server, and in every build.
+        jniLibs.srcDir(tetherJniLibs)
     }
 
     // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
@@ -387,7 +395,9 @@ tasks.matching { it.name == "generateReleasePlayResources" }.configureEach {
 // through whenever Gradle skipped straight to the merge.
 //
 // The staged directory is gitignored build output; the script rebuilds the daemon bundle each
-// time (~200 ms) so the APK can never ship a daemon older than the source.
+// time (~200 ms) so the APK can never ship a daemon older than the source, and the web UI
+// whenever turbollm/web is not what it was last built from, so it never ships an older web UI
+// either (a web build takes 40-55 s; checking costs a hash of web/, under 50 ms).
 val stagedDaemonAssets = layout.projectDirectory.dir("src/androidMain/assets/daemon")
 
 val stageDaemonAssets by tasks.registering(Exec::class) {
@@ -472,11 +482,15 @@ if (shipVulkanEngine) {
 
 // ── The LiteRT-LM engine ──────────────────────────────────────────────────────────────────
 //
-// Two files per ABI: liblitert-lm.so — Google's runtime, the same file the litert-lm-api wheel
-// installs under Termux, fetched from PyPI against a pinned sha256 — and liblitertlm_server.so,
+// Three files per ABI: liblitert-lm.so — Google's runtime, the file the litert-lm-api wheel
+// installs under Termux, fetched from PyPI against a pinned sha256, with its libandroid.so
+// dependency renamed because the engine process cannot load that library —, liblitertlm_server.so,
 // the native OpenAI-compatible server in engines/litert-lm-server that replaces the Python
-// `litert-lm serve` the app cannot run. scripts/stage-litert-lm-engine.mjs does both, then checks
-// each file's ELF architecture and 16 KB alignment. See BUILDING-ENGINES.md, "The LiteRT-LM engine".
+// `litert-lm serve` the app cannot run, and liblrtandr.so, the shim generated from the library's
+// imports to stand in for libandroid.so. scripts/stage-litert-lm-engine.mjs does all three, checks
+// each file's ELF architecture and 16 KB alignment and the patched library's pinned sha256, and
+// links a probe against the result so an import nothing provides fails the build. See
+// BUILDING-ENGINES.md, "The LiteRT-LM engine".
 //
 // The NDK is the one AGP itself resolves for native-lib, and CMake is the SDK copy that
 // externalNativeBuild above pins, so this needs nothing a plain `assembleDebug` didn't already.
@@ -485,7 +499,7 @@ if (shipVulkanEngine) {
 // incrementally, so a repeat run costs about a second.
 val stageLitertLmEngine by tasks.registering(Exec::class) {
     group = "build"
-    description = "Fetches liblitert-lm.so and builds liblitertlm_server.so into the APK's jniLibs."
+    description = "Fetches liblitert-lm.so and builds liblitertlm_server.so and its libandroid.so shim into the APK's jniLibs."
     workingDir = rootProject.projectDir
     // BaseExtension resolves both from local.properties / ANDROID_HOME and the pinned ndkVersion. (The
     // androidComponents.sdkComponents providers carry no value at execution time in AGP 8.7.)
@@ -514,6 +528,8 @@ if (shipLitertLmEngine) {
     // Same reasoning as the daemon payload check: an APK that silently lacks the engine it was
     // built for is worse than a failed build. Only the APK/AAB tasks themselves: AGP also has
     // bundle*ClassesToJar and assemble*UnitTest, which run without merging native libs at all.
+    // The shim is not listed: its name comes from the library, and the staging run that writes
+    // liblitert-lm.so fails unless the shim it links against is staged beside it.
     val packagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
     tasks.matching { packagingTask.matches(it.name) }.configureEach {
         doLast {
@@ -527,6 +543,54 @@ if (shipLitertLmEngine) {
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+// ── The engine tether ─────────────────────────────────────────────────────────────────────
+//
+// libtether_exec.so, built from engines/tether-exec/tether_exec.c by scripts/stage-tether-exec.mjs with the NDK AGP
+// resolves, as for the LiteRT-LM server. The daemon starts every engine through it: it arms PR_SET_PDEATHSIG(SIGKILL)
+// and execs the engine in place, so the kernel kills the engine the moment the daemon's thread ends, however the app
+// process ends. Before, an engine's only tie to the app was system_server killing the app's cgroup after the process
+// had died. The daemon checks the helper at boot by watching it work, and without it (missing, or failing that check)
+// it ties each engine with a /system/bin/sh watcher instead: one more process per engine, counted against Android
+// 12+'s phantom process limit. So it is in every build, whatever the engine flags say, and its absence fails the build
+// like a missing LiteRT-LM engine does. See BUILDING-ENGINES.md, "The engine tether". Hooked to merge*JniLibFolders,
+// as stageLitertLmEngine is; two clang runs of one small file, so it runs every time.
+val stageTetherExec by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds libtether_exec.so, the helper that ties each engine to the app process, into the APK's jniLibs."
+    workingDir = rootProject.projectDir
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+    val outDir = tetherJniLibs
+    outputs.upToDateWhen { false }
+    doFirst {
+        commandLine(
+            "node", "scripts/stage-tether-exec.mjs",
+            "--ndk", androidExt.ndkDirectory.absolutePath,
+            "--out", outDir.get().asFile.absolutePath,
+            "--abis", shippedAbis.joinToString(","),
+        )
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(stageTetherExec)
+}
+// The APK/AAB tasks only, as for the LiteRT-LM engine above.
+val tetherPackagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
+tasks.matching { tetherPackagingTask.matches(it.name) }.configureEach {
+    doLast {
+        for (abi in shippedAbis) {
+            val f = tetherJniLibs.get().file("$abi/libtether_exec.so").asFile
+            if (!f.exists()) {
+                throw GradleException(
+                    "Engine tether missing: ${f.absolutePath}\n" +
+                        "The daemon would tie each engine with an extra sh process instead. " +
+                        "It is built by stageTetherExec (scripts/stage-tether-exec.mjs).",
+                )
             }
         }
     }

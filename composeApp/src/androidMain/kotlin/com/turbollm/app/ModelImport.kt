@@ -16,8 +16,6 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
@@ -30,8 +28,11 @@ private const val TAG = "TurboLLM"
  *  that folder itself in the app, see TurboLLM engines/seed.ts) and the engines can open by path. The cost is the
  *  file's size again until the user deletes the original.
  *
- *  - Each file is written to `<name>.part` and renamed only when complete, so an interrupted copy never shows up in the
- *    library. A `.part` left by a process that died mid-copy is swept at the next app start or import.
+ *  - Each file is written to `<name>.import-part` and renamed only when complete, so an interrupted copy never shows up
+ *    in the library. One left by a process that died mid-copy is swept at the next app start or import. The suffix is
+ *    the import's own because [modelsDir] is also one of the daemon's model folders: a download the daemon writes there
+ *    (a non-Hugging Face Import from URL once the user makes this folder the primary one) keeps its partial file as
+ *    `<name>.part` at the top level, which may be live or paused when a sweep runs and must never be swept.
  *  - Free space is checked first; a name already in use by a different file gets a numbered suffix, never overwritten.
  *  - A partial wake lock is held for the copy, and EngineService counts a running import as busy, so leaving the app
  *    neither freezes the copy nor stops the service under it.
@@ -39,20 +40,23 @@ private const val TAG = "TurboLLM"
 object ModelImport {
     private val MODEL_FILE = Regex("""\.(gguf|litertlm)$""", RegexOption.IGNORE_CASE)
     private val SPLIT_PART = Regex("""^(.*)-(\d{5})-of-(\d{5})\.gguf$""", RegexOption.IGNORE_CASE)
+    /** Not `.part`: that is the daemon's download suffix, in the same folder (see the class comment). */
+    private const val IMPORT_PART = ".import-part"
     private val running = AtomicBoolean(false)
 
     fun isRunning(): Boolean = running.get()
 
     fun modelsDir(context: Context) = File(context.filesDir, "models")
 
-    /** Delete `*.part` files: only ever left behind by a copy whose process died, since a live import renames or
-     *  deletes its own. Safe whenever no import is running. */
+    /** Delete `*.import-part` files: only ever left behind by a copy whose process died, since a live import renames or
+     *  deletes its own. Safe whenever no import is running. A daemon download's `*.part` here is left alone: deleting
+     *  it under a running download made its final rename fail with ENOENT, and a paused one resume from byte 0. */
     fun sweepPartialFiles(context: Context) {
         if (!running.get()) sweep(modelsDir(context))
     }
 
     private fun sweep(dir: File) {
-        dir.listFiles { f -> f.isFile && f.name.endsWith(".part") }?.forEach { f ->
+        dir.listFiles { f -> f.isFile && f.name.endsWith(IMPORT_PART) }?.forEach { f ->
             if (f.delete()) Log.i(TAG, "removed an interrupted import: ${f.name}")
         }
     }
@@ -90,7 +94,7 @@ object ModelImport {
             try {
                 wakeLock.acquire(3 * 60 * 60 * 1000L)
                 val dest = modelsDir(app).apply { mkdirs() }
-                sweep(dest) // this import has written nothing yet, so any .part here is a dead one
+                sweep(dest) // this import has written nothing yet, so any .import-part here is a dead one
                 for ((i, uri) in uris.withIndex()) {
                     if (cancelled.get()) break
                     var label = uri.lastPathSegment ?: "file ${i + 1}"
@@ -114,7 +118,7 @@ object ModelImport {
                         }
                         val target = freeName(dest, name)
                         main.post { status.text = "${i + 1} of ${uris.size}: $name"; bar.progress = 0 }
-                        part = File(dest, "${target.name}.part")
+                        part = File(dest, "${target.name}$IMPORT_PART")
                         copyStream(app, uri, part, size, cancelled) { p -> main.post { bar.progress = p } }
                         if (!part.renameTo(target)) throw IllegalStateException("could not finish writing the file")
                         part = null
@@ -222,7 +226,7 @@ object ModelImport {
     /** Add the folder to the daemon's model folders (a no-op when it is there already); that request also rescans.
      *  False when the daemon did not accept it, so the caller says so instead of reporting a silent success. */
     private fun registerWithDaemon(dir: File): Boolean = runCatching {
-        val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/modeldirs").openConnection() as HttpURLConnection
+        val conn = DaemonAuth.open("/api/v1/modeldirs")
         try {
             conn.requestMethod = "POST"
             conn.doOutput = true

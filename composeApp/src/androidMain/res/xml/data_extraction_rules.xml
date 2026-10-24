@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 12+ (dataExtractionRules): the same exclusions as backup_rules.xml, for cloud backup and device transfer. -->
+<!-- Android 12+ (dataExtractionRules): the same exclusions as backup_rules.xml, for cloud backup and device transfer.
+     What is kept includes the chats and the daemon's settings file .turbollm/config.json, which also holds the
+     third-party tokens the user entered (Hugging Face, GitHub, tunnel, search, MCP, Turbo Link peers) in plaintext.
+     That is deliberate for now: see play-store-assets/privacy-notes.md ("Backups"). -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="daemon.log" />
@@ -8,13 +11,36 @@
         <!-- Imported models: multi-GB files exceed the backup quota, which makes Android skip the whole backup,
              chat history included. They can be imported again. -->
         <exclude domain="file" path="models/" />
+        <!-- Downloaded models: the daemon's default download folder (~/.turbollm/models, HOME being filesDir), the same
+             quota problem. They can be downloaded again. -->
+        <exclude domain="file" path=".turbollm/models/" />
+        <!-- LiteRT-LM's compiled-model cache for models in read-only folders: rebuilt on the next load. -->
+        <exclude domain="file" path=".turbollm/cache/" />
+        <!-- Engine logs: per-device diagnostics, like daemon.log. -->
+        <exclude domain="file" path=".turbollm/logs/" />
+        <!-- The daemon payload (~15 MB, most of the quota on its own): re-extracted from the APK (MainActivity.kt). -->
+        <exclude domain="file" path="daemon/" />
+        <!-- The app's external files folder, Android/data/com.turbollm/files/ (the "external" domain), which Auto
+             Backup takes by default: the app writes nothing there, but a model folder or download folder the user adds
+             inside it holds multi-GB models, the same quota problem. The whole folder, since the user names those. -->
+        <exclude domain="external" path="." />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="daemon.log" />
         <exclude domain="file" path="daemon.log.1" />
         <exclude domain="file" path="last-crash.txt" />
-        <!-- Imported models: multi-GB files exceed the backup quota, which makes Android skip the whole backup,
-             chat history included. They can be imported again. -->
+        <!-- Imported models (models/) and downloaded ones (~/.turbollm/models, HOME being filesDir): a device transfer
+             has no backup quota, but multi-GB files make it much slower. They can be imported or downloaded again. -->
         <exclude domain="file" path="models/" />
+        <exclude domain="file" path=".turbollm/models/" />
+        <!-- LiteRT-LM's compiled-model cache for models in read-only folders: rebuilt on the next load. -->
+        <exclude domain="file" path=".turbollm/cache/" />
+        <!-- Engine logs: per-device diagnostics, like daemon.log. -->
+        <exclude domain="file" path=".turbollm/logs/" />
+        <!-- The daemon payload: re-extracted from the APK (MainActivity.kt), so copying it is wasted. -->
+        <exclude domain="file" path="daemon/" />
+        <!-- The app's external files folder, Android/data/com.turbollm/files/: the app writes nothing there, but a
+             model or download folder the user adds inside it holds multi-GB models, as in models/ above. -->
+        <exclude domain="external" path="." />
     </device-transfer>
 </data-extraction-rules>

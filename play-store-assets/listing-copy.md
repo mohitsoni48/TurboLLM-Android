@@ -52,8 +52,8 @@ WHAT YOU CAN DO
   model — fully offline, even in airplane mode.
 - Discover and download models straight from Hugging Face, right inside the
   app, with one tap.
-- The inference engine installs itself automatically the first time you need
-  it — no manual setup, no compiling, no terminal.
+- The inference engines come built into the app — no setup, no compiling,
+  no terminal.
 - Create custom AI agents with their own system prompt and skill/tool access,
   for different tasks — coding help, writing, research, or a completely
   blank slate with zero injected instructions.
@@ -70,12 +70,21 @@ PRIVACY BY DESIGN
 - No account, no login, no cloud backend for your conversations.
 - No telemetry, no analytics, no crash-reporting SDK phoning home in this
   build.
-- Chats and downloaded models live only in this app's private storage on
-  your device.
-- Your prompts, files, and model weights are never sent to us or anyone
-  else. The only network requests this app makes are ones you triggered
-  yourself: downloading a model you picked, fetching the inference engine
-  binary the first time it's needed, or a tool call you explicitly approved.
+- Your chats stay in this app's private storage on your device. Android's
+  own backup to your Google account and its transfer to a new phone also
+  copy them off it, if you use them (with a screen lock on Android 9 and
+  later, the backup is end-to-end encrypted). Downloaded models stay in
+  the app's storage unless you pick another folder for them.
+- Your prompts, files, and model weights are never sent to us. They can
+  leave the phone through that backup (which leaves models out), a tool
+  call you approve, a device or service you connect the app to yourself,
+  or an image in a reply. Images in a reply or a model card load from
+  the website they name as soon as they show, without asking you, so a
+  reply can make the app contact that site and pass it text from the
+  chat in the image's address. Apart from those images, the app goes
+  online only for what you ask of it: browsing Hugging Face and
+  downloading the models you pick, a tool call you explicitly approve,
+  or a device or service you connect it to.
 
 WORTH KNOWING
 
@@ -90,9 +99,9 @@ WHO IT'S FOR
 Privacy-conscious users, local-AI enthusiasts, developers who already run
 TurboLLM or llama.cpp on a computer, and anyone curious what a genuinely
 offline LLM chat feels like on a phone — under your control, on your
-hardware, with nothing leaving the device.
+hardware.
 ```
-(2,736 chars — well under the 4,000 limit; keyword density: "local" x6, "offline" x5, "AI"/"LLM"
+(3,336 chars — well under the 4,000 limit; keyword density: "local" x6, "offline" x5, "AI"/"LLM"
 x9, "on-device" x2, "privacy/private" x3, "no cloud/account/subscription/telemetry" x5, plus
 feature nouns tuned for search — Hugging Face, GGUF, agents, tokens, llama.cpp.)
 
