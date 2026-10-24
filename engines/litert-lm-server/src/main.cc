@@ -309,6 +309,11 @@ struct ModelFileInfo {
   bool artisan = false;
   // The number of logits its decode signature outputs: its vocabulary. 0 when unknown.
   int vocabulary = 0;
+  // What LlmMetadata says about thinking: its supports_thinking (field 11, absent from most files: LFM2.5-230M,
+  // Qwen3-0.6B, Gemma 4), whether its Jinja template has the enable_thinking switch (Qwen3's and Gemma 4's do), and
+  // whether it has a channel, the thinking one being the first (Conversation::CreateDecodeConfig).
+  std::optional<bool> supports_thinking;
+  bool thinking_switch = false, channel = false;
 };
 
 // Bounds-checked reads of a FlatBuffer of `size` bytes, through `read`: just what the server needs of the header's
@@ -453,6 +458,14 @@ void ReadSampler(const std::string& llm_metadata, ModelFileInfo& info) {
   });
 }
 
+void ReadThinking(const std::string& llm_metadata, ModelFileInfo& info) {
+  ForEachProtoField(llm_metadata, [&](int field, uint64_t v, const std::string& bytes) {
+    if (field == 11) info.supports_thinking = v != 0;
+    if (field == 7) info.thinking_switch = bytes.find("enable_thinking") != std::string::npos;
+    if (field == 8) info.channel = true;
+  });
+}
+
 // What the server needs of the model's main TFLite graph (a tflite::Model FlatBuffer: subgraphs 2, signature_defs 7;
 // SignatureDef inputs 0, outputs 1, signature_key 2, subgraph_index 4; TensorMap name 0, tensor_index 1; SubGraph
 // tensors 0; Tensor shape 0), read through `m` where it lies in the file, a few tables of it and never the whole: the
@@ -570,7 +583,10 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
       continue;
     }
     info.recurrent_state |= HasRecurrentState(type, proto);
-    if (type == 5) ReadSampler(proto, info);
+    if (type == 5) {
+      ReadSampler(proto, info);
+      ReadThinking(proto, info);
+    }
   }
   if (main_end > main_begin) {
     const FbReader model{[&in, main_begin](uint64_t pos, void* out, size_t n) {
@@ -1083,20 +1099,21 @@ std::string CrossSiteRefusal(const Request& req) {
 }
 
 bool SendResponse(int fd, const Request& req, int status, const std::string& reason, const std::string& content_type,
-                  const std::string& body) {
+                  const std::string& body, const std::string& extra_headers = "") {
   std::string head = "HTTP/1.1 " + std::to_string(status) + " " + SafeReason(reason) + "\r\n";
   head += std::string("Server: ") + kServerName + "/" + kServerVersion + "\r\n";
   head += "Content-Type: " + content_type + "\r\n";
   head += "Content-Length: " + std::to_string(body.size()) + "\r\n";
   head += "Connection: close\r\n";
+  head += extra_headers;
   head += CorsHeaders(req);
   head += "\r\n";
   return SendAll(fd, head + body);
 }
 
-bool SendJson(int fd, const Request& req, int status, const json& j) {
+bool SendJson(int fd, const Request& req, int status, const json& j, const std::string& extra_headers = "") {
   return SendResponse(fd, req, status, ReasonFor(status), "application/json",
-                      j.dump(2, ' ', false, json::error_handler_t::replace) + "\n");
+                      j.dump(2, ' ', false, json::error_handler_t::replace) + "\n", extra_headers);
 }
 
 // Python's send_error: the message is the status line's reason phrase. The body is an
@@ -1327,20 +1344,79 @@ LiteRtLmThinkingConfig* MakeThinking(bool enable, int budget) {
   return t;
 }
 
-// openai_common.parse_thinking_config: reasoning_effort wins; otherwise the config's thinking keys.
-std::optional<std::pair<bool, int>> ParseThinking(const json& body, const ModelConfig& mc) {
-  if (body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()) {
-    if (!body["reasoning_effort"].is_string()) throw HttpError(400, "Invalid thinking parameters: ValueError: reasoning_effort must be a string");
-    std::string e = Lower(body["reasoning_effort"].get<std::string>());
-    if (e == "none") return std::make_pair(false, 0);
-    if (e == "minimal" || e == "low" || e == "medium" || e == "high" || e == "xhigh") return std::make_pair(true, -1);
-    throw HttpError(400, "Invalid thinking parameters: ValueError: Invalid reasoning_effort value: '" + e +
+// Thinking as a request asks for it. The server read only the top-level reasoning_effort and the config's thinking
+// keys (openai_common.parse_thinking_config), and passed an empty extra context with every message, so what TurboLLM
+// and other clients send was dropped: chat_template_kwargs (enable_thinking, reasoning_effort, preserve_thinking),
+// which LiteRT-LM renders into the model's Jinja template as extra context (c/conversation.cc, CreateOptionalArgs), and
+// thinking_budget_tokens, whose budget the runtime enforces (ThinkingBudgetConstraint, runtime/core/tasks.cc). On
+// Qwen3-0.6B {"chat_template_kwargs": {"enable_thinking": false}} and {"thinking_budget_tokens": 0} both thought for
+// 190 tokens; only reasoning_effort "none" turned it off. In order, the first that says: the top-level
+// reasoning_effort (as the Python server, and what the daemon sends for a LiteRT-LM model), then
+// chat_template_kwargs.enable_thinking, then chat_template_kwargs.reasoning_effort, then thinking_budget_tokens (0 is
+// off, n > 0 a budget of n, below 0 no budget), then the config's thinking keys. A budget of n > 0 applies whichever
+// turned thinking on. reasoning_effort's levels other than none turn it on with no budget, and none turns it off, as in
+// the Python server.
+struct Thinking {
+  bool enable;
+  int budget;  // -1: none
+  std::string from;
+};
+
+// Whether a model thinks, as its file says: its metadata's supports_thinking, else its template's switch or a thinking
+// channel (gemma-3-270m-it has neither).
+bool Thinks(const ModelFileInfo& m) { return m.supports_thinking ? *m.supports_thinking : m.thinking_switch || m.channel; }
+
+// The 400 for thinking turned on, by `t`, for a model that does not think.
+HttpError ThinkingRefused(const ModelFileInfo& m, const Thinking& t, const std::string& id) {
+  return HttpError(400, "Invalid thinking parameters: " + t.from + " turns thinking on, but " + id +
+                            (m.supports_thinking ? " does not think (its metadata says so)" : " does not think"));
+}
+
+std::optional<Thinking> ParseThinking(const json& body, const ModelConfig& mc) {
+  auto effort = [](const json& v, const std::string& field) -> Thinking {
+    if (!v.is_string()) throw HttpError(400, "Invalid thinking parameters: ValueError: " + field + " must be a string");
+    std::string e = Lower(v.get<std::string>());
+    if (e == "none") return {false, 0, field};
+    if (e == "minimal" || e == "low" || e == "medium" || e == "high" || e == "xhigh") return {true, -1, field};
+    throw HttpError(400, "Invalid thinking parameters: ValueError: Invalid " + field + " value: '" + e +
                              "'. Supported strings: none, minimal, low, medium, high, xhigh.");
+  };
+  auto has = [](const json& o, const char* k) { return o.contains(k) && !o[k].is_null(); };
+  std::optional<Thinking> t;
+  if (has(body, "reasoning_effort")) t = effort(body["reasoning_effort"], "reasoning_effort");
+  if (has(body, "chat_template_kwargs")) {
+    const json& ctk = body["chat_template_kwargs"];
+    if (!ctk.is_object()) throw HttpError(400, "Invalid thinking parameters: ValueError: chat_template_kwargs must be an object");
+    if (has(ctk, "enable_thinking")) {
+      if (!ctk["enable_thinking"].is_boolean()) {
+        throw HttpError(400, "Invalid thinking parameters: ValueError: chat_template_kwargs.enable_thinking must be a boolean");
+      }
+      if (!t) t = Thinking{ctk["enable_thinking"].get<bool>(), ctk["enable_thinking"].get<bool>() ? -1 : 0,
+                           "chat_template_kwargs.enable_thinking"};
+    }
+    if (has(ctk, "reasoning_effort")) {
+      Thinking e = effort(ctk["reasoning_effort"], "chat_template_kwargs.reasoning_effort");
+      if (!t) t = e;
+    }
   }
-  if (!mc.thinking && !mc.thinking_budget) return std::nullopt;
+  if (has(body, "thinking_budget_tokens")) {
+    const json& b = body["thinking_budget_tokens"];
+    if (!b.is_number_integer()) throw HttpError(400, "Invalid thinking parameters: ValueError: thinking_budget_tokens must be an integer");
+    const long long n = b.get<long long>();
+    if (n > INT32_MAX) throw HttpError(400, "Invalid thinking parameters: ValueError: thinking_budget_tokens is too large");
+    if (!t) {
+      t = Thinking{n != 0, n > 0 ? static_cast<int>(n) : n == 0 ? 0 : -1, "thinking_budget_tokens"};
+    } else if (t->enable && n > 0) {
+      t->budget = static_cast<int>(n);
+    } else if (t->enable != (n != 0)) {
+      Log("thinking_budget_tokens " + std::to_string(n) + " is not used: " + t->from + " turned thinking " +
+          (t->enable ? "on" : "off"));
+    }
+  }
+  if (t || (!mc.thinking && !mc.thinking_budget)) return t;
   bool thinking = mc.thinking ? *mc.thinking : (*mc.thinking_budget != 0);
   int budget = mc.thinking_budget ? *mc.thinking_budget : (thinking ? -1 : 0);
-  return std::make_pair(thinking, budget);
+  return Thinking{thinking, budget, "the config's thinking"};
 }
 
 // The sampler a conversation is created with. A session's sampler parameters replace the model's own entirely: the
@@ -1577,7 +1653,7 @@ void HandleChatCompletions(int fd, const Request& req) {
         has_sampler = true;
       }
     }
-    auto thinking = ParseThinking(body, mc);
+    std::optional<Thinking> thinking = ParseThinking(body, mc);
     auto constraint = ParseResponseFormat(body);
 
     json tools = json::array();
@@ -1624,6 +1700,15 @@ void HandleChatCompletions(int fd, const Request& req) {
     note_parts(prompt);
 
     std::lock_guard<std::mutex> engine_lock(g_engine_mu);
+    // Thinking turned on for a model that does not think is refused before anything loads, as an image for a model
+    // without vision is (GetOrCreateEngine): refused once loaded, it first released the model that was loaded and
+    // loaded this one (gemma-3-270m-it with reasoning_effort "high": a 400 after 0.6 s, and the next request to the
+    // model before it paid its whole load again). A file whose header the server cannot read is left to the check
+    // below, once the runtime has loaded it, as before.
+    if (thinking && thinking->enable) {
+      const ModelFileInfo& info = FileInfo(ref);
+      if (info.capabilities_known && !Thinks(info)) throw ThinkingRefused(info, *thinking, ref.id);
+    }
     LiteRtLmEngine* engine = GetOrCreateEngine(ref, mc, needs);
 
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
@@ -1663,11 +1748,47 @@ void HandleChatCompletions(int fd, const Request& req) {
     L.litert_lm_conversation_config_set_enable_constrained_decoding(cc, constrain_tools);
     LiteRtLmConstraintProviderType provider = kLiteRtLmConstraintProviderTypeLlGuidance;
     if (constraint) L.litert_lm_conversation_config_set_constraint_provider(cc, &provider);
+    // The model's thinking. A model that does not think (its metadata says so, or it has neither the template's switch
+    // nor a thinking channel: gemma-3-270m-it) cannot be asked to: a 400, before it loads (above) when the server could
+    // read its header, else here. Turning it off there changes nothing, so nothing is set. A model whose file does not
+    // say, whose template has no switch, but that has a channel (LFM2.5-230M, which does not think, and
+    // LFM2.5-1.2B-Thinking, which always does) gets what was asked as asked: LiteRT-LM 0.18.0 can neither turn on nor
+    // stop thinking there by itself (a budget of 0 sets no constraint, tasks.cc), and nothing in such a file tells the
+    // two apart, so a 400 for one would refuse the other. The server says so in its log once and, since a client sees
+    // nothing of that log, in every such reply's X-Thinking header ("unverified").
+    std::string note_headers;  // headers that tell the client what the server did with its request
     if (thinking) {
-      LiteRtLmThinkingConfig* t = MakeThinking(thinking->first, thinking->second);
+      const ModelFileInfo& m = g_engine.info;
+      const bool thinks = Thinks(m);
+      if (!thinks && thinking->enable) {
+        L.litert_lm_conversation_config_delete(cc);
+        throw ThinkingRefused(m, *thinking, ref.id);
+      }
+      if (!thinks) {
+        thinking.reset();
+      } else if (!m.supports_thinking && !m.thinking_switch) {
+        note_headers += "X-Thinking: unverified\r\n";
+        static std::set<std::string> told;
+        if (told.insert(ref.path).second) {
+          Log(ref.id + " does not say whether it thinks, and its template has no switch for it; thinking " +
+              (thinking->enable ? "on" : "off") + " (" + thinking->from + ") is passed to it as asked");
+        }
+      }
+    }
+    if (thinking) {
+      LiteRtLmThinkingConfig* t = MakeThinking(thinking->enable, thinking->budget);
       L.litert_lm_conversation_config_set_thinking_config(cc, t);
       L.litert_lm_thinking_config_delete(t);
     }
+    // chat_template_kwargs is the template's extra context, for the preface and for the message, and its
+    // enable_thinking is what was decided above, which the template reads in place of the thinking config's
+    // (conversation.cc), so that the template and the decoder's budget agree.
+    json extra_context = body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()
+                             ? body["chat_template_kwargs"]
+                             : json::object();
+    if (thinking && !extra_context.empty()) extra_context["enable_thinking"] = thinking->enable;
+    const std::string extra_context_str = extra_context.dump();
+    if (!extra_context.empty()) L.litert_lm_conversation_config_set_extra_context(cc, extra_context_str.c_str());
     // Declared before the conversation so it is freed after it: deleting the conversation waits for its generation to
     // end (~SessionAdvanced's WaitUntilDone), and until then the runtime may call StreamCallback with this queue, even
     // after a chunk marked final (see the error branch of the drain loop below).
@@ -1730,7 +1851,8 @@ void HandleChatCompletions(int fd, const Request& req) {
     std::string msg_str = prompt.dump();
     L.litert_lm_clear_last_error();
     g_engine.state_used = true;  // even a send that fails may have prefilled part of the message
-    int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), "{}", oa, StreamCallback, &q);
+    int rc = L.litert_lm_conversation_send_message_stream(conv.get(), msg_str.c_str(), extra_context_str.c_str(), oa,
+                                                          StreamCallback, &q);
     L.litert_lm_conversation_optional_args_delete(oa);
     // Declared after the queue and the conversation, so it runs before either is destroyed.
     StreamGuard guard(q_owner, conv.get());
@@ -1749,7 +1871,7 @@ void HandleChatCompletions(int fd, const Request& req) {
 
     if (stream) {
       std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n" +
-                         CorsHeaders(req) + "\r\n";
+                         note_headers + CorsHeaders(req) + "\r\n";
       headers_sent = true;
       SendAll(fd, head + Sse(make_chunk(json::array({{{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}}}))));
     }
@@ -1909,7 +2031,7 @@ void HandleChatCompletions(int fd, const Request& req) {
                  {"choices", json::array({{{"index", 0}, {"message", message}, {"finish_reason", finish}}})},
                  {"usage", usage},
                  {"timings", timings}};
-    SendJson(fd, req, 200, resp);
+    SendJson(fd, req, 200, resp, note_headers);
   } catch (const HttpError& e) {
     Log("request failed: " + std::string(e.what()));
     if (!headers_sent) SendError(fd, req, e.status, e.what());

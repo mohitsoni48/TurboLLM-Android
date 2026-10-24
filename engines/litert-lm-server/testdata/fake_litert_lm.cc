@@ -43,7 +43,9 @@ struct LiteRtLmSamplerParams {
 struct LiteRtLmSessionConfig {
   nlohmann::json sampler;
 };
-struct LiteRtLmThinkingConfig {};
+struct LiteRtLmThinkingConfig {
+  nlohmann::json j = nlohmann::json::object();
+};
 struct LiteRtLmConversationConfig {
   bool constrained = false, tools = false, provider = false;
   nlohmann::json config = nlohmann::json::object();
@@ -123,6 +125,16 @@ void litert_lm_conversation_config_set_session_config(LiteRtLmConversationConfig
 
 LiteRtLmThinkingConfig* litert_lm_thinking_config_create() { return new LiteRtLmThinkingConfig; }
 void litert_lm_thinking_config_delete(LiteRtLmThinkingConfig* c) { delete c; }
+void litert_lm_thinking_config_set_enable_thinking(LiteRtLmThinkingConfig* c, bool enable) { c->j["enable"] = enable; }
+void litert_lm_thinking_config_set_thinking_token_budget(LiteRtLmThinkingConfig* c, int32_t budget) {
+  c->j["budget"] = budget;
+}
+void litert_lm_conversation_config_set_thinking_config(LiteRtLmConversationConfig* c, const LiteRtLmThinkingConfig* t) {
+  c->config["thinking"] = t->j;
+}
+void litert_lm_conversation_config_set_extra_context(LiteRtLmConversationConfig* c, const char* extra_context_json) {
+  c->config["extra_context"] = nlohmann::json::parse(extra_context_json ? extra_context_json : "null", nullptr, false);
+}
 
 LiteRtLmConversationConfig* litert_lm_conversation_config_create() { return new LiteRtLmConversationConfig; }
 void litert_lm_conversation_config_delete(LiteRtLmConversationConfig* c) { delete c; }
@@ -169,9 +181,12 @@ void litert_lm_conversation_optional_args_set_constraint(LiteRtLmConversationOpt
   a->pattern = pattern ? pattern : "";
 }
 
-int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const char*, const char*,
-                                               const LiteRtLmConversationOptionalArgs* a,
+int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const char* message,
+                                               const char* extra_context, const LiteRtLmConversationOptionalArgs* a,
                                                LiteRtLmStreamCallback callback, void* data) {
+  Record({{"call", "send_message"},
+          {"message", nlohmann::json::parse(message ? message : "null", nullptr, false)},
+          {"extra_context", nlohmann::json::parse(extra_context ? extra_context : "null", nullptr, false)}});
   const LiteRtLmConstraintType type = a ? a->type : kLiteRtLmConstraintTypeNone;
   if (type == kLiteRtLmConstraintTypeRegex && a->pattern == "(") {
     g_error = "INTERNAL: Failed to create LLGuidance constraint: invalid regex \"(\": unclosed group";

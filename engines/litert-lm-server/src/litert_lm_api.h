@@ -30,6 +30,7 @@
   X(litert_lm_conversation_config_delete) \
   X(litert_lm_conversation_config_set_constraint_provider) \
   X(litert_lm_conversation_config_set_enable_constrained_decoding) \
+  X(litert_lm_conversation_config_set_extra_context) \
   X(litert_lm_conversation_config_set_messages) \
   X(litert_lm_conversation_config_set_session_config) \
   X(litert_lm_conversation_config_set_thinking_config) \

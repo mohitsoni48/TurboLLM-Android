@@ -104,7 +104,7 @@ export async function request(url, init, ms) {
   const signal = AbortSignal.timeout(ms)
   try {
     const res = await fetch(url, { ...init, signal })
-    return { status: res.status, text: await res.text() }
+    return { status: res.status, text: await res.text(), headers: res.headers }
   } catch (err) {
     if (!signal.aborted) throw err
     throw new Error(`${init?.method ?? 'GET'} ${url} ${init?.body ?? ''}: no reply in ${ms / 1000} s`)
@@ -129,6 +129,7 @@ export async function chat(server, body, ms = 30_000) {
       reasoning: chunks.map((c) => c.choices[0]?.delta?.reasoning_content ?? '').join(''),
       finish: chunks.at(-1).choices[0].finish_reason,
       chunks,
+      headers: res.headers,
     }
   }
   const json = JSON.parse(text)
@@ -140,6 +141,7 @@ export async function chat(server, body, ms = 30_000) {
     tool_calls: json.choices[0].message.tool_calls,
     finish: json.choices[0].finish_reason,
     usage: json.usage,
+    headers: res.headers,
   }
 }
 

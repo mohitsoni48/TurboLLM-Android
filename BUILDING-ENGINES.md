@@ -396,6 +396,23 @@ or below means no top-k limit, as in llama.cpp (TurboLLM's Top K 0 means disable
 outside 0 to 1, a negative `temperature`, and a `top_k` or `seed` with a fraction are a 400 that
 names the field instead of the runtime's 500.
 
+**Thinking is asked for the ways clients ask for it.** In order, the first that says: the
+top-level `reasoning_effort` (what the Python server reads, and what the daemon sends for a
+LiteRT-LM model), `chat_template_kwargs.enable_thinking`,
+`chat_template_kwargs.reasoning_effort`, then `thinking_budget_tokens` (0 is off, n > 0 a budget
+of n tokens, which also applies when another field turned thinking on), then the config's
+`thinking` keys. `chat_template_kwargs` is passed to the model's template as its extra context,
+with the `enable_thinking` decided above so that the template and the decoder's budget agree,
+and its other keys (`preserve_thinking`, which LFM2's template reads) as sent. A model that does
+not think (its metadata says so, or it has neither the template's switch nor a thinking channel:
+gemma-3-270m-it) gets a 400 for thinking on, and thinking off changes nothing there. A model
+whose file does not say and whose template has no switch, but that has a thinking channel
+(LFM2.5-230M, which does not think, and LFM2.5-1.2B-Thinking, which always does; LFM2-700M's and
+LFM2.5-350M's say they do not), gets the request's thinking as asked: LiteRT-LM 0.18.0 cannot
+stop such a model from thinking (a budget of 0 sets no constraint), and nothing in the file tells
+the two apart, so a 400 for one would refuse the other. The server logs that once, and every such
+reply carries `X-Thinking: unverified`, since a client sees nothing of the server's log.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker

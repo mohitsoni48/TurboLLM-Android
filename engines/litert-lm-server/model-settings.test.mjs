@@ -11,7 +11,8 @@
 //   LITERT_LM_TEST_LIBRARY=<liblitert-lm.so> LITERT_LM_TEST_MODELS=<model.litertlm>[,<model.litertlm>...] \
 //     node --test engines/litert-lm-server/model-settings.test.mjs
 // (an LFM2 one: litert-community/LFM2.5-230M on Hugging Face; a Gemma one: litert-community/gemma-3-270m-it).
-// LITERT_LM_TEST_VISION_MODELS (the same form) names models that take images (litert-community/LFM2.5-VL-450M).
+// LITERT_LM_TEST_VISION_MODELS (the same form) names models that take images (litert-community/LFM2.5-VL-450M), and
+// LITERT_LM_TEST_THINKING_MODELS models whose template switches thinking on and off (litert-community/Qwen3-0.6B).
 // Every server a test starts is killed by pid when that test ends, or at the latest when the tests end. Every wait is
 // bounded.
 import assert from 'node:assert/strict'
@@ -26,6 +27,9 @@ import {
 } from './testdata/harness.mjs'
 
 const visionModels = (process.env.LITERT_LM_TEST_VISION_MODELS ?? '').split(',').filter(Boolean)
+const thinkingModels = (process.env.LITERT_LM_TEST_THINKING_MODELS ?? '').split(',').filter(Boolean)
+const skipThinking = skip || (!realLibrary || !thinkingModels.length
+  ? 'set LITERT_LM_TEST_LIBRARY and LITERT_LM_TEST_THINKING_MODELS to run the server on models that think' : false)
 const skipVision = skip || (!realLibrary || !visionModels.length
   ? 'set LITERT_LM_TEST_LIBRARY and LITERT_LM_TEST_VISION_MODELS to run the server on models that take images' : false)
 
@@ -451,6 +455,145 @@ for (const path of realModels.length ? realModels : ['<model>']) {
         assert.equal(reply.status, 200, `${JSON.stringify(extra)}: ${reply.error}`)
       }
       for (const extra of [{ top_p: 1.5 }, { temperature: -1 }]) assert.equal((await ask(extra)).status, 400, JSON.stringify(extra))
+    } finally {
+      stopServer(server)
+    }
+  })
+}
+
+// LlmMetadata for a stand-in that thinks or not: supports_thinking (field 11), a Jinja template (7) and a channel (8).
+const thinkingMetadata = ({ flag, template, channel }) => ({
+  type: 5,
+  bytes: Buffer.concat([
+    ...(flag === undefined ? [] : [proto.varint(11, flag ? 1 : 0)]),
+    ...(template ? [proto.field(7, template)] : []),
+    ...(channel ? [proto.field(8, [proto.field(1, 'thought'), proto.field(2, '<think>'), proto.field(3, '</think>')])] : []),
+  ]),
+})
+const switchTemplate = "{%- if enable_thinking is defined and not enable_thinking -%}<think></think>{%- endif -%}"
+// What the conversation and its message were created with: its thinking config and the template's extra context.
+async function thinkingFor(server, body) {
+  const log = await callsDuring(async () => {
+    const reply = await chat(server, body)
+    assert.equal(reply.status, 200, reply.error)
+  })
+  const config = log.filter((c) => c.call === 'conversation_create').at(-1).config
+  const sent = log.filter((c) => c.call === 'send_message').at(-1)
+  return { thinking: config.thinking ?? null, preface: config.extra_context ?? null, message: sent.extra_context }
+}
+
+test('every way a request asks for thinking reaches the model, and the template is told what the decoder is', { skip, timeout: 60_000 }, async () => {
+  const model = litertlmFile(join(work, 'switch.litertlm'), [thinkingMetadata({ template: switchTemplate, channel: true })])
+  const ask = (request) => thinkingFor(fake, { model, messages: hello, ...request })
+  const on = { enable: true, budget: -1 }
+  const off = { enable: false, budget: 0 }
+  assert.deepEqual(await ask({}), { thinking: null, preface: null, message: {} })
+  assert.deepEqual((await ask({ reasoning_effort: 'none' })).thinking, off)
+  for (const level of ['minimal', 'low', 'medium', 'high', 'xhigh']) assert.deepEqual((await ask({ reasoning_effort: level })).thinking, on)
+  assert.deepEqual(await ask({ chat_template_kwargs: { enable_thinking: false } }),
+    { thinking: off, preface: { enable_thinking: false }, message: { enable_thinking: false } })
+  assert.deepEqual(await ask({ chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }),
+    { thinking: on, preface: { enable_thinking: true, preserve_thinking: true }, message: { enable_thinking: true, preserve_thinking: true } })
+  assert.deepEqual((await ask({ chat_template_kwargs: { reasoning_effort: 'low' } })).thinking, on)
+  assert.deepEqual((await ask({ chat_template_kwargs: { reasoning_effort: 'none' } })).thinking, off)
+  assert.deepEqual((await ask({ thinking_budget_tokens: 0 })).thinking, off)
+  assert.deepEqual((await ask({ thinking_budget_tokens: 256 })).thinking, { enable: true, budget: 256 })
+  assert.deepEqual((await ask({ reasoning_effort: 'medium', thinking_budget_tokens: 128 })).thinking, { enable: true, budget: 128 })
+  // The top-level reasoning_effort comes first, and the template is told the same.
+  assert.deepEqual(await ask({ reasoning_effort: 'none', chat_template_kwargs: { enable_thinking: true } }),
+    { thinking: off, preface: { enable_thinking: false }, message: { enable_thinking: false } })
+  const refused = async (request) => {
+    const reply = await chat(fake, { model, messages: hello, ...request })
+    assert.equal(reply.status, 400, JSON.stringify(request))
+    return reply.error
+  }
+  assert.equal(await refused({ chat_template_kwargs: 'enable_thinking=false' }), 'Invalid thinking parameters: ValueError: chat_template_kwargs must be an object')
+  assert.equal(await refused({ chat_template_kwargs: { enable_thinking: 'no' } }), 'Invalid thinking parameters: ValueError: chat_template_kwargs.enable_thinking must be a boolean')
+  assert.equal(await refused({ thinking_budget_tokens: 1.5 }), 'Invalid thinking parameters: ValueError: thinking_budget_tokens must be an integer')
+  assert.match(await refused({ chat_template_kwargs: { reasoning_effort: 'max' } }), /^Invalid thinking parameters: ValueError: Invalid chat_template_kwargs.reasoning_effort value: 'max'/)
+})
+
+test('thinking on for a model that does not think is a 400, and off changes nothing there', { skip, timeout: 60_000 }, async () => {
+  const none = litertlmFile(join(work, 'no-thinking.litertlm'), [thinkingMetadata({ template: '{{ messages }}' })])
+  const saysNo = litertlmFile(join(work, 'says-no.litertlm'), [thinkingMetadata({ flag: false, template: switchTemplate, channel: true })])
+  const saysYes = litertlmFile(join(work, 'says-yes.litertlm'), [thinkingMetadata({ flag: true })])
+  const unknown = litertlmFile(join(work, 'channel-only.litertlm'), [thinkingMetadata({ template: '{{ messages }}', channel: true })])
+  for (const [path, why] of [[none, 'no-thinking.litertlm does not think'], [saysNo, 'says-no.litertlm does not think (its metadata says so)']]) {
+    // Refused before it loads: the model loaded before stays loaded.
+    assert.equal((await chat(fake, { model: saysYes, messages: hello })).status, 200)
+    for (const [request, from] of [[{ reasoning_effort: 'high' }, 'reasoning_effort'], [{ chat_template_kwargs: { enable_thinking: true } }, 'chat_template_kwargs.enable_thinking'], [{ thinking_budget_tokens: 64 }, 'thinking_budget_tokens']]) {
+      const log = await callsDuring(async () => {
+        const reply = await chat(fake, { model: path, messages: hello, ...request })
+        assert.deepEqual(reply, { status: 400, error: `Invalid thinking parameters: ${from} turns thinking on, but ${why}` })
+      })
+      assert.deepEqual(settingsOf(log), [], `${basename(path)} was loaded for ${JSON.stringify(request)}`)
+    }
+    assert.deepEqual(settingsOf(await callsDuring(async () => {
+      assert.equal((await chat(fake, { model: saysYes, messages: hello })).status, 200)
+    })), [], 'the model loaded before was released')
+    for (const request of [{ reasoning_effort: 'none' }, { thinking_budget_tokens: 0 }]) assert.equal((await thinkingFor(fake, { model: path, messages: hello, ...request })).thinking, null)
+  }
+  assert.deepEqual((await thinkingFor(fake, { model: saysYes, messages: hello, reasoning_effort: 'high' })).thinking, { enable: true, budget: -1 })
+  for (let i = 0; i < 2; i++) assert.deepEqual((await thinkingFor(fake, { model: unknown, messages: hello, reasoning_effort: 'high' })).thinking, { enable: true, budget: -1 })
+  const lines = await logged(fake)
+  assert.equal(lines.filter((l) => l.startsWith('channel-only.litertlm does not say whether it thinks')).length, 1, fake.stderr)
+  assert.ok(lines.includes('channel-only.litertlm does not say whether it thinks, and its template has no switch for it; thinking on (reasoning_effort) is passed to it as asked'), fake.stderr)
+  assert.equal(lines.some((l) => l.startsWith('says-yes.litertlm does not say')), false)
+})
+
+test('a thinking request to a model whose file does not say whether it thinks is answered with X-Thinking: unverified', { skip, timeout: 60_000 }, async () => {
+  const unknown = litertlmFile(join(work, 'channel-only-note.litertlm'), [thinkingMetadata({ template: '{{ messages }}', channel: true })])
+  const saysYes = litertlmFile(join(work, 'says-yes-note.litertlm'), [thinkingMetadata({ flag: true })])
+  const switched = litertlmFile(join(work, 'switch-note.litertlm'), [thinkingMetadata({ template: switchTemplate, channel: true })])
+  const note = async (model, request, stream = false) => {
+    const reply = await chat(fake, { model, messages: hello, stream, ...request })
+    assert.equal(reply.status, 200, reply.error)
+    return reply.headers.get('x-thinking')
+  }
+  // Thinking on or off, streamed or not: the server could not tell whether the model does it.
+  for (const stream of [false, true]) {
+    assert.equal(await note(unknown, { reasoning_effort: 'high' }, stream), 'unverified')
+    assert.equal(await note(unknown, { chat_template_kwargs: { enable_thinking: false } }, stream), 'unverified')
+  }
+  // Not without a thinking request, nor for a model that says it thinks or whose template switches it.
+  assert.equal(await note(unknown, {}), null)
+  assert.equal(await note(saysYes, { reasoning_effort: 'high' }), null)
+  assert.equal(await note(switched, { reasoning_effort: 'none' }), null)
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model does not think when the request turns thinking off: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      for (const off of [{ chat_template_kwargs: { enable_thinking: false } }, { thinking_budget_tokens: 0 }, { reasoning_effort: 'none' }]) {
+        const reply = await chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'What is 2+3? Answer briefly.' }], max_completion_tokens: 64, seed: 1, ...off }, 300_000)
+        assert.equal(reply.status, 200, `${JSON.stringify(off)}: ${reply.error}`)
+        assert.equal(reply.reasoning, '', `${JSON.stringify(off)} thought: ${reply.reasoning}`)
+        assert.ok(reply.content, `${JSON.stringify(off)}: no answer`)
+      }
+    } finally {
+      stopServer(server)
+    }
+  })
+}
+
+for (const path of thinkingModels.length ? thinkingModels : ['<model>']) {
+  test(`a real model thinks when asked, within the budget it is given: ${path}`, { skip: skipThinking, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = (extra) => chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'What is 17 times 23?' }], max_completion_tokens: 400, seed: 1, ...extra }, 300_000)
+      const on = await ask({ chat_template_kwargs: { enable_thinking: true } })
+      assert.equal(on.status, 200, on.error)
+      assert.ok(on.reasoning.length > 0, 'no thinking')
+      const budgeted = await ask({ thinking_budget_tokens: 16 })
+      assert.equal(budgeted.status, 200, budgeted.error)
+      assert.ok(budgeted.reasoning.length > 0, 'no thinking')
+      assert.ok(budgeted.usage.completion_tokens_details.reasoning_tokens <= 24, `thought ${budgeted.usage.completion_tokens_details.reasoning_tokens} chunks for a budget of 16`)
+      assert.ok(budgeted.usage.completion_tokens_details.reasoning_tokens < on.usage.completion_tokens_details.reasoning_tokens)
     } finally {
       stopServer(server)
     }
