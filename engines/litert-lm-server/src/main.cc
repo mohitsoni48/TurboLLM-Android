@@ -1813,6 +1813,20 @@ void HandleChatCompletions(int fd, const Request& req) {
     }
     // conversation.normalize_message: a bare string is a user turn.
     if (prompt.is_string()) prompt = {{"role", "user"}, {"content", prompt}};
+    // A conversation that ends with the assistant's own words (a client prefilling the start of the reply, which the
+    // daemon's gateway passes through) asks for that reply to be continued. LiteRT-LM 0.18.0 can do that only from
+    // C++ (OptionalArgs::has_pending_message, runtime/conversation/conversation.h); its C API has no way to, so the
+    // message was sent as a finished turn and the model began a new reply: [user "What is the capital of France?",
+    // assistant "The capital of France is"] got "The capital of France is Paris.", which a client appending it to its
+    // prefill doubles. A 400 that says so instead. An assistant turn of tool calls is the model's own, as before; one
+    // whose tool_calls is null or empty, as clients that write every optional field send a plain reply, has none.
+    const bool has_calls = prompt.is_object() && prompt.contains("tool_calls") && prompt["tool_calls"].is_array() &&
+                           !prompt["tool_calls"].empty();
+    if (prompt.is_object() && prompt.value("role", "") == "assistant" && !has_calls) {
+      SendError(fd, req, 400, "Invalid messages: the last message is the assistant's, and this server cannot continue "
+                              "a reply (LiteRT-LM's C API has no way to); end with a user or tool message");
+      return;
+    }
 
     // max_completion_tokens, or max_tokens, OpenAI's older name for it, which the server did not read: a client that
     // sent max_tokens 5 got the whole reply. Below 1 is a 400, as OpenAI answers it: the runtime generated one token

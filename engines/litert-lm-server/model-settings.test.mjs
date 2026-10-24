@@ -1061,3 +1061,25 @@ test('n above 1, logprobs and top_logprobs, which LiteRT-LM cannot give, are 400
     assert.deepEqual(await chat(fake, { model, messages: hello, ...request }), { status: 400, error }, JSON.stringify(request))
   }
 })
+
+test('a conversation that ends with the assistant\'s words is a 400 that says the reply cannot be continued', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const error = "Invalid messages: the last message is the assistant's, and this server cannot continue a reply " +
+    "(LiteRT-LM's C API has no way to); end with a user or tool message"
+  for (const stream of [false, true]) {
+    for (const last of [
+      { role: 'assistant', content: 'The capital of France is' },
+      { role: 'assistant', content: [{ type: 'text', text: 'The' }] },
+      // with no calls, as clients that write out every optional field send a plain reply
+      { role: 'assistant', content: 'The capital of France is', tool_calls: null },
+      { role: 'assistant', content: 'The capital of France is', tool_calls: [] },
+    ]) {
+      const reply = await chat(fake, { model, messages: [{ role: 'user', content: 'What is the capital of France?' }, last], stream })
+      assert.deepEqual(reply, { status: 400, error })
+    }
+  }
+  // An assistant turn of tool calls, and the history's own assistant turns, are as before.
+  const calls = { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] }
+  assert.equal((await chat(fake, { model, messages: [...hello, calls] })).status, 200)
+  assert.equal((await chat(fake, { model, messages: [...hello, { role: 'assistant', content: 'Hi.' }, ...hello] })).status, 200)
+})

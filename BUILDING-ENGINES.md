@@ -460,6 +460,11 @@ start, the engine falls back to the next one the model lists, CPU for most, and 
 does not list, and the server logs why; when none starts, the error gives each one's reason. A
 backend the user set is used as set, failing as before.
 
+**A conversation that ends with the assistant's own words is a 400.** A client that prefills the
+start of a reply asks for it to be continued, which LiteRT-LM 0.18.0 can do only from C++
+(`has_pending_message`); through the C API the partial reply was sent as a finished turn and the
+model began a new one, which the client then appended to its prefill.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker
