@@ -11,6 +11,8 @@
 //   no-llg           has no LLGuidance constraint provider (constraint_provider_factory.cc:43-56)
 //   broken           cannot create any conversation
 //   anything else    takes both (a Gemma model whose vocabulary the FST library supports)
+// Each conversation created is logged with what its config asked for: {"call": "conversation_create", "model": ...,
+// "config": {"sampler": {...}, ...}}.
 // A conversation answers with one chunk of text that says how it was created and sent, for example
 // "constrained=1 tools=1 provider=0 constraint=0 creates=3", where creates counts every litert_lm_conversation_create
 // call in the process. A regex that does not compile fails the send as llguidance does
@@ -35,10 +37,16 @@ struct LiteRtLmEngineSettings {
 struct LiteRtLmEngine {
   std::string model;
 };
-struct LiteRtLmSessionConfig {};
+struct LiteRtLmSamplerParams {
+  nlohmann::json j;
+};
+struct LiteRtLmSessionConfig {
+  nlohmann::json sampler;
+};
 struct LiteRtLmThinkingConfig {};
 struct LiteRtLmConversationConfig {
   bool constrained = false, tools = false, provider = false;
+  nlohmann::json config = nlohmann::json::object();
 };
 struct LiteRtLmConversation {
   LiteRtLmConversationConfig config;
@@ -98,6 +106,21 @@ void litert_lm_engine_delete(LiteRtLmEngine* e) { delete e; }
 
 LiteRtLmSessionConfig* litert_lm_session_config_create() { return new LiteRtLmSessionConfig; }
 void litert_lm_session_config_delete(LiteRtLmSessionConfig* c) { delete c; }
+LiteRtLmSamplerParams* litert_lm_sampler_params_create(LiteRtLmSamplerType type) {
+  return new LiteRtLmSamplerParams{{{"type", type}}};
+}
+void litert_lm_sampler_params_delete(LiteRtLmSamplerParams* p) { delete p; }
+void litert_lm_sampler_params_set_top_k(LiteRtLmSamplerParams* p, int32_t k) { p->j["top_k"] = k; }
+void litert_lm_sampler_params_set_top_p(LiteRtLmSamplerParams* p, float v) { p->j["top_p"] = v; }
+void litert_lm_sampler_params_set_temperature(LiteRtLmSamplerParams* p, float v) { p->j["temperature"] = v; }
+void litert_lm_sampler_params_set_seed(LiteRtLmSamplerParams* p, int32_t seed) { p->j["seed"] = seed; }
+void litert_lm_session_config_set_sampler_params(LiteRtLmSessionConfig* c, const LiteRtLmSamplerParams* p) {
+  c->sampler = p->j;
+}
+void litert_lm_conversation_config_set_session_config(LiteRtLmConversationConfig* c, const LiteRtLmSessionConfig* s) {
+  c->config["sampler"] = s->sampler;
+}
+
 LiteRtLmThinkingConfig* litert_lm_thinking_config_create() { return new LiteRtLmThinkingConfig; }
 void litert_lm_thinking_config_delete(LiteRtLmThinkingConfig* c) { delete c; }
 
@@ -118,6 +141,7 @@ void litert_lm_conversation_config_set_constraint_provider(LiteRtLmConversationC
 LiteRtLmConversation* litert_lm_conversation_create(LiteRtLmEngine* engine, LiteRtLmConversationConfig* c) {
   ++g_creates;
   const std::string& m = engine->model;
+  Record({{"call", "conversation_create"}, {"model", m}, {"config", c->config}});
   if (Is(m, "broken")) {
     g_error = "INTERNAL: cannot create a session";
   } else if (c->constrained && Is(m, "lfm2")) {

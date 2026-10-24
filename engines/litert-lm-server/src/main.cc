@@ -71,6 +71,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -297,6 +298,16 @@ struct ModelFileInfo {
   // the file's encoder supports, the one it prefers first; none when it takes no such input.
   bool capabilities_known = false;
   std::vector<std::string> vision_backends, audio_backends;
+  // The model's own sampler (LlmMetadata's sampler_params): type UNSPECIFIED and zeros for a file that has none, as
+  // LFM2.5-230M and gemma-3-270m-it are, as the C API's litert_lm_loaded_file_sampler_* also answer.
+  LiteRtLmSamplerType sampler_type = kLiteRtLmSamplerTypeUnspecified;
+  int top_k = 0;
+  float top_p = 0, temperature = 0;
+  // Its text decoder is an Artisan one (a tf_lite_artisan_text_decoder section), which LiteRT-LM runs on GPU as
+  // GPU_ARTISAN (engine_settings.cc), a backend whose sampling is the model's own.
+  bool artisan = false;
+  // The number of logits its decode signature outputs: its vocabulary. 0 when unknown.
+  int vocabulary = 0;
 };
 
 // Bounds-checked reads of a FlatBuffer of `size` bytes, through `read`: just what the server needs of the header's
@@ -349,8 +360,9 @@ FbReader MemoryReader(const std::string& b) {
           b.size()};
 }
 
-// Calls f(field number, varint value, bytes) for each top-level field of a protobuf message: the varint for wire type
-// 0, the bytes for wire type 2; fixed-width fields are skipped. False when the message is malformed.
+// Calls f(field number, value, bytes) for each top-level field of a protobuf message: the varint for wire type 0, the
+// 32 bits for wire type 5 (a float's), the bytes for wire type 2; 64-bit fields are skipped. False when the message is
+// malformed.
 template <class F>
 bool ForEachProtoField(const std::string& m, F f) {
   size_t i = 0;
@@ -382,6 +394,10 @@ bool ForEachProtoField(const std::string& m, F f) {
         i += 8;
         break;
       case 5:
+        if (m.size() - i < 4) return false;
+        v = 0;
+        for (int b = 3; b >= 0; --b) v = (v << 8) | static_cast<unsigned char>(m[i + b]);
+        f(field, v, std::string());
         i += 4;
         break;
       default:
@@ -417,6 +433,57 @@ bool HasRecurrentState(int section_type, const std::string& proto) {
   return found;
 }
 
+// LlmMetadata's sampler_params (field 4, a SamplerParameters: type 1, k 2, p 3, temperature 4), when it has them.
+void ReadSampler(const std::string& llm_metadata, ModelFileInfo& info) {
+  auto as_float = [](uint64_t bits) {
+    const uint32_t b = static_cast<uint32_t>(bits);
+    float f;
+    std::memcpy(&f, &b, sizeof f);
+    return f;
+  };
+  ForEachProtoField(llm_metadata, [&](int field, uint64_t, const std::string& params) {
+    if (field != 4) return;
+    ForEachProtoField(params, [&](int field, uint64_t v, const std::string&) {
+      if (field == 1) info.sampler_type = static_cast<LiteRtLmSamplerType>(v);
+      if (field == 2) info.top_k = static_cast<int32_t>(v);
+      if (field == 3) info.top_p = as_float(v);
+      if (field == 4) info.temperature = as_float(v);
+    });
+  });
+}
+
+// What the server needs of the model's main TFLite graph (a tflite::Model FlatBuffer: subgraphs 2, signature_defs 7;
+// SignatureDef inputs 0, outputs 1, signature_key 2, subgraph_index 4; TensorMap name 0, tensor_index 1; SubGraph
+// tensors 0; Tensor shape 0), read through `m` where it lies in the file, a few tables of it and never the whole: the
+// number of logits the decode signature outputs (the last dimension of its "logits", which is what the runtime sizes
+// its sampler by: GetVocabSize in llm_litert_compiled_model_executor.cc).
+void ReadTflite(const FbReader& m, ModelFileInfo& info) {
+  const uint64_t model = m.Get<uint32_t>(0).value_or(0);  // the root table's uoffset, from 0
+  const uint64_t subgraphs = m.Follow(m.Field(model, 2)), signatures = m.Follow(m.Field(model, 7));
+  // The last dimension of the tensor that `entry`, one of the signature's inputs or outputs, names; 0 if none.
+  auto last_dimension = [&](uint64_t signature, uint64_t entry) {
+    const uint32_t subgraph = m.Scalar<uint32_t>(m.Field(signature, 4), 0);
+    if (subgraph >= m.Length(subgraphs)) return 0;
+    const uint64_t tensors = m.Follow(m.Field(m.Follow(subgraphs + 4 + 4ull * subgraph), 0));
+    const uint32_t tensor = m.Scalar<uint32_t>(m.Field(entry, 1), 0);
+    if (tensor >= m.Length(tensors)) return 0;
+    const uint64_t shape = m.Follow(m.Field(m.Follow(tensors + 4 + 4ull * tensor), 0));
+    const uint32_t rank = m.Length(shape);
+    return rank ? m.Get<int32_t>(shape + 4 + 4ull * (rank - 1)).value_or(0) : 0;
+  };
+  for (uint32_t k = 0; k < m.Length(signatures) && k < 256; ++k) {
+    const uint64_t signature = m.Follow(signatures + 4 + 4ull * k);
+    if (!signature || m.String(m.Field(signature, 2)) != "decode") continue;
+    const uint64_t outputs = m.Follow(m.Field(signature, 1));
+    for (uint32_t j = 0; j < m.Length(outputs) && j < 4096; ++j) {
+      const uint64_t output = m.Follow(outputs + 4 + 4ull * j);
+      if (output && m.String(m.Field(output, 0)) == "logits") {
+        info.vocabulary = std::max(0, last_dimension(signature, output));
+      }
+    }
+  }
+}
+
 // The backends a section's backend_constraint lists, in its order, as LiteRT-LM 0.18.0 reads it
 // (ParseBackendConstraint in schema/model_info/model_info.cc, what its C API's litert_lm_loaded_file_* answer): cpu
 // or cpu_artisan, gpu or gpu_artisan, npu or google_tensor_artisan; a section without one takes cpu, then gpu.
@@ -441,8 +508,9 @@ std::vector<std::string> ConstraintBackends(const std::string& constraint) {
 // the last one listed deciding its backends. The C API's litert_lm_loaded_file_create reads the same, but also reads
 // whole sections into memory: every vision section, and the main model when LlmMetadata has no max_num_tokens
 // (GetModelInfo), so asking it which inputs gemma-3-270m-it takes raised the server's peak memory by 285 MB, the size
-// of its model, before any engine loaded, and by up to 2 GB for a larger bundle. Here nothing but the header and the
-// small protobuf sections is read. A header or section this cannot read says nothing.
+// of its model, before any engine loaded, and by up to 2 GB for a larger bundle. Here nothing but the header, the small
+// protobuf sections and a few tables of the main model (ReadTflite) is read. A header or section this cannot read says
+// nothing.
 ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   ModelFileInfo info;
   const FbReader fb = MemoryReader(header);
@@ -451,6 +519,8 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   const uint32_t n = fb.Length(sections);
   info.capabilities_known = n > 0;
   std::optional<std::string> vision, audio;  // the encoder's backend_constraint
+  uint64_t main_begin = 0, main_end = 0;  // the main TFLite model, as DiscoverSections picks it
+  bool main_found = false, other_found = false;
   for (uint32_t k = 0; k < n && k < 4096; ++k) {
     const uint64_t s = fb.Follow(sections + 4 + 4ull * k);
     if (!s) continue;
@@ -466,6 +536,24 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
         if (key == "model_type") model_type = value;
         if (key == "backend_constraint") constraint = value;
       }
+      // ClassifyModelType's kinds: the main model is the last main section, or else the first that is no other kind.
+      const uint64_t begin = fb.Scalar<uint64_t>(fb.Field(s, 1), 0), end = fb.Scalar<uint64_t>(fb.Field(s, 2), 0);
+      const bool main = model_type == "tf_lite_prefill_decode" || model_type == "tf_lite_prefill_decode_hw" ||
+                        model_type == "tf_lite_prefill" || model_type == "tf_lite_decode" ||
+                        model_type == "tf_lite_artisan_text_decoder";
+      const bool other = !main && model_type != "tf_lite_text_encoder" && model_type != "tf_lite_embedder" &&
+                         model_type != "tf_lite_vision_adapter" && model_type != "tf_lite_vision_encoder" &&
+                         model_type != "tf_lite_audio_adapter" && model_type != "tf_lite_audio_encoder_hw" &&
+                         model_type != "tf_lite_audio_frontend" && model_type != "tf_lite_video_adapter" &&
+                         model_type != "tf_lite_video_encoder" && model_type != "tf_lite_mtp_drafter" &&
+                         model_type != "tf_lite_aux";
+      if (main || (other && !main_found && !other_found)) {
+        main_begin = begin;
+        main_end = end;
+      }
+      main_found |= main;
+      other_found |= other;
+      info.artisan |= model_type == "tf_lite_artisan_text_decoder";
       if (model_type == "tf_lite_vision_adapter" || model_type == "tf_lite_vision_encoder") vision = constraint;
       if (model_type == "tf_lite_audio_adapter" || model_type == "tf_lite_audio_encoder_hw" ||
           model_type == "tf_lite_audio_frontend") {
@@ -481,6 +569,16 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
       continue;
     }
     info.recurrent_state |= HasRecurrentState(type, proto);
+    if (type == 5) ReadSampler(proto, info);
+  }
+  if (main_end > main_begin) {
+    const FbReader model{[&in, main_begin](uint64_t pos, void* out, size_t n) {
+                           in.clear();
+                           return static_cast<bool>(in.seekg(static_cast<std::streamoff>(main_begin + pos)) &&
+                                                    in.read(static_cast<char*>(out), static_cast<std::streamsize>(n)));
+                         },
+                         main_end - main_begin};
+    ReadTflite(model, info);
   }
   if (vision) info.vision_backends = ConstraintBackends(*vision);
   if (audio) info.audio_backends = ConstraintBackends(*audio);
@@ -545,9 +643,10 @@ struct EngineHolder {
   // it was created: its data processor cannot constrain tool calls (see HandleChatCompletions), so its later requests
   // with tools are created without it at once. Cleared when another engine is loaded.
   bool tools_unconstrained = false;
-  // The model's decoder keeps a recurrent state (ModelFileInfo), and a message has been sent on this engine since it
-  // was created, so that state is no longer the initial one.
-  bool recurrent_state = false;
+  // What the model file says about itself (ModelFileInfo), as it was when this engine was created.
+  ModelFileInfo info;
+  // The model's decoder keeps a recurrent state (info.recurrent_state), and a message has been sent on this engine
+  // since it was created, so that state is no longer the initial one.
   bool state_used = false;
 };
 
@@ -662,7 +761,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // France." after that same question's first turn and a title request, and with "The capital of Italy is **Rome**."
   // on a fresh one (LiteRT-LM #3165; the model card says to create a new Engine for each conversation). The C API has
   // no way to reset that state, so the engine is created again, with the same settings.
-  const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.recurrent_state && g_engine.state_used;
+  const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.info.recurrent_state && g_engine.state_used;
   if (g_engine.engine && g_engine.key == key && !fresh_state) return g_engine.engine;
   if (fresh_state) {
     static std::set<std::string> told;  // once per model file, not per conversation
@@ -708,7 +807,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   g_engine.key = key;
   // The same model and settings again: what was found out about the model still holds.
   if (!fresh_state) g_engine.tools_unconstrained = false;
-  g_engine.recurrent_state = info.recurrent_state;
+  g_engine.info = info;
   g_engine.state_used = false;
   g_engine.init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   Log("Engine ready in " + std::to_string(g_engine.init_seconds) + " s");
@@ -1243,6 +1342,85 @@ std::optional<std::pair<bool, int>> ParseThinking(const json& body, const ModelC
   return std::make_pair(thinking, budget);
 }
 
+// The sampler a conversation is created with. A session's sampler parameters replace the model's own entirely: the
+// runtime uses LlmMetadata's only when the session's type is UNSPECIFIED (SessionConfig::MaybeUpdateAndValidate in
+// engine_settings.cc, LiteRT-LM 0.18.0). The server used to build one only when the request set any of temperature,
+// top_p, top_k and seed, and then filled every field the request left out with a fixed value: top_k 1, which is
+// greedy decoding (sampling_cpu_util.cc), top_p 0.95, temperature 1 and seed 0. So a temperature or top_p sent alone
+// never had any effect (with temperature 1.5 and seeds 1, 2 and 3, LFM2.5-230M wrote the same sentence it writes
+// with none), and the model's own parameters were thrown away whenever a request set one field. And the seed was 0
+// whenever the request gave none, the runtime's default as well (engine_settings.cc), so every conversation drew the
+// same "random" sample and a Regenerate repeated the answer word for word.
+struct Sampling {
+  int top_k;
+  float top_p, temperature;
+  int seed;
+};
+
+// The top_k that is no top-k limit. On CPU the largest k, which the CPU sampler clamps to the vocabulary
+// (TopKTopPSampling in sampling_cpu_util.cc). On GPU the vocabulary itself, all the tokens there are: the GPU sampler
+// is created for the k it is given and the model's number of logits (CreateGpuSampler in sampler_factory.cc; the
+// sampler itself is not open source), so it gets no k larger than that. LiteRT-LM 0.18.0 sets no top_k limit of its
+// own there: GpuConfig::max_top_k, 64, is read nowhere. Where the vocabulary is unknown, the largest k, as on CPU.
+int NoTopKLimit(const std::string& backend, const ModelFileInfo& model) {
+  return backend == "gpu" && model.vocabulary > 0 ? model.vocabulary : INT32_MAX;
+}
+
+// Each field the request sets, as it set it; the others from the model's own parameters, or, for a model that has
+// none, LiteRT-LM's own defaults for CPU and GPU, the ones it would use (engine_settings.cc: TOP_P, k 1, p 0.95,
+// temperature 1); and a random seed unless the request gives one. The CPU sampler implements TOP_P only
+// (CreateCpuSampler in sampler_factory.cc), and TOP_P with p 1 is top-k sampling, so a model whose own type is TOP_K
+// or GREEDY gets that. On NPU, and for an Artisan text decoder on GPU, which LiteRT-LM runs as GPU_ARTISAN, its
+// default type is UNSPECIFIED (engine_settings.cc), which leaves sampling to the model, so there a sampler is set only
+// for a request that sets one of the fields, as before. none: the runtime's own choice.
+std::optional<Sampling> SamplingFor(const json& body, const ModelFileInfo& model, const std::string& backend,
+                                    const std::string& model_id, bool request_sets_any) {
+  const bool model_samples = (backend != "cpu" && backend != "gpu") || (backend == "gpu" && model.artisan);
+  if (model_samples && !request_sets_any) return std::nullopt;
+  Sampling s{1, 0.95f, 1.0f, 0};
+  switch (model.sampler_type) {
+    case kLiteRtLmSamplerTypeTopP:
+      s = {model.top_k, model.top_p, model.temperature, 0};
+      break;
+    case kLiteRtLmSamplerTypeTopK:
+      s = {model.top_k, 1.0f, model.temperature, 0};
+      break;
+    case kLiteRtLmSamplerTypeGreedy:
+      s = {1, 1.0f, 1.0f, 0};
+      break;
+    default:
+      break;
+  }
+  // A model that names TOP_P or TOP_K with no k (0) asks for no top-k limit; the runtime refuses k 0.
+  if (s.top_k <= 0) s.top_k = NoTopKLimit(backend, model);
+  auto has = [&](const char* k) { return body.contains(k) && !body[k].is_null(); };
+  if (has("temperature")) s.temperature = body["temperature"].get<float>();
+  if (has("top_p")) s.top_p = body["top_p"].get<float>();
+  if (has("top_k")) {
+    s.top_k = body["top_k"].get<int>();
+  } else if (s.top_k == 1 && ((has("temperature") && s.temperature > 0) || (has("top_p") && s.top_p < 1))) {
+    // k 1 picks the likeliest token whatever the temperature or top_p, so the request's would have no effect: the
+    // model's default here is greedy decoding, and the request asks to sample. It gets no top-k limit.
+    s.top_k = NoTopKLimit(backend, model);
+    static std::set<std::string> told;  // once per model and backend, not per request
+    if (told.insert(model_id + "," + backend).second) {
+      Log("top_k is not set and " + model_id + "'s default is 1 (greedy), under which the request's " +
+          (has("temperature") ? "temperature" : "top_p") + " would have no effect; sampling on " + backend +
+          " with top_k " + std::to_string(s.top_k) +
+          (s.top_k == INT32_MAX ? " (no limit)" : " (its vocabulary: no limit)"));
+    }
+  }
+  if (has("seed")) {
+    s.seed = body["seed"].get<int>();
+  } else {
+    // The CPU sampler seeds std::default_random_engine (minstd_rand0) with it, which takes 0 and 1 alike, so the
+    // range starts at 1; each conversation seeds its own generator (CreateNewContext).
+    static std::mt19937 gen{std::random_device{}()};
+    s.seed = std::uniform_int_distribution<int>(1, INT32_MAX - 1)(gen);
+  }
+  return s;
+}
+
 // openai_common.parse_response_format → (constraint type, schema/pattern), or none.
 std::optional<std::pair<LiteRtLmConstraintType, std::string>> ParseResponseFormat(const json& body) {
   if (!body.contains("response_format") || body["response_format"].is_null()) return std::nullopt;
@@ -1424,13 +1602,12 @@ void HandleChatCompletions(int fd, const Request& req) {
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
     LiteRtLmSessionConfig* sc = L.litert_lm_session_config_create();
-    if (has_sampler) {
+    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.key.backend, ref.id, has_sampler)) {
       LiteRtLmSamplerParams* sp = L.litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
-      L.litert_lm_sampler_params_set_top_k(sp, body.contains("top_k") && !body["top_k"].is_null() ? body["top_k"].get<int>() : 1);
-      L.litert_lm_sampler_params_set_top_p(sp, body.contains("top_p") && !body["top_p"].is_null() ? body["top_p"].get<float>() : 0.95f);
-      L.litert_lm_sampler_params_set_temperature(
-          sp, body.contains("temperature") && !body["temperature"].is_null() ? body["temperature"].get<float>() : 1.0f);
-      L.litert_lm_sampler_params_set_seed(sp, body.contains("seed") && !body["seed"].is_null() ? body["seed"].get<int>() : 0);
+      L.litert_lm_sampler_params_set_top_k(sp, sampling->top_k);
+      L.litert_lm_sampler_params_set_top_p(sp, sampling->top_p);
+      L.litert_lm_sampler_params_set_temperature(sp, sampling->temperature);
+      L.litert_lm_sampler_params_set_seed(sp, sampling->seed);
       L.litert_lm_session_config_set_sampler_params(sc, sp);
       L.litert_lm_sampler_params_delete(sp);
     }

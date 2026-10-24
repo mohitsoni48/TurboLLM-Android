@@ -21,8 +21,8 @@ import { basename, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { after, before, test } from 'node:test'
 import {
-  buildServer, calls, chat, killServers, litertlmFile, logged, proto, realLibrary, realModels, skip, skipReal, startServer,
-  stopServer,
+  buildServer, calls, chat, fb, flatbuffer, killServers, litertlmFile, logged, proto, realLibrary, realModels, skip,
+  skipReal, startServer, stopServer,
 } from './testdata/harness.mjs'
 
 const visionModels = (process.env.LITERT_LM_TEST_VISION_MODELS ?? '').split(',').filter(Boolean)
@@ -171,19 +171,19 @@ const imageMessage = (text) => [{ role: 'user', content: [
 ] }]
 const audioMessage = [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } }, { type: 'text', text: 'What is this?' }] }]
 
-// A stand-in file whose header lists `sections`, by default a text decoder alone: TFLite sections, each with its
-// model_type and, when given, its backend_constraint, as LiteRT-LM's builder writes them. The server reads the header;
-// the stand-in library reads only the file's name.
+// A stand-in file whose header lists `sections`: by default those `kinds` gives for its name (below), else a text
+// decoder alone. TFLite sections have their model_type and, when given, their backend_constraint, as LiteRT-LM's
+// builder writes them. The server reads the header; the stand-in library reads only the file's name.
 const tflite = (model_type, backend_constraint) => ({ type: 3, items: { model_type, ...(backend_constraint ? { backend_constraint } : {}) } })
 const decoder = tflite('tf_lite_prefill_decode')
-const readable = (name, sections = [decoder]) => litertlmFile(join(work, `${name}.litertlm`), sections)
+const readable = (name, sections = kinds[name] ?? [decoder]) => litertlmFile(join(work, `${name}.litertlm`), sections)
 // One with no header the server can read, which is left to the runtime.
 const unreadable = (name) => {
   const path = join(work, `${name}.litertlm`)
   writeFileSync(path, 'stand-in model')
   return path
 }
-const inputs = {
+const kinds = {
   text: [decoder],
   vl: [decoder, tflite('tf_lite_embedder'), tflite('tf_lite_vision_encoder'), tflite('tf_lite_vision_adapter')], // LFM2.5-VL-450M's
   'gpu-vision': [decoder, tflite('tf_lite_vision_encoder', 'gpu')],
@@ -202,7 +202,7 @@ test('a model that takes images or audio gets its encoders, on the backend it pr
     unreadable: { backend: 'cpu', vision_backend: null, audio_backend: null },
   }
   for (const [name, settings] of Object.entries(expected)) {
-    const path = name === 'unreadable' ? unreadable(name) : readable(name, inputs[name])
+    const path = name === 'unreadable' ? unreadable(name) : readable(name)
     const log = await callsDuring(async () => assert.equal((await chat(fake, { model: `${path},cpu`, messages: hello })).status, 200))
     assert.deepEqual(settingsOf(log), [settings], name)
   }
@@ -217,7 +217,7 @@ test('the config\'s vision_backend and audio_backend are used for a model that t
   const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: '', FAKE_LITERT_LM_CALLS: callLog }, ['--config', config, '--verbose'])
   try {
     const settings = async (name) => settingsOf(await callsDuring(async () => {
-      assert.equal((await chat(server, { model: readable(name, inputs[name.split('-')[0]]), messages: hello })).status, 200)
+      assert.equal((await chat(server, { model: readable(name, kinds[name.split('-')[0]]), messages: hello })).status, 200)
     }))
     assert.deepEqual(await settings('vl-configured'), [{ backend: 'cpu', vision_backend: 'gpu', audio_backend: null }])
     assert.deepEqual(await settings('text-configured'), [{ backend: 'cpu', vision_backend: null, audio_backend: null }])
@@ -245,8 +245,8 @@ test('an image or audio part sent to a model without that input is a 400 that sa
   const reply = await chat(fake, { model: text, messages: [...imageMessage('What color is this?'), { role: 'assistant', content: 'Red.' }, ...hello] })
   assert.equal(reply.status, 400)
   // A model that takes it, and one whose header the server cannot read (left to the runtime, as before), get it.
-  assert.equal((await chat(fake, { model: readable('vl', inputs.vl), messages: imageMessage('What color is this?') })).status, 200)
-  assert.equal((await chat(fake, { model: readable('omni', inputs.omni), messages: audioMessage })).status, 200)
+  assert.equal((await chat(fake, { model: readable('vl'), messages: imageMessage('What color is this?') })).status, 200)
+  assert.equal((await chat(fake, { model: readable('omni'), messages: audioMessage })).status, 200)
   assert.equal((await chat(fake, { model: unreadable('unreadable'), messages: imageMessage('What color is this?') })).status, 200)
 })
 
@@ -285,6 +285,128 @@ for (const path of visionModels.length ? visionModels : ['<model>']) {
       assert.match(reply.content, /red/i)
       const plain = await chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Say hello.' }], max_completion_tokens: 16 }, 300_000)
       assert.equal(plain.status, 200, plain.error)
+    } finally {
+      stopServer(server)
+    }
+  })
+}
+
+// The sampler the stand-in logged for the conversation a request was answered with (the last one created).
+async function samplerFor(server, body) {
+  const log = await callsDuring(async () => {
+    const reply = await chat(server, body)
+    assert.equal(reply.status, 200, reply.error)
+  })
+  const created = log.filter((c) => c.call === 'conversation_create')
+  assert.ok(created.length > 0, 'no conversation created')
+  return created.at(-1).config.sampler ?? null
+}
+const f = Math.fround
+const NO_LIMIT = 2147483647
+const TOP_P = 2
+// LlmMetadata with the model's own sampler_params (field 4, a SamplerParameters: type 1, k 2, p 3 and temperature 4,
+// the last two floats).
+const float = (n, v) => { const b = Buffer.alloc(5); b[0] = (n << 3) | 5; b.writeFloatLE(v, 1); return b }
+const samplerMetadata = ({ type, k, p, temperature }) => ({ type: 5, bytes: proto.field(4, [
+  proto.varint(1, type), ...(k === undefined ? [] : [proto.varint(2, k)]), ...(p === undefined ? [] : [float(3, p)]),
+  ...(temperature === undefined ? [] : [float(4, temperature)]),
+]) })
+// A main model section whose decode signature outputs "logits" of [1, 1, vocabulary], as a tflite::Model lays them
+// out (subgraphs 2, signature_defs 7; SignatureDef outputs 1, signature_key 2, subgraph_index 4; TensorMap name 0,
+// tensor_index 1; SubGraph tensors 0; Tensor shape 0).
+const decoderWith = (vocabulary, model_type = 'tf_lite_prefill_decode', constraint) => ({
+  ...tflite(model_type, constraint),
+  bytes: flatbuffer(fb.table([undefined, undefined, fb.vector([fb.table([fb.vector([fb.table([fb.ints([1, 1, vocabulary])])])])]),
+    undefined, undefined, undefined, undefined,
+    fb.vector([fb.table([undefined, fb.vector([fb.table(['logits', fb.u32(0)])]), 'decode', undefined, fb.u32(0)])])])),
+})
+Object.assign(kinds, {
+  'sampler-topp': [decoder, samplerMetadata({ type: TOP_P, k: 50, p: 0.9, temperature: 0.6 })],
+  'sampler-topk': [decoder, samplerMetadata({ type: 1, k: 40, temperature: 0.8 })],
+  'sampler-greedy': [decoder, samplerMetadata({ type: 3 })],
+  'sampler-k0': [decoder, samplerMetadata({ type: TOP_P, k: 0, p: 0.95, temperature: 0.7 })],
+  'plain-vocabulary': [decoderWith(32000)],
+  // An Artisan text decoder, which LiteRT-LM runs on GPU as GPU_ARTISAN (gemma-4-E2B-it-gpu has one), with a sampler.
+  artisan: [decoderWith(262144, 'tf_lite_artisan_text_decoder', 'gpu_artisan'), samplerMetadata({ type: TOP_P, k: 64, p: 0.95, temperature: 1 })],
+})
+
+test('the fields a request leaves out of its sampler come from the model\'s own parameters, and the ones it sets are used as set', { skip, timeout: 60_000 }, async () => {
+  const model = (name, backend = 'cpu') => `${readable(name)},${backend}`
+  const check = async (name, request, expected, backend) => {
+    const sampler = await samplerFor(fake, { model: model(name, backend), messages: hello, ...request })
+    assert.ok(sampler, `no sampler set: ${name} ${JSON.stringify(request)}`)
+    const { seed, ...rest } = sampler
+    assert.deepEqual(rest, { type: TOP_P, ...expected }, `${name} ${JSON.stringify(request)}`)
+    assert.ok(Number.isInteger(seed))
+  }
+  // The model's own: TOP_P as given, TOP_K as TOP_P with p 1 (the CPU sampler has only TOP_P), GREEDY as k 1, and no k
+  // as no limit.
+  await check('sampler-topp', {}, { top_k: 50, top_p: f(0.9), temperature: f(0.6) })
+  await check('sampler-topk', {}, { top_k: 40, top_p: 1, temperature: f(0.8) })
+  await check('sampler-greedy', {}, { top_k: 1, top_p: 1, temperature: 1 })
+  await check('sampler-k0', {}, { top_k: NO_LIMIT, top_p: f(0.95), temperature: f(0.7) })
+  // Each field the request sets replaces only that one.
+  await check('sampler-topp', { temperature: 1.2 }, { top_k: 50, top_p: f(0.9), temperature: f(1.2) })
+  await check('sampler-topp', { top_p: 0.5 }, { top_k: 50, top_p: 0.5, temperature: f(0.6) })
+  await check('sampler-topp', { top_k: 10 }, { top_k: 10, top_p: f(0.9), temperature: f(0.6) })
+  // A model with none: LiteRT-LM's own defaults, which are greedy (k 1), so a temperature or top_p the request sets
+  // alone gets no top-k limit, or it would do nothing; an explicit top_k, and temperature 0, stay greedy.
+  await check('plain', {}, { top_k: 1, top_p: f(0.95), temperature: 1 })
+  await check('plain', { temperature: 1.5 }, { top_k: NO_LIMIT, top_p: f(0.95), temperature: 1.5 })
+  await check('plain', { top_p: 0.8 }, { top_k: NO_LIMIT, top_p: f(0.8), temperature: 1 })
+  await check('plain', { temperature: 0 }, { top_k: 1, top_p: f(0.95), temperature: 0 })
+  await check('plain', { temperature: 1.5, top_k: 1 }, { top_k: 1, top_p: f(0.95), temperature: 1.5 })
+  // On the GPU backend, no limit is the model's vocabulary, all its tokens; where that is unknown, as on CPU.
+  await check('plain-vocabulary', { temperature: 1.5 }, { top_k: 32000, top_p: f(0.95), temperature: 1.5 }, 'gpu')
+  await check('plain-vocabulary', { temperature: 1.5 }, { top_k: NO_LIMIT, top_p: f(0.95), temperature: 1.5 })
+  await check('plain', { temperature: 1.5 }, { top_k: NO_LIMIT, top_p: f(0.95), temperature: 1.5 }, 'gpu')
+  const lines = await logged(fake)
+  // Said once per model and backend, not on every request.
+  assert.deepEqual(lines.filter((l) => l.startsWith("top_k is not set and plain.litertlm's")), [
+    "top_k is not set and plain.litertlm's default is 1 (greedy), under which the request's temperature would have no " +
+      'effect; sampling on cpu with top_k 2147483647 (no limit)',
+    "top_k is not set and plain.litertlm's default is 1 (greedy), under which the request's temperature would have no " +
+      'effect; sampling on gpu with top_k 2147483647 (no limit)',
+  ], fake.stderr)
+  assert.ok(lines.includes("top_k is not set and plain-vocabulary.litertlm's default is 1 (greedy), under which the " +
+    "request's temperature would have no effect; sampling on gpu with top_k 32000 (its vocabulary: no limit)"), fake.stderr)
+  // On NPU, and for an Artisan text decoder on GPU, where LiteRT-LM leaves sampling to the model, nothing is set
+  // unless the request sets something.
+  for (const name of ['sampler-topp,npu', 'artisan,gpu']) {
+    const [kind, backend] = name.split(',')
+    assert.equal(await samplerFor(fake, { model: model(kind, backend), messages: hello }), null, name)
+  }
+  const npu = await samplerFor(fake, { model: model('sampler-topp', 'npu'), messages: hello, temperature: 0.3 })
+  assert.deepEqual({ ...npu, seed: 0 }, { type: TOP_P, top_k: 50, top_p: f(0.9), temperature: f(0.3), seed: 0 })
+  const artisan = await samplerFor(fake, { model: model('artisan', 'gpu'), messages: hello, temperature: 0.3 })
+  assert.deepEqual({ ...artisan, seed: 0 }, { type: TOP_P, top_k: 64, top_p: f(0.95), temperature: f(0.3), seed: 0 })
+})
+
+test('a request without a seed is sampled with a new random seed, and one with a seed with that seed', { skip, timeout: 60_000 }, async () => {
+  const seeds = []
+  for (let i = 0; i < 6; i++) seeds.push((await samplerFor(fake, { model: readable('sampler-topp'), messages: hello }))?.seed)
+  for (let i = 0; i < 2; i++) seeds.push((await samplerFor(fake, { model: readable('sampler-topp'), messages: hello, temperature: 1 })).seed)
+  assert.equal(new Set(seeds).size, seeds.length, `seeds repeat: ${seeds}`)
+  // Not 0 or 1, which seed the CPU sampler's generator alike.
+  assert.ok(seeds.every((s) => s > 1), `${seeds}`)
+  assert.equal((await samplerFor(fake, { model: readable('sampler-topp'), messages: hello, seed: 7 })).seed, 7)
+  assert.equal((await samplerFor(fake, { model: readable('plain'), messages: hello, seed: 0 })).seed, 0)
+})
+
+for (const path of realModels.length ? realModels : ['<model>']) {
+  test(`a real model samples with a temperature sent alone, differently each time without a seed: ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
+    const config = join(work, 'no-cache.json')
+    writeFileSync(config, JSON.stringify({ default: { cache: 'no' } }))
+    const server = await startServer(binary, { ...process.env, LITERT_LM_LIBRARY: realLibrary }, ['--config', config])
+    try {
+      const ask = async (extra) => {
+        const reply = await chat(server, { model: `${path},cpu`, messages: [{ role: 'user', content: 'Write one sentence about the sea.' }], max_completion_tokens: 24, ...extra }, 300_000)
+        assert.equal(reply.status, 200, reply.error)
+        return reply.reasoning + reply.content // a thinking model (Qwen3) may only think in 24 tokens
+      }
+      const unseeded = [await ask({ temperature: 1.5 }), await ask({ temperature: 1.5 }), await ask({ temperature: 1.5 })]
+      assert.ok(new Set(unseeded).size > 1, `the same reply three times: ${unseeded[0]}`)
+      assert.equal(await ask({ temperature: 1.5, seed: 7 }), await ask({ temperature: 1.5, seed: 7 }))
     } finally {
       stopServer(server)
     }

@@ -380,6 +380,18 @@ itself, as LiteRT-LM does. The C API's `litert_lm_loaded_file_*` answer the same
 model sections into memory to do it (every vision section, and the main model when its metadata
 gives no context size): 285 MB for gemma-3-270m-it, before any engine loads.
 
+**Sampling starts from the model's own parameters.** A session's sampler replaces the model's
+(LlmMetadata's `sampler_params`) entirely, so every conversation is created with the model's own
+top_k, top_p and temperature (read from the file's LlmMetadata), each field the request sets put
+in its place, and a random seed unless the request gives one. A model with no parameters of its
+own (LFM2.5-230M, gemma-3-270m-it) gets LiteRT-LM's defaults, which are greedy (top_k 1), so a
+temperature or top_p sent without a top_k there samples with no top-k limit (on CPU the largest
+k, which its sampler clamps to the vocabulary; on GPU the model's vocabulary size, its number of
+logits), and the server logs it once per model. The CPU sampler implements only TOP_P, so a
+model whose own type is TOP_K gets TOP_P with p 1. On NPU, and for an Artisan text decoder on GPU
+(which LiteRT-LM runs as GPU_ARTISAN; Gemma 4's `-gpu` bundles have one), nothing is set unless
+the request sets a field, as before: LiteRT-LM leaves sampling to the model there.
+
 **The library is loaded with `dlopen(RTLD_LOCAL)`, not linked**, and the server's own C++
 runtime is static and unexported. `liblitert-lm.so` carries its own statically linked C++
 runtime and *exports* it; when the server was linked against the library, the linker
