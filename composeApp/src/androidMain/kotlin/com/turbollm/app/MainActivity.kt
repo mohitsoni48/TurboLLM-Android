@@ -17,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
@@ -28,12 +29,25 @@ private const val TAG = "TurboLLM"
  *  (below) and for the WebView's own URL (DaemonWebView.kt). */
 const val ANDROID_DAEMON_PORT = 7000
 
+/** Every app on the phone shares 127.0.0.1, and the daemon trusts loopback callers, so any installed app could use
+ *  its whole API. The daemon is started with this random secret (TURBOLLM_APP_SECRET, see the daemon's auth.ts) and
+ *  then trusts only loopback requests carrying it: the WebView as the `turbollm_app` cookie (DaemonWebView.kt), native
+ *  calls as the X-TurboLLM-App header. Neither is sent before the daemon proves it holds the port (DaemonAuth.kt). One
+ *  per process, like Node itself (nodeStarted below), so every component in this process holds the value the running
+ *  daemon was given. */
+val DAEMON_APP_SECRET: String = ByteArray(32).also { SecureRandom().nextBytes(it) }
+    .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+
 /** Node can start once per process: a second node::Start aborts it. The process outlives the activity (EngineService
  *  keeps it running after Back), so a flag on the activity instance let a reopened app start Node again and crash. */
 private val nodeStarted = AtomicBoolean(false)
 
 class MainActivity : ComponentActivity() {
     private lateinit var storageAccess: StorageAccess
+    /** From EngineService.activityOpened: the service ignores this activity's close once a newer one is open. */
+    private var activityNumber = 0
+    /** Set by finish(), so onDestroy tells Back from a swipe from Recents. */
+    private var finishedByBack = false
 
     /** The system file picker for importing models (ModelImport). Any type: .gguf and .litertlm have no MIME type
      *  providers agree on, so ModelImport checks the name instead. */
@@ -57,6 +71,9 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         recordCrashes()
+        // First, so a close the service is deciding on the last Back sees at once that the app is open again and
+        // quits nothing (EngineService.appClosed).
+        activityNumber = EngineService.activityOpened()
 
         // The daemon ships inside the APK and is unpacked here, so a Play Store install needs
         // nothing pushed to the device. Synchronous on purpose: the Node thread started below
@@ -66,7 +83,8 @@ class MainActivity : ComponentActivity() {
         EngineService.start(this)
         requestNotificationPermission()
         storageAccess = StorageAccess(this)
-        // A model import interrupted by the process dying leaves a multi-GB <name>.part behind; nothing else removes it.
+        // A model import interrupted by the process dying leaves a multi-GB <name>.import-part behind; nothing else
+        // removes it. Only that suffix: a daemon download into the same folder keeps its <name>.part there.
         Thread { ModelImport.sweepPartialFiles(this) }.start()
 
         if (nodeStarted.compareAndSet(false, true)) {
@@ -97,6 +115,8 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
                             // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
+                            // Loopback callers must present it (DAEMON_APP_SECRET).
+                            "TURBOLLM_APP_SECRET" to DAEMON_APP_SECRET,
                         ) + gpuEnv() + socEnv(),
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
@@ -120,6 +140,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Post the engine notification (and its Quit) again whenever the app comes on screen, the permission prompt
+        // closing and a return from Settings included. Android drops a post made without the permission for good and
+        // re-posts nothing on a grant, and the first post (startForeground, from onCreate) goes out before the user
+        // can answer the prompt.
+        EngineService.repostNotification(this)
         storageAccess.onResume()
         DaemonLog.rotateIfLarge(filesDir)
     }
@@ -129,9 +154,22 @@ class MainActivity : ComponentActivity() {
         super.onPause()
     }
 
+    /** Called only for Back: DaemonWebView's BackHandlers call it, and before Android 12 so does the system's own Back
+     *  while none is composed (the splash), through onBackPressed and finishAfterTransition; from Android 12 that Back
+     *  moves the task to the back instead, which is no close. A swipe from Recents finishes the activity too, but from
+     *  the system's side, without calling this. */
+    override fun finish() {
+        finishedByBack = true
+        super.finish()
+    }
+
     override fun onDestroy() {
-        // Back, not a configuration change (those no longer recreate the activity, see the manifest).
-        if (isFinishing) EngineService.activityFinished(this)
+        // Back, not a configuration change (those no longer recreate the activity, see the manifest), and not a swipe
+        // from Recents: the service hears that one as onTaskRemoved. Sent for a swipe too, it was a second close of
+        // the same swipe, decided afresh a moment later, so a swipe with a reply running quit the app if the reply
+        // ended in between (EngineService.appClosed).
+        // Android may run this only after the app was opened again, a new MainActivity included (activityNumber).
+        if (isFinishing && finishedByBack) EngineService.activityFinished(this, activityNumber)
         super.onDestroy()
     }
 
@@ -145,8 +183,9 @@ class MainActivity : ComponentActivity() {
         return mapOf("TURBOLLM_ANDROID_SOC" to name)
     }
 
-    /** The engine notification carries the Quit action and the "phone is hot" warning. Asked once; Android stops
-     *  prompting on its own after the user declines, and the service runs either way. */
+    /** The engine notification carries the Quit action and the "phone is hot" warning. Asked each time the activity
+     *  is created while it is not granted, with nothing kept to stop asking; Android stops showing the prompt on its
+     *  own once the user has declined it twice. The service runs either way. */
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT < 33) return
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
@@ -157,12 +196,14 @@ class MainActivity : ComponentActivity() {
      *  install works with nothing ever pushed to the device.
      *
      *  This replaces a `/sdcard` copy that was only ever a dev helper. That approach cannot work
-     *  for a real user twice over: the app declares no storage permission, and nothing would have
-     *  put the files there anyway. It also hid a second, larger problem — the daemon bundle the
-     *  npm build produces leaves `dependencies` external (npm installs them on a desktop), so a
-     *  genuinely fresh install died at boot with `Cannot find package '@hono/node-server'`. The
-     *  payload staged into assets is therefore built by a separate Android pass with its
-     *  dependencies bundled in (turbollm/tsup.android.config.ts + scripts/stage-daemon-assets.mjs).
+     *  for a real user twice over: the app holds no storage permission to read it with unless, on
+     *  Android 10 or older, the user allowed one for a model folder in shared storage (none on 11+),
+     *  and nothing would have put the files there anyway. It also hid a second, larger problem —
+     *  the daemon bundle the npm build produces leaves `dependencies` external (npm installs them
+     *  on a desktop), so a genuinely fresh install died at boot with `Cannot find package
+     *  '@hono/node-server'`. The payload staged into assets is therefore built by a separate
+     *  Android pass with its dependencies bundled in (turbollm/tsup.android.config.ts +
+     *  scripts/stage-daemon-assets.mjs).
      *
      *  Re-extracted whenever the APK changes, keyed on `lastUpdateTime`: an app update ships a new
      *  daemon, and a stale copy in filesDir would silently win over it. Everything else in

@@ -11,8 +11,6 @@ import android.os.Looper
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 
 private const val TAG = "TurboLLM"
 private const val CHECK_MS = 2000L
@@ -135,7 +133,7 @@ class StorageAccess(private val activity: Activity) {
 
     private fun rescan() {
         runCatching {
-            val conn = URL("http://127.0.0.1:$ANDROID_DAEMON_PORT/api/v1/models/rescan").openConnection() as HttpURLConnection
+            val conn = DaemonAuth.open("/api/v1/models/rescan")
             conn.requestMethod = "POST"
             conn.connectTimeout = 2000
             conn.readTimeout = 5000
