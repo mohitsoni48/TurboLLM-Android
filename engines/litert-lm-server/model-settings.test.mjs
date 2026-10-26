@@ -973,6 +973,44 @@ test('with no backend set, the model\'s own is used, and one that does not start
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
 })
 
+test('a backend the request sets after the model\'s own fell back gets an engine on it or its error, never the other', { skip, timeout: 60_000 }, async () => {
+  const engines = async (ref) => {
+    let reply
+    const log = await callsDuring(async () => { reply = await chat(fake, { model: ref, messages: hello }) })
+    return { status: reply.status, error: reply.error, created: log.filter((c) => c.call === 'engine_create').map((c) => c.backend) }
+  }
+  const ok = (created) => ({ status: 200, error: undefined, created })
+  const gpuError = (path) => ({ status: 500, created: ['gpu'],
+    error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${path}: UNAVAILABLE: no usable OpenCL device')` })
+  // The model's own gpu does not start, so its engine runs on cpu, and a request without a backend keeps that engine.
+  const broken = readable('gpu-broken')
+  assert.deepEqual(await engines(broken), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(broken), ok([]))
+  // gpu set: an engine on gpu, here the GPU's error, not the engine that runs on cpu.
+  assert.deepEqual(await engines(`${broken},gpu`), gpuError(broken))
+  // cpu set: the engine that runs on cpu serves it, and requests without a backend keep it after.
+  assert.deepEqual(await engines(broken), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(`${broken},cpu`), ok([]))
+  assert.deepEqual(await engines(broken), ok([]))
+  // A model that gets a new engine for each conversation (an LFM2 one): gpu set is not the cpu its last one ran on.
+  const recurrent = litertlmFile(join(work, 'gpu-broken-lfm2-set.litertlm'), [tflite('tf_lite_prefill_decode', 'gpu,cpu'), llmMetadata(LFM2)])
+  assert.deepEqual(await engines(recurrent), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(`${recurrent},gpu`), gpuError(recurrent))
+  // An engine on the model's own backend serves a request that sets it; one on a backend a request set is not the
+  // model's choice, so a request without a backend gets the model's own.
+  const first = readable('gpu-first')
+  assert.deepEqual(await engines(first), ok(['gpu']))
+  assert.deepEqual(await engines(`${first},gpu`), ok([]))
+  assert.deepEqual(await engines(first), ok([]))
+  assert.deepEqual(await engines(`${first},cpu`), ok(['cpu']))
+  assert.deepEqual(await engines(first), ok(['gpu']))
+  // A model file replaced by one whose own backend is another gets an engine on that one.
+  const replaced = readable('backend-replaced', [decoder])
+  assert.deepEqual(await engines(replaced), ok(['cpu']))
+  readable('backend-replaced', [tflite('tf_lite_prefill_decode', 'gpu'), llmMetadata(GENERIC)])
+  assert.deepEqual(await engines(replaced), ok(['gpu']))
+})
+
 test('a developer message is a system message', { skip, timeout: 60_000 }, async () => {
   let log = await callsDuring(async () => {
     const reply = await chat(fake, { model: readable('plain'), messages: [{ role: 'developer', content: 'Answer in one word.' }, ...hello] })

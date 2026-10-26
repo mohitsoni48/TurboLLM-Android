@@ -458,7 +458,8 @@ puts gpu first), as `litert-lm serve` picks it. The server picked CPU for every 
 GPU-only bundle sent without a backend failed to load. When the model's own backend does not
 start, the engine falls back to the next one the model lists, CPU for most, and never to one it
 does not list, and the server logs why; when none starts, the error gives each one's reason. A
-backend the user set is used as set, failing as before.
+backend the user set is used as set, failing as before, also when an engine whose own backend fell
+back is loaded: an engine is kept for the backend it runs on.
 
 **A conversation that ends with the assistant's own words is a 400.** A client that prefills the
 start of a reply asks for it to be continued, which LiteRT-LM 0.18.0 can do only from C++

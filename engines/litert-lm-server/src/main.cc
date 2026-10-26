@@ -715,8 +715,9 @@ struct EngineHolder {
   bool tools_unconstrained = false;
   // What the model file says about itself (ModelFileInfo), as it was when this engine was created.
   ModelFileInfo info;
-  // The backend the engine runs on: key.backend, or CPU when the model's own backend did not start.
-  std::string backend;
+  // The model's own backend, when no backend was set for this engine (else empty): the one it runs on (key.backend), or
+  // the one it fell back from because it did not start.
+  std::string backend_chosen;
   // The context window this engine has, in tokens (-1: unknown), and the larger one that was asked for, if any.
   int window = -1, window_asked = -1;
   // The model's decoder keeps a recurrent state (info.recurrent_state), and a message has been sent on this engine
@@ -845,6 +846,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // start falls back to the next one it lists (below); one the user set does not.
   const bool backend_set = !key.backend.empty();
   if (!backend_set) key.backend = info.text_backends.empty() ? "cpu" : info.text_backends.front();
+  const std::string chosen = backend_set ? "" : key.backend;
   // A vision or audio executor is created only when the engine settings name a backend for it (c/engine.cc,
   // CreateEngineSettingsHelper), and none was named, so an image sent to LFM2.5-VL-450M got a 500 "Vision executor
   // should not be null, please TryLoadingVisionExecutor() first." although the model takes images.
@@ -857,6 +859,15 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   }
   if (info.capabilities_known && needs.audio && key.audio_backend.empty()) {
     throw HttpError(400, "Invalid messages: " + ref.id + " takes no audio input");
+  }
+  // An engine is keyed by the backend it runs on, so a backend the request or the config sets gets an engine on that
+  // backend or that backend's error. Keyed by the model's choice, an engine that had fallen back to CPU served a request
+  // that set gpu. A request that sets none takes the engine made for the same choice of the model's, on whichever
+  // backend it fell back to, so the model's own is not tried again until another engine is loaded.
+  if (!chosen.empty() && g_engine.engine && g_engine.backend_chosen == chosen) {
+    EngineKey fallen = key;
+    fallen.backend = g_engine.key.backend;
+    if (g_engine.key == fallen) key = fallen;
   }
 
   // A model whose decoder keeps a recurrent state gets a new engine for every conversation after the first. LiteRT-LM
@@ -931,12 +942,12 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
     }
     return e;
   };
-  // A new engine for a fresh state (above) runs where the one before it did, so a model whose own backend fell back is
-  // not tried on that backend again for every conversation. A backend other than CPU that the model picked and that
-  // does not start falls back to the next one the model lists, and only to one it lists: a GPU-only bundle was tried
-  // on CPU, which cannot run it, and the error then gave the CPU's reason instead of the GPU's. When none starts, the
-  // error gives each one's reason.
-  std::vector<std::string> backends = {fresh_state ? g_engine.backend : key.backend};
+  // A new engine for a fresh state (above) has the key of the one before it, so it runs where that one did, and a model
+  // whose own backend fell back is not tried on that backend again for every conversation. A backend other than CPU that
+  // the model picked and that does not start falls back to the next one the model lists, and only to one it lists: a
+  // GPU-only bundle was tried on CPU, which cannot run it, and the error then gave the CPU's reason instead of the
+  // GPU's. When none starts, the error gives each one's reason.
+  std::vector<std::string> backends = {key.backend};
   if (!backend_set && backends[0] != "cpu") {
     auto at = std::find(info.text_backends.begin(), info.text_backends.end(), backends[0]);
     if (at != info.text_backends.end()) backends.insert(backends.end(), at + 1, info.text_backends.end());
@@ -956,7 +967,8 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   if (window <= 0) window = RuntimeWindow(info, -1, backend);
   g_engine.engine = e;
   g_engine.key = key;
-  g_engine.backend = backend;
+  g_engine.key.backend = backend;
+  g_engine.backend_chosen = chosen;
   // The same model and settings again: what was found out about the model still holds.
   if (!fresh_state) g_engine.tools_unconstrained = false;
   g_engine.info = info;
@@ -2002,7 +2014,7 @@ void HandleChatCompletions(int fd, const Request& req) {
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
     LiteRtLmSessionConfig* sc = L.litert_lm_session_config_create();
-    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.backend, ref.id, has_sampler)) {
+    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.key.backend, ref.id, has_sampler)) {
       LiteRtLmSamplerParams* sp = L.litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
       L.litert_lm_sampler_params_set_top_k(sp, sampling->top_k);
       L.litert_lm_sampler_params_set_top_p(sp, sampling->top_p);
