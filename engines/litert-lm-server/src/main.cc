@@ -655,40 +655,59 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   return info;
 }
 
-// ModelFileInfo for the model file, read once per version of it (its size and modification time). A .litertlm starts
-// with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end offset (the same 32
-// bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32 bytes before reading
-// the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate, killing the whole
-// server, so the offset is bounded here first. The bound is the runtime's own: it reads the header from the file's
-// first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger offset can never load,
-// yet would still cost an allocation up to the file's size (hundreds of MB on a phone). Checked before the loaded
-// engine is released, which a bad file then leaves in place. A file that can't be read or lacks the magic is left to
-// the runtime, which reports it cleanly and more precisely (e.g. "Permission denied"), and says nothing here. Caller
-// holds g_engine_mu.
+// ModelFileInfo for the model file, read once per version of it: its device, inode, size, and modification and change
+// times to the nanosecond, from a stat, which is all a request costs while the file is unchanged. The change time moves
+// with every write, and nothing can set it back, so a rewrite that puts the old modification time back (cp -p,
+// touch -r, tar) is a new version too. Keyed by the size and the second, a model rewritten in place within the same
+// second at the same size kept the old file's info (an image sent to a model that now takes images was refused), and
+// every request opened the file and read it again. The stat comes before the read, so a file that changes in between is
+// read again next time. A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a
+// little-endian uint64 header-end offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime
+// allocates and zeroes header_end - 32 bytes before reading the header, and the std::bad_alloc a bogus offset raises
+// crosses the C API into std::terminate, killing the whole server, so the offset is bounded here first. The bound is
+// the runtime's own: it reads the header from the file's first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's
+// litert_lm_loader.h), so a larger offset can never load, yet would still cost an allocation up to the file's size
+// (hundreds of MB on a phone). Refused, for every request to that version of the file, before the loaded engine is
+// released, which a bad file then leaves in place. A file that can't be read or lacks the magic is left to the runtime,
+// which reports it cleanly and more precisely (e.g. "Permission denied"), and says nothing here. Caller holds
+// g_engine_mu.
 const ModelFileInfo& FileInfo(const ModelRef& ref) {
   struct Cached {
-    long long size = -1, mtime = -1;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    off_t size = -1;
+    timespec mtime{}, ctime{};
+    std::string invalid;  // the 500 for a header offset the runtime cannot load
     ModelFileInfo info;
   };
   static std::map<std::string, Cached> cache;
-  struct stat st {};
-  unsigned char h[32] = {};
-  std::ifstream in(ref.path, std::ios::binary);
-  bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
-            std::memcmp(h, "LITERTLM", 8) == 0;
-  uint64_t header_end = 0;
-  for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
-  constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
-  if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
-    throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
-                             ": invalid .litertlm header')");
-  }
   Cached& c = cache[ref.path];
-  if (c.size == static_cast<long long>(st.st_size) && c.mtime == static_cast<long long>(st.st_mtime)) return c.info;
-  c = Cached{static_cast<long long>(st.st_size), static_cast<long long>(st.st_mtime), ModelFileInfo()};
-  if (!ok) return c.info;
-  std::string header(header_end - 32, '\0');
-  if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) c.info = ReadModelFileInfo(in, header);
+  struct stat st {};
+  if (::stat(ref.path.c_str(), &st) != 0) {
+    c = Cached();
+    return c.info;
+  }
+  if (c.dev != st.st_dev || c.ino != st.st_ino || c.size != st.st_size || c.mtime.tv_sec != st.st_mtim.tv_sec ||
+      c.mtime.tv_nsec != st.st_mtim.tv_nsec || c.ctime.tv_sec != st.st_ctim.tv_sec ||
+      c.ctime.tv_nsec != st.st_ctim.tv_nsec) {
+    c = Cached{st.st_dev, st.st_ino, st.st_size, st.st_mtim, st.st_ctim, "", ModelFileInfo()};
+    if (g_verbose) Log("Reading the header of " + ref.path);
+    unsigned char h[32] = {};
+    std::ifstream in(ref.path, std::ios::binary);
+    if (in.read(reinterpret_cast<char*>(h), sizeof h) && std::memcmp(h, "LITERTLM", 8) == 0) {
+      uint64_t header_end = 0;
+      for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
+      constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
+      if (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize)) {
+        c.invalid = "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
+                    ": invalid .litertlm header')";
+      } else {
+        std::string header(header_end - 32, '\0');
+        if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) c.info = ReadModelFileInfo(in, header);
+      }
+    }
+  }
+  if (!c.invalid.empty()) throw HttpError(500, c.invalid);
   return c.info;
 }
 

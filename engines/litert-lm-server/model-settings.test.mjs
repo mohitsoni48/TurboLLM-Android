@@ -16,14 +16,14 @@
 // Every server a test starts is killed by pid when that test ends, or at the latest when the tests end. Every wait is
 // bounded.
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { after, before, test } from 'node:test'
 import {
   buildServer, calls, chat, fb, flatbuffer, killServers, litertlmFile, logged, proto, realLibrary, realModels, request,
-  skip, skipReal, startServer, stopServer,
+  skip, skipReal, sleep, startServer, stopServer,
 } from './testdata/harness.mjs'
 
 const visionModels = (process.env.LITERT_LM_TEST_VISION_MODELS ?? '').split(',').filter(Boolean)
@@ -252,6 +252,54 @@ test('an image or audio part sent to a model without that input is a 400 that sa
   assert.equal((await chat(fake, { model: readable('vl'), messages: imageMessage('What color is this?') })).status, 200)
   assert.equal((await chat(fake, { model: readable('omni'), messages: audioMessage })).status, 200)
   assert.equal((await chat(fake, { model: unreadable('unreadable'), messages: imageMessage('What color is this?') })).status, 200)
+})
+
+test('a model file is read once while it is unchanged, and again once it changes, in the same second at the same size or with its time put back', { skip, timeout: 60_000 }, async () => {
+  const path = join(work, 'rewritten.litertlm')
+  const reads = async (name) => (await logged(fake)).filter((l) => l.startsWith('Reading the header of ') && l.endsWith(`/${name}`)).length
+  // Takes no image, until it is rewritten in place (the same inode), at the same size (a section each), its
+  // modification time moved within the same second: then it has a vision encoder.
+  litertlmFile(path, [decoder, tflite('tf_lite_embedder')])
+  const second = Math.floor(Date.now() / 1000) - 60
+  utimesSync(path, second + 0.25, second + 0.25)
+  const before = statSync(path)
+  assert.deepEqual(await chat(fake, { model: path, messages: imageMessage('What is this?') }), { status: 400, error: 'Invalid messages: rewritten.litertlm takes no image input' })
+  for (let i = 0; i < 3; i++) assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 1)
+  litertlmFile(path, [decoder, tflite('tf_lite_vision_encoder')])
+  utimesSync(path, second + 0.75, second + 0.75)
+  const after = statSync(path)
+  assert.deepEqual([after.ino, after.size, Math.floor(after.mtimeMs / 1000)], [before.ino, before.size, second])
+  assert.equal((await chat(fake, { model: path, messages: imageMessage('What is this?') })).status, 200)
+  assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 2)
+  // Rewritten again, as the file without the encoder, and given back the modification time it had (as cp -p, touch -r
+  // and tar do): the same inode, size and modification time to the nanosecond, its change time moved.
+  const was = statSync(path, { bigint: true })
+  await sleep(20)
+  litertlmFile(path, [decoder, tflite('tf_lite_embedder')])
+  utimesSync(path, second + 0.75, second + 0.75)
+  const now = statSync(path, { bigint: true })
+  assert.deepEqual([now.ino, now.size, now.mtimeNs], [was.ino, was.size, was.mtimeNs])
+  assert.notEqual(now.ctimeNs, was.ctimeNs)
+  assert.deepEqual(await chat(fake, { model: path, messages: imageMessage('What is this?') }), { status: 400, error: 'Invalid messages: rewritten.litertlm takes no image input' })
+  assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 3)
+  // A header end the runtime cannot load is refused for every request, read once, and the engine loaded stays.
+  const bad = join(work, 'bad-offset.litertlm')
+  const preamble = Buffer.alloc(32)
+  preamble.write('LITERTLM')
+  preamble.writeBigUInt64LE(1n << 40n, 24)
+  writeFileSync(bad, Buffer.concat([preamble, Buffer.alloc(16384)]))
+  const log = await callsDuring(async () => {
+    for (let i = 0; i < 2; i++) {
+      assert.deepEqual(await chat(fake, { model: bad, messages: hello }), { status: 500,
+        error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${bad}: invalid .litertlm header')` })
+    }
+    assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  })
+  assert.deepEqual(log.filter((c) => c.call === 'engine_create'), [])
+  assert.equal(await reads('bad-offset.litertlm'), 1)
 })
 
 // The server's peak resident memory, from /proc (Linux, as the tests are).
