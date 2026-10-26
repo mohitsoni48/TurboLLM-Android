@@ -749,6 +749,35 @@ test('repetition penalties reach the model with llama.cpp\'s and OpenAI\'s meani
   assert.equal((await logged(fake)).filter((l) => l === 'min_p is not applied to plain.litertlm: LiteRT-LM has no min-p sampling').length, 1, fake.stderr)
 })
 
+test('a sampler or penalty value a float cannot hold is a 400 that names it, and one it can is passed as set', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const range = (field, value) => `Invalid sampler parameters: ValueError: ${field} must be within a float's range (-3.4028235e+38 to 3.4028235e+38), got ${value}`
+  for (const [request, error] of [
+    [{ temperature: 1e39 }, range('temperature', '1e+39')],
+    [{ repetition_penalty: 1e39 }, range('repetition_penalty', '1e+39')],
+    [{ repeat_penalty: 1e39 }, range('repeat_penalty', '1e+39')],
+    [{ presence_penalty: 1e39 }, range('presence_penalty', '1e+39')],
+    [{ presence_penalty: -1e39 }, range('presence_penalty', '-1e+39')],
+    [{ frequency_penalty: 1e39 }, range('frequency_penalty', '1e+39')],
+    [{ frequency_penalty: -1e39 }, range('frequency_penalty', '-1e+39')],
+    // Past FLT_MAX by more than half a float's step, so it rounds to infinity (3.4028235e38, below, is past it by less
+    // and rounds to FLT_MAX).
+    [{ temperature: 3.4028236e38 }, range('temperature', '3.4028236e+38')],
+  ]) {
+    for (const stream of [false, true]) {
+      assert.deepEqual(await chat(fake, { model, messages: hello, ...request, stream }), { status: 400, error }, JSON.stringify(request))
+    }
+  }
+  // Within a float's range, as set: the sampler and the penalties get it.
+  const log = await callsDuring(async () => {
+    const reply = await chat(fake, { model, messages: hello, temperature: 3e38, repetition_penalty: 3e38, presence_penalty: -3e38, frequency_penalty: 3.4028235e38 })
+    assert.equal(reply.status, 200, reply.error)
+  })
+  assert.equal(log.filter((c) => c.call === 'conversation_create').at(-1).config.sampler.temperature, f(3e38))
+  assert.deepEqual(log.filter((c) => c.call === 'send_message').at(-1).args.repetition_penalty_config,
+    { repetition_penalty: f(3e38), presence_penalty: f(-3e38), frequency_penalty: f(3.4028235e38), window_size: 0 })
+})
+
 test('min_p is said once per model, by a request that is answered, also when requests with it arrive at once', { skip, timeout: 60_000 }, async () => {
   // Each connection has its own thread. The note is taken under the engine lock, so requests refused before it (here
   // for their response_format) never touch it, and answered ones take turns.

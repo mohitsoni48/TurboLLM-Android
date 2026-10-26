@@ -394,7 +394,9 @@ the request sets a field, as before: LiteRT-LM leaves sampling to the model ther
 or below means no top-k limit, as in llama.cpp (TurboLLM's Top K 0 means disabled), and one above
 0 is passed as set, on GPU too, where LiteRT-LM 0.18.0 sets no limit of its own; a `top_p`
 outside 0 to 1, a negative `temperature`, and a `top_k` or `seed` with a fraction are a 400 that
-names the field instead of the runtime's 500.
+names the field instead of the runtime's 500. LiteRT-LM takes these values and the repetition
+penalties below as floats, so a `temperature` or penalty beyond a float's range (3.4028235e+38
+either way), which reached it as an infinity, is a 400 that names the field too.
 
 **Thinking is asked for the ways clients ask for it.** In order, the first that says: the
 top-level `reasoning_effort` (what the Python server reads, and what the daemon sends for a

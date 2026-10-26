@@ -1611,11 +1611,22 @@ struct Penalties {
   int window = 0;
 };
 
+// Why `v`, a number the request sets as `field`, cannot be passed to LiteRT-LM, which takes sampler values as floats,
+// or empty. A number beyond a float's range (FLT_MAX, 3.4028235e+38) passed every check the server made as a double and
+// became an infinity as a float: temperature 1e39 reached the sampler as inf, a penalty of 1e39 or -1e39 the decoder.
+std::string OutOfFloatRange(const char* field, const json& v) {
+  if (std::isfinite(static_cast<float>(v.get<double>()))) return "";
+  return std::string(field) + " must be within a float's range (-3.4028235e+38 to 3.4028235e+38), got " + v.dump();
+}
+
 std::optional<Penalties> ParsePenalties(const json& body) {
   auto has = [&](const char* k) { return body.contains(k) && !body[k].is_null(); };
   auto number = [&](const char* k) {
     if (!body[k].is_number() || !std::isfinite(body[k].get<double>())) {
       throw HttpError(400, std::string("Invalid sampler parameters: ValueError: ") + k + " must be a number");
+    }
+    if (std::string why = OutOfFloatRange(k, body[k]); !why.empty()) {
+      throw HttpError(400, "Invalid sampler parameters: ValueError: " + why);
     }
     return body[k].get<float>();
   };
@@ -1910,6 +1921,10 @@ void HandleChatCompletions(int fd, const Request& req) {
         if ((std::string(k) == "top_k" || std::string(k) == "seed") && !integral) why = std::string(k) + " must be an integer";
         if (!why.empty()) {
           SendError(fd, req, 400, "Invalid sampler parameters: ValueError: " + why + ", got " + body[k].dump());
+          return;
+        }
+        if (std::string range = OutOfFloatRange(k, body[k]); !range.empty()) {
+          SendError(fd, req, 400, "Invalid sampler parameters: ValueError: " + range);
           return;
         }
         has_sampler = true;
