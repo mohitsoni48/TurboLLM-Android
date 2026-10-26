@@ -2488,6 +2488,27 @@ void PrintHelp() {
       "The request's `model` field is the model path: <path>[,<backend>[,<max-tokens>]]\n");
 }
 
+#ifdef __linux__
+// Whether the process that started this one has already exited, which main() can tell only by this process now being
+// init's: an orphan is adopted by PID 1. Only the machine's own init counts, PID 1 of the root PID namespace. PID 1 of
+// a container's namespace is its entrypoint (tini, dumb-init, a shell), which starts the server as its child on purpose
+// (`docker run --init`), and such a server was refused. The kernel keeps no record of who forked a process, so there
+// an orphan, which that PID 1 adopts too, cannot be told from its child, and starts. On Android, where only the app
+// starts this binary, a parent of PID 1 is always the app gone, also where Android runs in a container (ChromeOS's
+// ARC++), so there it stays refused.
+bool ParentExited() {
+  if (::getppid() != 1) return false;
+#ifndef __ANDROID__
+  char ns[64];
+  const ssize_t n = ::readlink("/proc/self/ns/pid", ns, sizeof ns);
+  // The root PID namespace's inode, PROC_PID_INIT_INO in the kernel's proc_ns.h (since Linux 3.8). When /proc cannot
+  // be read, as before.
+  if (n > 0 && std::string(ns, static_cast<size_t>(n)) != "pid:[4026531836]") return false;
+#endif
+  return true;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2499,14 +2520,14 @@ int main(int argc, char** argv) {
   // covers every other way it is started: by a daemon without that helper, through the daemon's sh lifeline when the
   // helper fails its self-test, or by hand. Armed before anything else runs, so even a server stuck loading its
   // library goes. A parent process that ended before the prctl never sends it: this process was then already
-  // reparented to init, so the server does not start. This sees the process end, not the thread: had only the forking
-  // thread ended, this process would have moved to another thread of its parent and the signal would come when that
-  // one ends; the daemon's thread ends only with the daemon. A server that init starts on purpose is refused too;
-  // none is, as this binary ships only in the APK (host builds are for its tests).
+  // reparented to init, so the server does not start (ParentExited). This sees the process end, not the thread: had
+  // only the forking thread ended, this process would have moved to another thread of its parent and the signal would
+  // come when that one ends; the daemon's thread ends only with the daemon. A server that the machine's own init
+  // starts on purpose is refused too; none is on Android, where this binary ships only in the APK.
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
     std::fprintf(stderr, "prctl(PR_SET_PDEATHSIG) failed: %s; the server will not end with its parent\n",
                  std::strerror(errno));
-  } else if (::getppid() == 1) {
+  } else if (ParentExited()) {
     std::fprintf(stderr, "the process that started %s has already exited; not starting\n", kServerName);
     return 1;
   }

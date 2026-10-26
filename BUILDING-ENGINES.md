@@ -478,10 +478,13 @@ AddressSanitizer caught an exception being destroyed by the other runtime. See
 ends, and it exits 1 without starting when its parent is already init (the starter died before
 the `prctl`). The daemon's [engine tether](#the-engine-tether) does the same before it execs the
 server; this covers a server started any other way: by a daemon without the tether, through the
-daemon's `/system/bin/sh` fallback, or by hand. `node --test
-engines/litert-lm-server/parent-death.test.mjs` builds the server for the machine (Linux, `cc`
-and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing, and checks that a
-stand-in daemon's SIGKILL takes the listening server with it and that an orphaned start exits.
+daemon's `/system/bin/sh` fallback, or by hand. Off Android, a parent that is PID 1 of a
+container's PID namespace, its entrypoint (tini, a shell), is taken for the server's starter, as
+it usually is: the kernel keeps no record that would tell an orphan that PID 1 adopted from its
+child. `node --test engines/litert-lm-server/parent-death.test.mjs` builds the server for the
+machine (Linux, `cc` and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing,
+and checks that a stand-in daemon's SIGKILL takes the listening server with it, that an orphaned
+start exits, and, where `unshare` can make a PID namespace, that a server its PID 1 starts runs.
 
 ### GPU
 
