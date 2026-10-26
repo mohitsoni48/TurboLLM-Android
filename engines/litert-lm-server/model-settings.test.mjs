@@ -1116,6 +1116,14 @@ test('a backend the request sets after the model\'s own fell back gets an engine
   assert.deepEqual(await engines(replaced), ok(['cpu']))
   readable('backend-replaced', [tflite('tf_lite_prefill_decode', 'gpu'), llmMetadata(GENERIC)])
   assert.deepEqual(await engines(replaced), ok(['gpu']))
+  // And one whose own backend is the one the old file's engine fell back to gets an engine of its own too, not the old
+  // file's: that one was keyed by the cpu it runs on, and served the new file with the old file's settings (here an
+  // LFM2 model's new engine for each conversation was lost to the old file's info).
+  const fellBack = readable('gpu-broken-replaced', [tflite('tf_lite_prefill_decode', 'gpu,cpu'), llmMetadata(GENERIC)])
+  assert.deepEqual(await engines(fellBack), ok(['gpu', 'cpu']))
+  readable('gpu-broken-replaced', [tflite('tf_lite_prefill_decode', 'cpu'), llmMetadata(LFM2)])
+  assert.deepEqual(await engines(fellBack), ok(['cpu']))
+  assert.deepEqual(await engines(fellBack), ok(['cpu']), 'and LFM2 gets a new engine for its next conversation')
 })
 
 test('a developer message is a system message', { skip, timeout: 60_000 }, async () => {

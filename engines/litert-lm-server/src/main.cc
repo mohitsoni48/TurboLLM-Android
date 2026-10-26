@@ -888,6 +888,13 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
     fallen.backend = g_engine.key.backend;
     if (g_engine.key == fallen) key = fallen;
   }
+  // Nor does a request that sets none take one made for another choice of the model's, which only a replaced file
+  // (the choice is its header's) brings, even when that engine fell back to the backend the new file chooses: it was
+  // loaded from the old file, and its ModelFileInfo (sampler, context, recurrent state) is the old file's. A file
+  // replaced by one of the same choice, or used with a backend set, still keeps the engine, as it always has: the key
+  // holds no version of the file.
+  const bool other_choice = !chosen.empty() && g_engine.engine && !g_engine.backend_chosen.empty() &&
+                            g_engine.backend_chosen != chosen;
 
   // A model whose decoder keeps a recurrent state gets a new engine for every conversation after the first. LiteRT-LM
   // 0.18.0 starts each new conversation on an engine at step 0 and keeps the executor's buffers as they are there
@@ -898,8 +905,9 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // France." after that same question's first turn and a title request, and with "The capital of Italy is **Rome**."
   // on a fresh one (LiteRT-LM #3165; the model card says to create a new Engine for each conversation). The C API has
   // no way to reset that state, so the engine is created again, with the same settings.
-  const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.info.recurrent_state && g_engine.state_used;
-  if (g_engine.engine && g_engine.key == key && !fresh_state) return g_engine.engine;
+  const bool fresh_state =
+      g_engine.engine && g_engine.key == key && !other_choice && g_engine.info.recurrent_state && g_engine.state_used;
+  if (g_engine.engine && g_engine.key == key && !other_choice && !fresh_state) return g_engine.engine;
   if (fresh_state) {
     static std::set<std::string> told;  // once per model file, not per conversation
     if (told.insert(ref.path).second) {
