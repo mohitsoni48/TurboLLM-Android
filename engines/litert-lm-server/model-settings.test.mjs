@@ -958,6 +958,36 @@ test('a prompt that does not fit the context window is a 400 that says the windo
     '(INVALID_ARGUMENT: Input token ids are too long. Exceeding the maximum number of tokens allowed: 4209 >= 4096)' })
 })
 
+test('model output nested deeper than the server reads fails its request, streamed or not, and the server stays up', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const nested = (n, stream) => chat(fake, { model, messages: [{ role: 'user', content: `nested:${n}` }], stream }, 30_000)
+  // A tool call's arguments nested as deep as a request's may be, 128 levels ({"a": ...} and 127 arrays), are read as
+  // before; so are 125, which LiteRT-LM 0.18.0 itself takes from a model.
+  for (const n of [100, 125, 127]) {
+    const reply = await nested(n, false)
+    assert.equal(reply.status, 200, `${n}: ${reply.error}`)
+    assert.equal(reply.finish, 'tool_calls')
+    assert.deepEqual(JSON.parse(reply.tool_calls[0].function.arguments), { a: JSON.parse('['.repeat(n) + ']'.repeat(n)) })
+  }
+  // One level more is refused. Copied or written out a level at a time, 200,000 levels ran the connection thread out of
+  // stack.
+  const error = 'RuntimeError: the model\'s output, as the runtime parsed it, is nested deeper than 132 levels ' +
+    '(128 within a tool call\'s arguments)'
+  assert.deepEqual(await nested(128, false), { status: 500, error })
+  assert.deepEqual(await nested(200_000, false), { status: 500, error })
+  const res = await request(`http://127.0.0.1:${fake.port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'nested:200000' }], stream: true }),
+  }, 30_000)
+  assert.equal(res.status, 200)
+  assert.ok(res.text.includes(`event: response.error\ndata: ${JSON.stringify({ error })}\n\n`), res.text)
+  assert.ok(res.text.endsWith('data: [DONE]\n\n'), res.text)
+  // A chunk that is no JSON is the reply's text, as always, however many brackets it opens.
+  const text = await chat(fake, { model, messages: [{ role: 'user', content: 'nested-text:200' }] })
+  assert.deepEqual([text.status, text.content], [200, `${'['.repeat(200)} not json`])
+  assert.equal((await chat(fake, { model, messages: hello })).status, 200)
+})
+
 for (const path of realModels.length ? realModels : ['<model>']) {
   test(`a real model's context window is its own when more is asked, and a reply that fills it ends with "length": ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
     const config = join(work, 'no-cache.json')

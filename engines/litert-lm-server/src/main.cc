@@ -1024,20 +1024,22 @@ std::map<std::string, std::string> BuildNameByToolCallId(const json& messages) {
 constexpr int kMaxJsonDepth = 128;
 
 struct JsonTooDeep : std::runtime_error {
-  JsonTooDeep() : std::runtime_error("nested deeper than " + std::to_string(kMaxJsonDepth) + " levels") {}
+  explicit JsonTooDeep(int max_depth = kMaxJsonDepth)
+      : std::runtime_error("nested deeper than " + std::to_string(max_depth) + " levels") {}
 };
 
 // The DOM builder json::parse itself uses, counting the arrays and objects open: it throws JsonTooDeep at one that
-// kMaxJsonDepth others enclose. Not json::parse with a parser callback, which would be simpler: that parser's
+// max_depth others enclose. Not json::parse with a parser callback, which would be simpler: that parser's
 // end_object scans the whole enclosing array or object for a value the callback discarded, each time an object closes,
 // so a body holding N objects in one array or object took O(N^2). A normal chat request with an extra field of 50,000
 // empty objects (575 KB) kept a core busy for 16 s, on the connection thread and before any lock, and nothing stops
 // that once the client has gone. This builder's start and end are what json::parse does, so it stays linear.
 struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
-  using json_sax_dom_parser::json_sax_dom_parser;
+  BoundedDomParser(json& result, int max_depth) : json_sax_dom_parser(result, true), max_depth(max_depth) {}
+  const int max_depth;
   int depth = 0;
   bool start_object(std::size_t n) {
-    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    if (++depth > max_depth) throw JsonTooDeep(max_depth);
     return json_sax_dom_parser::start_object(n);
   }
   bool end_object() {
@@ -1045,7 +1047,7 @@ struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
     return json_sax_dom_parser::end_object();
   }
   bool start_array(std::size_t n) {
-    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    if (++depth > max_depth) throw JsonTooDeep(max_depth);
     return json_sax_dom_parser::start_array(n);
   }
   bool end_array() {
@@ -1054,11 +1056,11 @@ struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
   }
 };
 
-// json::parse, throwing JsonTooDeep at an array or object that kMaxJsonDepth others enclose. A syntax error throws
+// json::parse, throwing JsonTooDeep at an array or object that max_depth others enclose. A syntax error throws
 // json::parse_error, as with json::parse (the builder is made with allow_exceptions).
-json ParseBounded(const std::string& s) {
+json ParseBounded(const std::string& s, int max_depth = kMaxJsonDepth) {
   json result;
-  BoundedDomParser builder(result, true);
+  BoundedDomParser builder(result, max_depth);
   json::sax_parse(s, &builder);
   return result;
 }
@@ -1433,12 +1435,26 @@ std::string ContentText(const json& content) {
   return out;
 }
 
+// Throws JsonTooDeep for a JSON chunk nested deeper than a request may be, its envelope aside. The runtime's chunk
+// carries the tool calls it parsed from the model's output, 4 levels down (the chunk, its tool_calls, the call, its
+// function), so a call's arguments may nest as deep as a request's, kMaxJsonDepth. Copying the tool calls (below) and
+// writing them out recurse once per level, and a stand-in's chunk with a tool call 200,000 levels deep killed the server
+// with SIGSEGV. LiteRT-LM 0.18.0 bounds what it parses itself (a JSON tool call at 128 levels), but the server does not
+// rely on what the runtime hands it.
 Piece ParseChunk(const std::string& s) {
   Piece p;
   if (s.empty()) return p;
   json j;
   try {
-    j = json::parse(s);
+    j = ParseBounded(s, kMaxJsonDepth + 4);
+  } catch (const JsonTooDeep&) {
+    // Text that is not JSON, however many brackets it opens, is plain text, as below. accept() builds nothing, so it
+    // does not recurse.
+    if (!json::accept(s)) {
+      p.text = s;
+      return p;
+    }
+    throw;
   } catch (...) {
     p.text = s;  // the Python client treats unparseable chunks as plain text, too
     return p;
@@ -2330,7 +2346,20 @@ void HandleChatCompletions(int fd, const Request& req) {
         }
         break;
       }
-      Piece p = ParseChunk(item.text);
+      Piece p;
+      try {
+        p = ParseChunk(item.text);
+      } catch (const JsonTooDeep& e) {
+        // The model's output cannot be read: the request fails as on the runtime's own error, and the rest of the
+        // generation is not waited for.
+        if (!cancelled) {
+          cancelled = true;
+          L.litert_lm_conversation_cancel_process(conv.get());
+        }
+        error = std::string("the model's output, as the runtime parsed it, is ") + e.what() + " (" +
+                std::to_string(kMaxJsonDepth) + " within a tool call's arguments)";
+        break;
+      }
       p.text = apply_stops(p.text);
       if (stopped) p.tool_calls = json::array();
       if (!p.reasoning.empty()) ++reasoning_tokens;
