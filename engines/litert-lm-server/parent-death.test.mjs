@@ -6,7 +6,7 @@
 // when it ends.
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -116,6 +116,17 @@ test('a server whose parent exited before it started does not start', { skip }, 
     assert.ok(ppid !== undefined, 'the orphaned sh was gone before it was let go')
     if (ppid !== 1) {
       t.skip(`an orphan is adopted by pid ${ppid} here, not init`)
+      return
+    }
+    // PID 1 of a container's PID namespace is its entrypoint, whose child the server is taken for (main.cc
+    // ParentExited), so an orphan it adopted starts there by design (the next test). The server is in this process's
+    // namespace; one whose /proc cannot be read counts as the root one, as the server takes it.
+    let ns = null
+    try {
+      ns = readlinkSync('/proc/self/ns/pid')
+    } catch {}
+    if (ns !== null && ns !== 'pid:[4026531836]') {
+      t.skip('in a container\'s PID namespace, where an orphan its PID 1 adopted starts by design')
       return
     }
     outer.stdio[3].end('go\n')

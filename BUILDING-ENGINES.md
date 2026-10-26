@@ -486,7 +486,8 @@ it usually is: the kernel keeps no record that would tell an orphan that PID 1 a
 child. `node --test engines/litert-lm-server/parent-death.test.mjs` builds the server for the
 machine (Linux, `cc` and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing,
 and checks that a stand-in daemon's SIGKILL takes the listening server with it, that an orphaned
-start exits, and, where `unshare` can make a PID namespace, that a server its PID 1 starts runs.
+start exits (outside a container's PID namespace, where that test is skipped), and, where `unshare`
+can make a PID namespace, that a server its PID 1 starts runs.
 
 ### GPU
 
