@@ -26,8 +26,14 @@ internal data class DownloadNotice(val title: String, val text: String, val prog
 /** The running and queued rows of a GET /api/v1/downloads reply, or null when the reply is not the list the daemon
  *  sends (the poll then counts as failed, and as idle, as before). A row with a field missing or of another type
  *  reads that field as 0 instead of failing the whole list. */
-internal fun parseLiveDownloads(body: String): List<LiveDownload>? {
-    val list = runCatching { JSONObject(body).optJSONArray("downloads") }.getOrNull() ?: return null
+internal fun parseLiveDownloads(body: String): List<LiveDownload>? =
+    runCatching { JSONObject(body) }.getOrNull()?.let(::liveDownloads)
+
+/** The running and queued rows of [json]'s `downloads`, as parseLiveDownloads reads them: the list GET
+ *  /api/v1/downloads answers, and the one a GET /api/v1/activity reply carries too from a daemon that sends it there
+ *  (TurboLLM's active-work.ts, its running and queued rows only). Null when [json] has no such list. */
+internal fun liveDownloads(json: JSONObject): List<LiveDownload>? {
+    val list = json.optJSONArray("downloads") ?: return null
     return (0 until list.length()).mapNotNull { i ->
         val row = list.optJSONObject(i) ?: return@mapNotNull null
         val status = row.optString("status")

@@ -40,9 +40,11 @@ in the foreground, also while idle, until the user quits or closes the app with 
 rather than suggesting it runs only during generation.
 
 LAN access, remote access and Turbo Link are read from the daemon the app bundles: the `serving` field of its GET
-/api/v1/status, from TurboLLM's feat(api): /api/v1/status says which server features are on. A daemon without that
-field reports them all off (the app reads a missing or malformed `serving` as nothing served), so a close with only
-one of them on would quit: the text below holds only for an APK built with a TurboLLM that has it.
+/api/v1/status, from TurboLLM's feat(api): /api/v1/status says which server features are on, or the same field in the
+`status` its GET /api/v1/activity carries too, from TurboLLM's fix(api): one activity request carries what the
+Android poll reads. A daemon without that field reports them all off (the app reads a missing or malformed `serving`
+as nothing served), so a close with only one of them on would quit: the text below holds only for an APK built with a
+TurboLLM that has it.
 
 A close made while the app is still starting, before its daemon answers (a swipe from Recents during the splash
 screen, and before Android 12 Back there too), waits for the daemon, for up to 30 seconds, and is then decided as the

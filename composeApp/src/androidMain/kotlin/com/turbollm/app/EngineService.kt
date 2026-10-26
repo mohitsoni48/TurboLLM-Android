@@ -341,13 +341,15 @@ class EngineService : Service() {
     /** Whether anything runs, asked of the daemon now (see appClosed): a model import, work in progress or a reply
      *  waiting for a tool approval (GET /api/v1/activity's items, engineGenerating or waiting), a model download
      *  running or queued (a paused or failed one does not count), or a model loaded or loading or a server feature on
-     *  (queryStatus). A query that fails, or a reply it does not recognise, counts as something running. */
+     *  (queryStatus). The downloads and the status come from the same activity reply when it carries them
+     *  (ActivityReply), else from their own routes. A query that fails, or a reply it does not recognise, counts as
+     *  something running. */
     private fun anythingRuns(): Boolean {
         if (ModelImport.isRunning()) return true
-        val activity = queryActivity() ?: return true
-        if (activity.work != null || activity.waiting) return true
-        if (queryDownloads()?.isEmpty() != true) return true
-        return queryStatus()?.runs != false
+        val reply = queryActivity() ?: return true
+        if (reply.activity.work != null || reply.activity.waiting) return true
+        if ((reply.downloads ?: queryDownloads())?.isEmpty() != true) return true
+        return (reply.status ?: queryStatus())?.runs != false
     }
 
     /** Ask the daemon to write its chat database to disk now (POST /api/v1/daemon/flush), waiting at most
@@ -382,10 +384,15 @@ class EngineService : Service() {
         while (running) {
             // A model import counts as work too: the service must neither stop nor let the CPU sleep under the copy.
             val importing = ModelImport.isRunning()
-            // So does a model download (Discover): a stopped service or a sleeping CPU would stall a multi-GB transfer.
-            val downloads = queryDownloads()
+            // One request a tick, two loopback connections (DaemonAuth's proof and the request), to a daemon whose
+            // activity reply carries the downloads and the status too (ActivityReply); an older daemon's are asked of
+            // their own routes, as before, each with a proof of its own: four connections a tick, six while idle.
+            val reply = queryActivity()
+            val activity = reply?.activity
+            // A model download counts too (Discover): a stopped service or a sleeping CPU would stall a multi-GB
+            // transfer.
+            val downloads = reply?.downloads ?: queryDownloads()
             val downloading = !downloads.isNullOrEmpty()
-            val activity = queryActivity()
             // A poll that could not read the activity keeps its last work or approval line up for up to
             // ACTIVITY_MISSES polls in a row, as the download lines do below: the daemon can be slow to answer for a
             // moment mid-reply, and the line read "Idle" for that poll, while a close then counts the unreadable
@@ -402,7 +409,11 @@ class EngineService : Service() {
             val nowBusy = activity?.work != null || importing || downloading
             // The loaded model's name, for the line shown while nothing runs: asked only then, and kept from the last
             // reading when the status cannot be read, so a slow answer does not drop the name for 3 s.
-            val status = if (work == null && !importing && !downloading && !waiting) queryStatus() else null
+            val status = if (work == null && !importing && !downloading && !waiting) {
+                reply?.status ?: queryStatus()
+            } else {
+                null
+            }
             val model = if (status != null) status.name else this.model
             // The query can take seconds. Under the lock, so the service being destroyed meanwhile is seen before the
             // wake lock is re-taken or a removed notification is posted again.
@@ -449,10 +460,10 @@ class EngineService : Service() {
         }
     }
 
-    /** What the daemon is doing (GET /api/v1/activity, see DaemonActivity), or null when it could not be read: the poll
+    /** What the daemon is doing (GET /api/v1/activity, see ActivityReply), or null when it could not be read: the poll
      *  reads that as idle for the wake lock and keeps its last line for a few polls, a close (anythingRuns) counts it
      *  as something running. */
-    private fun queryActivity(): DaemonActivity? = try {
+    private fun queryActivity(): ActivityReply? = try {
         val conn = DaemonAuth.open("/api/v1/activity")
         conn.connectTimeout = 1000
         conn.readTimeout = 2000
@@ -465,7 +476,10 @@ class EngineService : Service() {
                 // daemon's: unreadable, so a close does not take it for nothing running.
                 JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
                     .takeIf { it.optJSONArray("items") != null }
-                    ?.let(::daemonActivity)
+                    ?.let { json ->
+                        val status = json.optJSONObject("status")?.let(::statusReading)
+                        ActivityReply(daemonActivity(json), liveDownloads(json), status)
+                    }
             }
         } finally {
             conn.disconnect()
@@ -617,6 +631,17 @@ class EngineService : Service() {
  *  while nothing is; [waiting] is true while a chat waits for the user to answer a tool approval, which is not work
  *  (the daemon lists those chats under `waiting`, not `items`). */
 private class DaemonActivity(val work: String?, val waiting: Boolean)
+
+/** A GET /api/v1/activity reply: what the daemon is doing, and, from a daemon that sends them there too (TurboLLM's
+ *  active-work.ts), its running and queued downloads ([downloads], as GET /api/v1/downloads gives them) and the fields
+ *  of GET /api/v1/status the service reads ([status], in that route's names and shapes), so that one request a poll
+ *  tells all three. Each is null when the reply does not carry it as that route would answer (an older daemon, or a
+ *  field this does not recognise), and is then asked of its own route, as before. */
+private class ActivityReply(
+    val activity: DaemonActivity,
+    val downloads: List<LiveDownload>?,
+    val status: StatusReading?,
+)
 
 /** What GET /api/v1/status says. [runs]: something runs there, a model held or a server feature on (statusReading).
  *  [name]: the model the notification names while nothing runs, null when none is loaded or the loaded one is only
