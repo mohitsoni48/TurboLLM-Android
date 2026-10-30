@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.FinishReason
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -18,7 +19,7 @@ data class ChatCompletionChunk(
 data class ChunkChoice(
     val index: Int,
     val delta: ChunkDelta,
-    @SerialName("finish_reason") val finishReason: String? = null,
+    @SerialName("finish_reason") val finishReason: FinishReason? = null,
 )
 
 @Serializable

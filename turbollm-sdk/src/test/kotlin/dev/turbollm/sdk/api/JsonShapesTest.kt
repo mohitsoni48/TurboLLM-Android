@@ -1,5 +1,8 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.EngineKind
+import dev.turbollm.sdk.FinishReason
+import dev.turbollm.sdk.ModelFormat
 import dev.turbollm.sdk.internal.sdkJson
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -129,7 +132,7 @@ class JsonShapesTest {
                 ChatChoice(
                     index = 0,
                     message = ChatCompletionMessage(content = "hello", reasoningContent = "think"),
-                    finishReason = "stop",
+                    finishReason = FinishReason.STOP,
                 ),
             ),
             usage = Usage(promptTokens = 3, completionTokens = 2, totalTokens = 5),
@@ -163,7 +166,7 @@ class JsonShapesTest {
             id = "c",
             created = 1,
             model = "m",
-            choices = listOf(ChunkChoice(index = 0, delta = ChunkDelta(content = "x"), finishReason = "length")),
+            choices = listOf(ChunkChoice(index = 0, delta = ChunkDelta(content = "x"), finishReason = FinishReason.LENGTH)),
             usage = Usage(promptTokens = 1, completionTokens = 1, totalTokens = 2),
             timings = sampleTimings(),
         )
@@ -181,7 +184,12 @@ class JsonShapesTest {
                 ModelEntry(
                     id = "org/repo/file",
                     created = 1730246400,
-                    meta = ModelMeta(format = "gguf", engine = "llama.cpp", sizeBytes = 1107000000, loaded = true),
+                    meta = ModelMeta(
+                        format = ModelFormat.GGUF,
+                        engine = EngineKind.LLAMA_CPP,
+                        sizeBytes = 1107000000,
+                        loaded = true,
+                    ),
                 ),
             ),
         )
@@ -190,6 +198,14 @@ class JsonShapesTest {
             """"owned_by":"turbollm-sdk","meta":{"format":"gguf","engine":"llama.cpp","size_bytes":1107000000,""" +
             """"loaded":true}}]}"""
         assertEquals(parse(expected), parse(sdkJson.encodeToString(ModelList.serializer(), list)))
+    }
+
+    @Test
+    fun liteRtModelsUseTheDaemonFormatAndEngineNames() {
+        val meta = ModelMeta(format = ModelFormat.LITERTLM, engine = EngineKind.LITERT_LM, sizeBytes = 1, loaded = false)
+
+        val expected = """{"format":"litertlm","engine":"litert-lm","size_bytes":1,"loaded":false}"""
+        assertEquals(parse(expected), parse(sdkJson.encodeToString(ModelMeta.serializer(), meta)))
     }
 
     private fun decodeRequest(wire: String) = sdkJson.decodeFromString(ChatCompletionRequest.serializer(), wire)

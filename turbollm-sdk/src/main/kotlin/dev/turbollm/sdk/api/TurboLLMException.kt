@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.EngineKind
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -69,8 +70,10 @@ sealed class TurboLLMException(
     class EngineFailure(message: String, cause: Throwable? = null) :
         TurboLLMException(message, 500, SERVER_ERROR, "engine_error", cause)
 
-    class EngineUnavailable(message: String = "The engine is not available on this device.") :
-        TurboLLMException(message, 501, SERVER_ERROR, "engine_unavailable")
+    class EngineUnavailable(
+        val kind: EngineKind,
+        message: String = "The engine is not available on this device.",
+    ) : TurboLLMException(message, 501, SERVER_ERROR, "engine_unavailable")
 
     class InsufficientMemory(message: String = "Not enough memory to load the model.") :
         TurboLLMException(message, 507, SERVER_ERROR, "insufficient_memory")

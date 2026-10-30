@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.internal.sdkJson
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -59,6 +60,11 @@ class ErrorJsonGoldenTest {
         assertEquals(cause, TurboLLMException.ModelLoadFailed("load failed", cause).cause)
     }
 
+    @Test
+    fun engineUnavailableNamesTheMissingEngine() {
+        assertEquals(EngineKind.LITERT_LM, TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM).kind)
+    }
+
     private fun encode(error: TurboLLMException): String =
         sdkJson.encodeToString(ErrorBody.serializer(), error.toErrorBody())
 
@@ -84,7 +90,7 @@ class ErrorJsonGoldenTest {
         Row(TurboLLMException.ServerBusy(), 429, "rate_limit_error", "server_busy"),
         Row(TurboLLMException.ModelLoadFailed("Model load failed."), 500, "server_error", "model_load_failed"),
         Row(TurboLLMException.EngineFailure("The engine failed."), 500, "server_error", "engine_error"),
-        Row(TurboLLMException.EngineUnavailable(), 501, "server_error", "engine_unavailable"),
+        Row(TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM), 501, "server_error", "engine_unavailable"),
         Row(TurboLLMException.InsufficientMemory(), 507, "server_error", "insufficient_memory"),
     )
 }
