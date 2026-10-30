@@ -32,6 +32,20 @@ data class LoadedModel(
     val notes: List<String>,
 )
 
+/**
+ * A model under the model root. A split GGUF is one entry: [path] is its first shard, [shards] the group size,
+ * and [complete] is false while a shard is missing (listed, but not loadable).
+ */
+data class InstalledModel(
+    val id: String,
+    val path: String,
+    val format: ModelFormat,
+    val sizeBytes: Long,
+    val quant: String?,
+    val shards: Int,
+    val complete: Boolean,
+)
+
 /** Wire names match the TurboLLM daemon's model formats. */
 @Serializable
 enum class ModelFormat {
