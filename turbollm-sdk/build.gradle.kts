@@ -1,5 +1,10 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+val allCpuVariants = "base;dotprod;i8mm"
+val debugCpuVariants = providers.gradleProperty("turbollmSdkAllVariants")
+    .map { if (it.toBoolean()) allCpuVariants else "base" }
+    .getOrElse("base")
+
 plugins {
     alias(libs.plugins.androidLibrary)
     alias(libs.plugins.kotlinAndroid)
@@ -16,6 +21,31 @@ android {
         consumerProguardFiles("consumer-rules.pro")
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DANDROID_STL=c++_static",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    "-DTURBOLLM_LLAMA_DIR=${rootProject.file("third_party/llama.cpp").absolutePath}",
+                )
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            externalNativeBuild { cmake { arguments += "-DTURBOLLM_VARIANTS=$debugCpuVariants" } }
+        }
+        release {
+            externalNativeBuild { cmake { arguments += "-DTURBOLLM_VARIANTS=$allCpuVariants" } }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
