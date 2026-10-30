@@ -3,6 +3,7 @@ package dev.turbollm.sdk.chat
 import dev.turbollm.sdk.api.TurboLLMException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
@@ -97,6 +98,21 @@ class GenerationGateTest {
         val queuedInside = gate.withPermit { gate.queued }
 
         assertEquals(0, queuedInside)
+    }
+
+    @Test
+    fun awaitingIdleWaitsForTheHolderEvenWhenTheQueueIsFull() = runTest {
+        val gate = GenerationGate(maxQueuedRequests = 0)
+        val holder = holdGate(gate)
+
+        val idle = async { gate.awaitIdle() }
+        runCurrent()
+        assertFalse(idle.isCompleted)
+        assertEquals(0, gate.queued)
+
+        holder.release()
+        idle.await()
+        assertFalse(gate.busy)
     }
 
     private class Holder(private val gateOpen: CompletableDeferred<Unit>) {

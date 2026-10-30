@@ -26,6 +26,12 @@ internal class GenerationGate(private val maxQueuedRequests: Int) {
         }
     }
 
+    /** Waits for every generation ahead of the caller to finish. Never refused and never counted as queued. */
+    suspend fun awaitIdle() {
+        permit.acquire()
+        permit.release()
+    }
+
     private suspend fun waitInQueue() {
         if (waiters.incrementAndGet() > maxQueuedRequests) {
             waiters.decrementAndGet()
