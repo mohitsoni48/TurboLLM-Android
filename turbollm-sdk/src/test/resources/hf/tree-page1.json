@@ -1,0 +1,47 @@
+[
+ {
+  "type": "directory",
+  "oid": "d1",
+  "size": 0,
+  "path": "Q8_0"
+ },
+ {
+  "type": "file",
+  "oid": "f1",
+  "size": 1520,
+  "path": "README.md"
+ },
+ {
+  "type": "file",
+  "oid": "f2",
+  "size": 135,
+  "path": "Qwen3-1.7B-Q4_K_M.gguf",
+  "lfs": {
+   "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "size": 1107000000,
+   "pointerSize": 135
+  }
+ },
+ {
+  "type": "file",
+  "oid": "f3",
+  "size": 135,
+  "path": "Q8_0/Big-Q8_0-00001-of-00002.gguf",
+  "lfs": {
+   "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "size": 100,
+   "pointerSize": 135
+  }
+ },
+ {
+  "type": "file",
+  "oid": "f4",
+  "size": 135,
+  "path": "mmproj-Qwen3-F16.gguf",
+  "lfs": {
+   "oid": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "size": 900,
+   "pointerSize": 135
+  }
+ }
+]

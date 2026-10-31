@@ -68,12 +68,12 @@ private fun redirectTarget(current: URL, location: String): URL {
     return next
 }
 
-private fun URL.hasSameOriginAs(other: URL): Boolean =
+internal fun URL.hasSameOriginAs(other: URL): Boolean =
     protocol.equals(other.protocol, ignoreCase = true) &&
         host.equals(other.host, ignoreCase = true) &&
         effectivePort() == other.effectivePort()
 
-private fun URL.effectivePort(): Int = if (port == -1) defaultPort else port
+internal fun URL.effectivePort(): Int = if (port == -1) defaultPort else port
 
 private fun Map<String, String>.withoutCredentials(): Map<String, String> =
     filterKeys { it.lowercase() !in CROSS_ORIGIN_DROPPED }

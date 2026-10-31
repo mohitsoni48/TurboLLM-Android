@@ -1,0 +1,25 @@
+[
+ {
+  "_id": "4",
+  "id": "litert-community/Gemma3-1B-IT",
+  "likes": 40,
+  "downloads": 500,
+  "lastModified": "2026-08-01T00:00:00.000Z",
+  "gated": "auto",
+  "tags": [
+   "litert-lm"
+  ]
+ },
+ {
+  "_id": "2",
+  "id": "google/gemma-3-1b-it",
+  "likes": 5,
+  "downloads": 10,
+  "lastModified": "2026-09-01T00:00:00.000Z",
+  "gated": "manual",
+  "tags": [
+   "gguf",
+   "litert-lm"
+  ]
+ }
+]
