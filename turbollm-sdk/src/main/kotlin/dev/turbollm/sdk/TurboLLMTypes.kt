@@ -32,20 +32,6 @@ data class LoadedModel(
     val notes: List<String>,
 )
 
-/**
- * A model under the model root. A split GGUF is one entry: [path] is its first shard, [shards] the group size,
- * and [complete] is false while a shard is missing (listed, but not loadable).
- */
-data class InstalledModel(
-    val id: String,
-    val path: String,
-    val format: ModelFormat,
-    val sizeBytes: Long,
-    val quant: String?,
-    val shards: Int,
-    val complete: Boolean,
-)
-
 /** Wire names match the TurboLLM daemon's model formats. */
 @Serializable
 enum class ModelFormat {
@@ -74,29 +60,6 @@ enum class FinishReason {
     @SerialName("length") LENGTH,
     @SerialName("cancelled") CANCELLED,
 }
-
-/** The order of a Hugging Face search. */
-enum class HfSort { TRENDING, DOWNLOADS, LIKES, MODIFIED }
-
-/** A Hugging Face repo that ships a format the SDK runs; [formats] says which searches found it. */
-data class HfRepo(
-    val repo: String,
-    val downloads: Long,
-    val likes: Long,
-    val updatedAt: String?,
-    val gated: Boolean,
-    val formats: Set<ModelFormat>,
-)
-
-/** One downloadable model in a repo. A split GGUF is one entry: [path] is its first shard, [shards] the count. */
-data class HfModelFile(
-    val path: String,
-    val format: ModelFormat,
-    val sizeBytes: Long,
-    val quant: String?,
-    val shards: Int,
-    val sha256: String?,
-)
 
 /** A Hugging Face failure. Kotlin API only: it is never sent over HTTP in M1. */
 sealed class HfError(message: String, cause: Throwable? = null) : Exception(message, cause) {

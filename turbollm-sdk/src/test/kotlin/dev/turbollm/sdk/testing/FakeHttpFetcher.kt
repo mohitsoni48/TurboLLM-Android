@@ -5,8 +5,8 @@ import dev.turbollm.sdk.models.HttpResponse
 import java.io.ByteArrayInputStream
 
 /**
- * A scripted [HttpFetcher]: answers each URL with what [respond] set, or [fail]s it, or falls back to the
- * [respondByDefault] reply (a 404 unless set). Records every request.
+ * A scripted [HttpFetcher]: answers each URL with its [respondTo] handler, or what [respond] set, or [fail]s it,
+ * or falls back to the [respondByDefault] reply (a 404 unless set). Records every request.
  */
 internal class FakeHttpFetcher : HttpFetcher {
 
@@ -14,6 +14,7 @@ internal class FakeHttpFetcher : HttpFetcher {
 
     private class Reply(val status: Int, val body: ByteArray, val headers: Map<String, String>)
 
+    private val handlers = mutableMapOf<String, (Request) -> HttpResponse>()
     private val replies = mutableMapOf<String, Reply>()
     private val failures = mutableMapOf<String, Throwable>()
     private var defaultReply = Reply(404, ByteArray(0), emptyMap())
@@ -22,6 +23,11 @@ internal class FakeHttpFetcher : HttpFetcher {
 
     fun respond(url: String, status: Int = 200, body: ByteArray = ByteArray(0), headers: Map<String, String> = emptyMap()) {
         replies[url] = Reply(status, body, headers)
+    }
+
+    /** Answers [url] by calling [handler] with each request, so a reply can depend on its headers. */
+    fun respondTo(url: String, handler: (Request) -> HttpResponse) {
+        handlers[url] = handler
     }
 
     fun respondByDefault(status: Int, body: ByteArray) {
@@ -33,8 +39,10 @@ internal class FakeHttpFetcher : HttpFetcher {
     }
 
     override suspend fun get(url: String, headers: Map<String, String>): HttpResponse {
-        recordedRequests += Request(url, headers)
+        val request = Request(url, headers)
+        recordedRequests += request
         failures[url]?.let { throw it }
+        handlers[url]?.let { return it(request) }
         val reply = replies[url] ?: defaultReply
         return HttpResponse(reply.status, url, reply.headers, ByteArrayInputStream(reply.body))
     }
