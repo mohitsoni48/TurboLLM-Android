@@ -130,7 +130,7 @@ class LiteRtLmEngineFakeRuntimeTest {
 
     @Test
     fun aReplyStreamsEachChunkAsTextThenDoneWithTheTokenCountDeltas() = runBlocking {
-        liteRt.chunks = listOf("Hel", "lo")
+        liteRt.chunks = listOf(LiteRtChunk(text = "Hel"), LiteRtChunk(text = "lo"))
         liteRt.tokensBeforeReply = 10
         liteRt.tokensAfterReply = 15
         engine.load(spec())
@@ -158,12 +158,41 @@ class LiteRtLmEngineFakeRuntimeTest {
 
     @Test
     fun anEmptyChunkIsNotEmitted() = runBlocking {
-        liteRt.chunks = listOf("", "Hi", "")
+        liteRt.chunks = listOf(LiteRtChunk(), LiteRtChunk(text = "Hi"), LiteRtChunk(thought = ""))
         engine.load(spec())
 
         val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
 
         assertEquals(listOf(EngineEvent.Text("Hi")), events.dropLast(1))
+    }
+
+    @Test
+    fun theModelsThoughtStreamsAsReasoningAndItsAnswerAsText() = runBlocking {
+        liteRt.chunks = listOf(
+            LiteRtChunk(thought = "Okay,"),
+            LiteRtChunk(thought = " the user"),
+            LiteRtChunk(text = "Yes."),
+        )
+        engine.load(spec())
+
+        val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
+
+        val expected = listOf(
+            EngineEvent.Reasoning("Okay,"),
+            EngineEvent.Reasoning(" the user"),
+            EngineEvent.Text("Yes."),
+        )
+        assertEquals(expected, events.dropLast(1))
+    }
+
+    @Test
+    fun aChunkCarryingBothAThoughtAndAnswerTextEmitsTheReasoningFirst() = runBlocking {
+        liteRt.chunks = listOf(LiteRtChunk(text = "Yes.", thought = "Done thinking."))
+        engine.load(spec())
+
+        val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
+
+        assertEquals(listOf(EngineEvent.Reasoning("Done thinking."), EngineEvent.Text("Yes.")), events.dropLast(1))
     }
 
     @Test

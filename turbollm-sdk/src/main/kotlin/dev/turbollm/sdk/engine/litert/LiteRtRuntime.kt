@@ -28,8 +28,8 @@ internal interface LiteRtModel : AutoCloseable {
 }
 
 internal interface LiteRtConversation : AutoCloseable {
-    /** The reply to [userTurn], as the text chunks LiteRT streams (each one new text, not the reply so far). */
-    fun reply(userTurn: String): Flow<String>
+    /** The reply to [userTurn], as the chunks LiteRT streams (each one new output, not the reply so far). */
+    fun reply(userTurn: String): Flow<LiteRtChunk>
 
     /** Tokens in the conversation's KV cache, prefill and decode together. */
     fun tokenCount(): Int
@@ -37,3 +37,9 @@ internal interface LiteRtConversation : AutoCloseable {
     /** Stops an in-flight reply; what the reply's flow does next is undocumented. */
     fun cancel()
 }
+
+/**
+ * One streamed piece of a reply: [text] is answer text, [thought] is the model's thinking (LiteRT-LM's
+ * `thought` channel). Either may be empty.
+ */
+internal data class LiteRtChunk(val text: String = "", val thought: String = "")

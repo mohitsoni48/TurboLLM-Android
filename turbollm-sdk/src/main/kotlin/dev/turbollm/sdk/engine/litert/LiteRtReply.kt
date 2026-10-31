@@ -12,8 +12,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 
 /**
- * One reply in its own conversation, on the engine thread (architecture §2.7). Usage is the conversation's
- * token-count delta, timings are wall-clock, and the conversation is always closed: after a cancel, first
+ * One reply in its own conversation, on the engine thread (architecture §2.7). A chunk's thinking becomes
+ * [EngineEvent.Reasoning] and its answer text [EngineEvent.Text]. Usage is the conversation's token-count delta
+ * (thinking included), timings are wall-clock, and the conversation is always closed: after a cancel, first
  * stopping the process.
  */
 internal class LiteRtReply(private val model: LiteRtModel, private val clock: Clock) {
@@ -40,7 +41,7 @@ internal class LiteRtReply(private val model: LiteRtModel, private val clock: Cl
         var firstChunkAt: Long? = null
         conversation.reply(prompt.userTurn).collect { chunk ->
             if (firstChunkAt == null) firstChunkAt = clock.nowMillis()
-            if (chunk.isNotEmpty()) emit(EngineEvent.Text(chunk))
+            emitParts(chunk)
         }
         val ended = clock.nowMillis()
         val completionTokens = conversation.tokenCount() - promptTokens
@@ -52,6 +53,12 @@ internal class LiteRtReply(private val model: LiteRtModel, private val clock: Cl
             promptMs = (prefilled - sent).toDouble(),
             genMs = (ended - prefilled).toDouble(),
         )
+    }
+
+    /** Thinking first, as the model produced it before the answer; empty parts are not emitted. */
+    private suspend fun FlowCollector<EngineEvent>.emitParts(chunk: LiteRtChunk) {
+        if (chunk.thought.isNotEmpty()) emit(EngineEvent.Reasoning(chunk.thought))
+        if (chunk.text.isNotEmpty()) emit(EngineEvent.Text(chunk.text))
     }
 
     /** LiteRT says nothing about why a reply ended; one that used its whole budget was cut short. */

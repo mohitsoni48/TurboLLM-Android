@@ -28,6 +28,7 @@ import org.junit.runner.RunWith
 /**
  * [LiteRtLmEngine] on the real LiteRT-LM AAR and a small `.litertlm`, taken from the instrumentation argument
  * `turbollmTestLitertlm`. CPU only, so it also answers whether LiteRT runs on the x86_64 emulator (F7).
+ * The model is expected to think before it answers, as the Qwen3 test model does.
  * Every test is bounded, and so is every wait inside one.
  */
 @RunWith(AndroidJUnit4::class)
@@ -38,12 +39,16 @@ class LiteRtLmEngineTest {
     fun closeTheEngine() = engine.close()
 
     @Test(timeout = 180_000)
-    fun aCpuLoadStreamsTextAndThenDone() = runBlocking {
+    fun aCpuLoadStreamsTheThoughtAsReasoningThenTheAnswerAsTextAndThenDone() = runBlocking {
         engine.load(spec())
 
-        val events = withTimeout(GENERATION_MILLIS) { engine.generate(QUESTION, SHORT).toList() }
+        val events = withTimeout(GENERATION_MILLIS) { engine.generate(QUESTION, ROOM_TO_ANSWER).toList() }
 
-        assertTrue("the model generated no text", events.any { it is EngineEvent.Text })
+        val firstReasoning = events.indexOfFirst { it is EngineEvent.Reasoning }
+        val firstText = events.indexOfFirst { it is EngineEvent.Text }
+        assertTrue("no reasoning arrived", firstReasoning >= 0)
+        assertTrue("no answer text within ${ROOM_TO_ANSWER.maxTokens} tokens", firstText >= 0)
+        assertTrue("the answer began before the thinking", firstReasoning < firstText)
         val done = events.last() as EngineEvent.Done
         assertTrue(done.completionTokens > 0)
     }
@@ -93,5 +98,6 @@ class LiteRtLmEngineTest {
         val QUESTION = listOf(ChatMessage(ChatRole.USER, MessageContent.Text("Reply with the single word: yes.")))
         val SHORT = GenerationParams(maxTokens = 8, temperature = 0f, topP = null, topK = null, seed = null)
         val ENDLESS = SHORT.copy(maxTokens = 512)
+        val ROOM_TO_ANSWER = SHORT.copy(maxTokens = 768)
     }
 }

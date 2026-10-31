@@ -83,8 +83,8 @@ private fun messageOf(turn: LiteRtTurn): Message = when (turn.role) {
 }
 
 private class AarConversation(private val conversation: Conversation) : LiteRtConversation {
-    override fun reply(userTurn: String): Flow<String> =
-        conversation.sendMessageAsync(userTurn).map { chunk -> chunk.toString() }
+    override fun reply(userTurn: String): Flow<LiteRtChunk> =
+        conversation.sendMessageAsync(userTurn).map { chunk -> chunk.toChunk() }
 
     override fun tokenCount(): Int = conversation.getTokenCount()
 
@@ -92,3 +92,10 @@ private class AarConversation(private val conversation: Conversation) : LiteRtCo
 
     override fun close() = conversation.close()
 }
+
+/** LiteRT-LM puts a thinking model's thinking in this channel of each streamed message, not in its contents. */
+private const val THOUGHT_CHANNEL = "thought"
+
+/** The message's contents are answer text; its `thought` channel is thinking. Other channels are not used. */
+internal fun Message.toChunk(): LiteRtChunk =
+    LiteRtChunk(text = contents.toString(), thought = channels[THOUGHT_CHANNEL].orEmpty())

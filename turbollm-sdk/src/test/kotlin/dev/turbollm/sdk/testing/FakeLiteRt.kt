@@ -1,6 +1,7 @@
 package dev.turbollm.sdk.testing
 
 import dev.turbollm.sdk.engine.litert.LiteRtBackend
+import dev.turbollm.sdk.engine.litert.LiteRtChunk
 import dev.turbollm.sdk.engine.litert.LiteRtConversation
 import dev.turbollm.sdk.engine.litert.LiteRtModel
 import dev.turbollm.sdk.engine.litert.LiteRtModelConfig
@@ -23,7 +24,7 @@ internal class FakeLiteRt(val clock: SteppingClock = SteppingClock()) : LiteRtRu
 
     var gpuFailure: Exception? = null
     var cpuFailure: Exception? = null
-    var chunks = listOf("Hello")
+    var chunks = listOf(LiteRtChunk(text = "Hello"))
     var tokensBeforeReply = 10
     var tokensAfterReply = 15
     var prefillMillis = 0L
@@ -76,7 +77,7 @@ internal class FakeLiteRt(val clock: SteppingClock = SteppingClock()) : LiteRtRu
         @Volatile
         private var replied = false
 
-        override fun reply(userTurn: String): Flow<String> = flow {
+        override fun reply(userTurn: String): Flow<LiteRtChunk> = flow {
             happened("reply")
             clock.advance(prefillMillis)
             chunks.forEach { emit(it) }
