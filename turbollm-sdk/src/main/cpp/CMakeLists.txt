@@ -84,10 +84,12 @@ function(add_jni_variant variant)
     add_llama_static_build(${variant} "${arch_flags}" archives)
 
     set(target turbollm_llama_${variant})
-    add_library(${target} SHARED turbollm_jni.cpp)
+    add_library(${target} SHARED turbollm_jni.cpp llama_session.cpp chat_format.cpp)
+    target_compile_features(${target} PRIVATE cxx_std_17)
     add_dependencies(${target} llama_${variant})
     target_include_directories(${target} PRIVATE
         "${TURBOLLM_LLAMA_DIR}/include"
+        "${TURBOLLM_LLAMA_DIR}/common"
         "${TURBOLLM_LLAMA_DIR}/ggml/include")
     separate_arguments(arch_flag_list UNIX_COMMAND "${arch_flags}")
     target_compile_options(${target} PRIVATE ${arch_flag_list} -fvisibility=hidden -fvisibility-inlines-hidden)
