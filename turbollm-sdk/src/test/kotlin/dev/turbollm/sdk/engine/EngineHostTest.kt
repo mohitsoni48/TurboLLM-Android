@@ -12,11 +12,13 @@ import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -114,6 +116,56 @@ class EngineHostTest {
         assertTrue("got $thrown", thrown is TurboLLMException.LoadInProgress)
         assertEquals(EngineState.Loading(first.ref), host.state.value)
         advanceUntilIdle()
+    }
+
+    @Test
+    fun aBackgroundLoadReadsLoadingBeforeItReturnsAndBeforeTheOldModelUnloads() = runTest {
+        val host = hostOf(FakeEngine(), FakeEngine(loadPauseMillis = 100))
+        host.load(target("org/repo/a"))
+        val second = target("org/repo/b")
+
+        host.loadInBackground(second, this)
+
+        assertEquals(EngineState.Loading(second.ref), host.state.value)
+        advanceUntilIdle()
+        assertEquals("org/repo/b", (host.state.value as EngineState.Ready).model.id)
+    }
+
+    @Test
+    fun aBackgroundLoadWhileAnotherLoadRunsIsRefusedBeforeItReturns() = runTest {
+        val host = hostOf(FakeEngine(loadPauseMillis = 100), FakeEngine())
+        host.loadInBackground(target("org/repo/a"), this)
+
+        val thrown = runCatching { host.loadInBackground(target("org/repo/b"), this) }.exceptionOrNull()
+
+        assertTrue("got $thrown", thrown is TurboLLMException.LoadInProgress)
+        advanceUntilIdle()
+        assertEquals("org/repo/a", (host.state.value as EngineState.Ready).model.id)
+    }
+
+    @Test
+    fun aFailedBackgroundLoadIsPublishedAndNeverThrownIntoItsScope() = runTest {
+        val failure = TurboLLMException.ModelLoadFailed("bad magic")
+        val host = hostOf(FakeEngine(loadFailure = failure))
+        val target = target("org/repo/a")
+
+        host.loadInBackground(target, this)
+        advanceUntilIdle()
+
+        assertEquals(EngineState.Failed(target.ref, failure), host.state.value)
+    }
+
+    @Test
+    fun aBackgroundLoadInACancelledScopeStillReleasesTheLifecycle() = runTest {
+        val host = hostOf(FakeEngine(loadPauseMillis = 100), FakeEngine())
+        val cancelledScope = CoroutineScope(Job().apply { cancel() } + StandardTestDispatcher(testScheduler))
+
+        host.loadInBackground(target("org/repo/a"), cancelledScope)
+        advanceUntilIdle()
+
+        assertEquals(EngineState.Idle, host.state.value)
+        assertFalse("sentinel after the cancelled load", sentinelFile.exists())
+        assertEquals("org/repo/b", host.load(target("org/repo/b")).id)
     }
 
     @Test

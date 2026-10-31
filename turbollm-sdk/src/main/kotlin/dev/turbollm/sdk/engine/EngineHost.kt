@@ -10,12 +10,16 @@ import dev.turbollm.sdk.chat.GenerationGate
 import dev.turbollm.sdk.internal.LoadSentinel
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -39,19 +43,24 @@ internal class EngineHost(
     val state: StateFlow<EngineState> = publishedState.asStateFlow()
 
     suspend fun load(target: LoadTarget): LoadedModel {
-        if (!lifecycle.tryLock()) throw TurboLLMException.LoadInProgress()
-        try {
-            unloadCurrent()
-            publishedState.value = EngineState.Loading(target.ref)
-            val model = loadEngine(target).model
-            publishedState.value = EngineState.Ready(model, busy = gate.busy, queued = gate.queued)
-            return model
-        } catch (failure: TurboLLMException) {
-            publishedState.value = EngineState.Failed(target.ref, failure)
-            throw failure
-        } finally {
-            if (publishedState.value is EngineState.Loading) publishedState.value = EngineState.Idle
-            lifecycle.unlock()
+        claimLoad(target)
+        return loadClaimed(target)
+    }
+
+    /**
+     * Claims the load before returning, so a concurrent load is refused at once and [state] already reads
+     * Loading, then runs it in [scope]. The outcome is published in [state] and never thrown into [scope].
+     * It starts even in a cancelled [scope], so the claim it holds is always released.
+     */
+    @OptIn(DelicateCoroutinesApi::class)
+    fun loadInBackground(target: LoadTarget, scope: CoroutineScope): Job {
+        claimLoad(target)
+        return scope.launch(start = CoroutineStart.ATOMIC) {
+            try {
+                loadClaimed(target)
+            } catch (_: TurboLLMException) {
+                // Already published as Failed; a background load has no caller left to throw to.
+            }
         }
     }
 
@@ -68,6 +77,27 @@ internal class EngineHost(
             generation(loaded ?: throw TurboLLMException.ModelNotLoaded())
         } finally {
             generations -= generationJob
+        }
+    }
+
+    private fun claimLoad(target: LoadTarget) {
+        if (!lifecycle.tryLock()) throw TurboLLMException.LoadInProgress()
+        publishedState.value = EngineState.Loading(target.ref)
+    }
+
+    /** Runs a load whose lifecycle [claimLoad] holds, and releases it however the load ends. */
+    private suspend fun loadClaimed(target: LoadTarget): LoadedModel {
+        try {
+            unloadCurrent()
+            val model = loadEngine(target).model
+            publishedState.value = EngineState.Ready(model, busy = gate.busy, queued = gate.queued)
+            return model
+        } catch (failure: TurboLLMException) {
+            publishedState.value = EngineState.Failed(target.ref, failure)
+            throw failure
+        } finally {
+            if (publishedState.value is EngineState.Loading) publishedState.value = EngineState.Idle
+            lifecycle.unlock()
         }
     }
 
