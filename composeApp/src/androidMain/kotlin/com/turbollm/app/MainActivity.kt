@@ -1,6 +1,7 @@
 package com.turbollm.app
 
 import android.Manifest
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -14,6 +15,8 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import dev.turbollm.sdk.ServerHandle
+import dev.turbollm.sdk.TurboLLM
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -21,6 +24,7 @@ import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
+private const val SDK_LOG_TAG = "TurboLLMSdk"
 
 /** The daemon's listen port on Android — 7000, not desktop/LAN's 6996, to avoid any ambiguity
  *  between the two when both might be reachable on the same machine during testing (an
@@ -95,6 +99,8 @@ class MainActivity : ComponentActivity() {
                     // verification pass (adb push + run-as) — not yet bundled into the APK's
                     // own assets (that's the "download/extract on first launch" step, later).
                     val daemonScript = "${filesDir.absolutePath}/daemon/dist/cli.js"
+                    // Before Node: the daemon learns the SDK engine's URL and token once, through its env.
+                    val sdkEnv = sdkEngineEnv()
                     nodeRuntime.startScript(
                         daemonScript,
                         env = mapOf(
@@ -117,7 +123,7 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
                             // Loopback callers must present it (DAEMON_APP_SECRET).
                             "TURBOLLM_APP_SECRET" to DAEMON_APP_SECRET,
-                        ) + gpuEnv() + socEnv(),
+                        ) + gpuEnv() + socEnv() + sdkEnv,
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
                     )
@@ -181,6 +187,40 @@ class MainActivity : ComponentActivity() {
         val maker = Build.SOC_MANUFACTURER.takeIf { it.isNotBlank() && it != Build.UNKNOWN }
         val name = if (maker != null && !model.startsWith(maker, ignoreCase = true)) "$maker $model" else model
         return mapOf("TURBOLLM_ANDROID_SOC" to name)
+    }
+
+    /** On the Node thread only: binding the SDK server blocks. Without the server the daemon registers no SDK
+     *  engine and offers only the spawned engines this build carries (ADR-239: no placeholder engine). */
+    private fun sdkEngineEnv(): Map<String, String> = sdkServerEnv() + interruptedLoadEnv()
+
+    private fun sdkServerEnv(): Map<String, String> {
+        val server = runCatching { TurboLLMBootstrap.ensureServer(this) }
+            .onFailure {
+                Log.e(TAG, "the on-device engine could not start", it)
+                showLongToast("The on-device engine could not start; the app will use its fallback engine.")
+            }
+            .getOrNull()
+            ?: return emptyMap()
+        logSdkServerInDebugBuilds(server)
+        return mapOf("TURBOLLM_ANDROID_SDK_URL" to server.baseUrl, "TURBOLLM_ANDROID_SDK_TOKEN" to server.token)
+    }
+
+    /** A model load the last process never finished may be what ended it, so the daemon must not load it again
+     *  at start (its auto-load reads TURBOLLM_ANDROID_SDK_SKIP_RESUME). The SDK reports it once per process. */
+    private fun interruptedLoadEnv(): Map<String, String> {
+        TurboLLM.currentOrNull()?.interruptedLoad ?: return emptyMap()
+        showLongToast("The app closed while a model was loading, so it was not reloaded automatically.")
+        return mapOf("TURBOLLM_ANDROID_SDK_SKIP_RESUME" to "1")
+    }
+
+    /** Phase Z QA reads the SDK's port and token from this line. A release build must never log the token. */
+    private fun logSdkServerInDebugBuilds(server: ServerHandle) {
+        if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
+        Log.i(SDK_LOG_TAG, "sdk-server ${server.baseUrl} ${server.token}")
+    }
+
+    private fun showLongToast(message: String) {
+        runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
     }
 
     /** The engine notification carries the Quit action and the "phone is hot" warning. Asked each time the activity

@@ -34,6 +34,7 @@ kotlin {
 
     sourceSets {
         androidMain.dependencies {
+            implementation(project(":turbollm-sdk"))
             implementation(libs.androidx.activity.compose)
             implementation(libs.androidx.appcompat)
             implementation(libs.android.material)
