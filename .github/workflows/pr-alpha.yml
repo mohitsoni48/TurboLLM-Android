@@ -86,7 +86,7 @@ jobs:
         with:
           node-version: '22'
 
-      - uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       # SDK pieces the build asks for. ubuntu-latest ships the SDK itself; these make the
       # cmake/NDK/platform versions deterministic instead of relying on AGP's auto-download.
@@ -163,7 +163,7 @@ jobs:
                 --stacktrace 2>&1 | tee "$RUNNER_TEMP/publish.log"; then
               exit 0
             fi
-            if [ "$attempt" -lt 3 ] && grep -qiE 'edit.*(invalid|expired|no longer|not found|conflict)|concurrent' "$RUNNER_TEMP/publish.log"; then
+            if [ "$attempt" -lt 3 ] && grep -qiE 'edit.*(invalid|expired|no longer|not found|conflict)|(another|concurrent) (edit|modification|update)' "$RUNNER_TEMP/publish.log"; then
               echo "::warning::Play edit conflict, retrying ($attempt/3)"; sleep 45
             else
               exit 1
