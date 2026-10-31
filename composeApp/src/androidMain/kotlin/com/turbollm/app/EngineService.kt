@@ -4,10 +4,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -17,6 +15,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import dev.turbollm.sdk.EngineState
+import dev.turbollm.sdk.service.TurboLLMService
 import org.json.JSONObject
 
 private const val TAG = "TurboLLM"
@@ -65,7 +65,7 @@ private val LOADED_STATES = setOf("starting", "running", "stopping")
  *  import (ModelImport). So a long reply or a multi-GB transfer finishes with the screen off
  *  without keeping the CPU awake while idle, or while a chat waits for the user to answer a tool
  *  approval. */
-class EngineService : Service() {
+class EngineService : TurboLLMService() {
     @Volatile private var running = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
@@ -108,6 +108,10 @@ class EngineService : Service() {
     private val stateLock = Any()
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override val notificationId = NOTIFICATION_ID
+
+    override fun provideConfig() = TurboLLMBootstrap.config(this)
 
     /** The app's session, as the service sees it: the newest activity (newestActivity), the newest plain start
      *  (lastStartId) and how many times the app came on screen (appShown). A close or a Quit keeps the one it was
@@ -162,10 +166,7 @@ class EngineService : Service() {
             return START_NOT_STICKY
         }
         lastStartId = startId
-        ServiceCompat.startForeground(
-            this, NOTIFICATION_ID, buildNotification(),
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,
-        )
+        startInForeground()
         if (!running) {
             running = true
             Thread(::pollActivity, "turbollm-activity").apply { isDaemon = true }.start()
@@ -517,10 +518,14 @@ class EngineService : Service() {
     }
 
     private fun updateNotification() {
-        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification()) }
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIFICATION_ID, buildNotification(core.state.value))
+        }
     }
 
-    private fun buildNotification(): Notification {
+    /** Driven by the daemon poll, not by the SDK core's [state]: the daemon reports the engine (/api/v1/status). */
+    override fun buildNotification(state: EngineState): Notification {
         val open = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),

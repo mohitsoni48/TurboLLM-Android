@@ -23,8 +23,10 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.testing.testApplication
 import java.io.File
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -192,6 +194,20 @@ class TurboLLMFacadeTest {
     @Test
     fun noInterruptedLoadWhenTheLastLoadFinished() = runTest {
         assertNull(create().interruptedLoad)
+    }
+
+    /** G-9: a Quit kills the process mid-load, so the load's own cleanup never runs. The next process must see it. */
+    @Test
+    fun aLoadTheProcessEndsDuringIsLeftForTheNextProcessAsInterrupted() = runTest(timeout = 10.seconds) {
+        engine = FakeEngine(listOf(done()), loadPauseMillis = 60_000)
+        val model = gguf("$MODEL_ID.gguf")
+        val core = create()
+
+        backgroundScope.launch { core.load(ModelRef.Installed(MODEL_ID)) }
+        core.state.first { it is EngineState.Loading }
+        runCurrent()
+
+        assertEquals(model.canonicalPath, LoadSentinel(folder.root).consumeStale())
     }
 
     @Test
