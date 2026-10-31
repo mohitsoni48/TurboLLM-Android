@@ -29,10 +29,14 @@ internal class FakeEngine(
     sealed interface Step {
         data class Emit(val event: EngineEvent) : Step
         data class Pause(val millis: Long) : Step
+        data class Fail(val error: Throwable) : Step
     }
 
     private val recordedLoads = mutableListOf<LoadSpec>()
     val loads: List<LoadSpec> get() = recordedLoads.toList()
+
+    private val recordedGenerations = mutableListOf<GenerationParams>()
+    val generations: List<GenerationParams> get() = recordedGenerations.toList()
 
     private val recordedHistory = mutableListOf<String>()
     val history: List<String> get() = recordedHistory.toList()
@@ -55,7 +59,10 @@ internal class FakeEngine(
     }
 
     override fun generate(messages: List<ChatMessage>, params: GenerationParams): Flow<EngineEvent> =
-        flow { script.forEach { play(it) } }
+        flow {
+            recordedGenerations += params
+            script.forEach { play(it) }
+        }
             .onCompletion { cause -> if (cause != null) markCancelled() }
 
     override suspend fun unload() {
@@ -76,6 +83,7 @@ internal class FakeEngine(
     private suspend fun FlowCollector<EngineEvent>.play(step: Step) = when (step) {
         is Step.Emit -> emit(step.event)
         is Step.Pause -> delay(step.millis)
+        is Step.Fail -> throw step.error
     }
 
     private companion object {
