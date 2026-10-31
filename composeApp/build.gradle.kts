@@ -429,7 +429,12 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.con
 
 // A build that produced no payload would ship a broken app, so fail loudly at assemble time
 // rather than at the user's first launch.
-tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }.configureEach {
+//
+// Only the tasks that PRODUCE the app. A `startsWith("bundle")` match also caught AGP's intermediate
+// bundleReleaseResources, which runs BEFORE mergeReleaseAssets stages the daemon: on a clean checkout (CI) the guard
+// failed a build that was fine, and it never showed locally because the staged folder is left over from earlier builds.
+val appPackagingTasks = Regex("(assemble|bundle)(Debug|Release)")
+tasks.matching { appPackagingTasks.matches(it.name) }.configureEach {
     doLast {
         val cli = stagedDaemonAssets.file("dist/cli.js").asFile
         if (!cli.exists()) {
