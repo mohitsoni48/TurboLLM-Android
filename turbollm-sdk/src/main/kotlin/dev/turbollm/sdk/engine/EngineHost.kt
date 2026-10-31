@@ -18,6 +18,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -67,6 +68,11 @@ internal class EngineHost(
     suspend fun unload() = lifecycle.withLock {
         unloadCurrent()
         publishedState.value = EngineState.Idle
+    }
+
+    /** Re-reads the gate into a Ready state, so its `busy` and `queued` stay live while the model serves. */
+    fun showOccupancy() = publishedState.update { state ->
+        if (state is EngineState.Ready) state.copy(busy = gate.busy, queued = gate.queued) else state
     }
 
     /** Runs [generation] against the loaded engine; an unload cancels it. Fails fast when nothing is loaded. */

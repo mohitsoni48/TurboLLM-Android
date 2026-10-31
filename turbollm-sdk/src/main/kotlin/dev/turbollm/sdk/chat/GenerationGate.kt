@@ -6,9 +6,13 @@ import kotlinx.coroutines.sync.Semaphore
 
 /**
  * One generation at a time, with a bounded FIFO queue behind it. A request that finds the queue full is
- * refused with [TurboLLMException.ServerBusy] instead of waiting. Not reentrant.
+ * refused with [TurboLLMException.ServerBusy] instead of waiting. Not reentrant. [onOccupancyChanged] is called
+ * whenever [busy] or [queued] may have changed.
  */
-internal class GenerationGate(private val maxQueuedRequests: Int) {
+internal class GenerationGate(
+    private val maxQueuedRequests: Int,
+    private val onOccupancyChanged: () -> Unit = {},
+) {
 
     private val permit = Semaphore(1)
     private val waiters = AtomicInteger(0)
@@ -19,10 +23,12 @@ internal class GenerationGate(private val maxQueuedRequests: Int) {
 
     suspend fun <T> withPermit(generation: suspend () -> T): T {
         if (!permit.tryAcquire()) waitInQueue()
+        onOccupancyChanged()
         try {
             return generation()
         } finally {
             permit.release()
+            onOccupancyChanged()
         }
     }
 
@@ -37,10 +43,12 @@ internal class GenerationGate(private val maxQueuedRequests: Int) {
             waiters.decrementAndGet()
             throw TurboLLMException.ServerBusy()
         }
+        onOccupancyChanged()
         try {
             permit.acquire()
         } finally {
             waiters.decrementAndGet()
+            onOccupancyChanged()
         }
     }
 }
