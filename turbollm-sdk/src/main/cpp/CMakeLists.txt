@@ -104,6 +104,15 @@ function(add_jni_variant variant)
     target_compile_options(${target} PRIVATE ${arch_flag_list} -fvisibility=hidden -fvisibility-inlines-hidden)
     target_link_libraries(${target} PRIVATE -Wl,--start-group ${archives} -Wl,--end-group android log)
     target_link_options(${target} PRIVATE -Wl,--exclude-libs,ALL -Wl,--gc-sections)
+    add_test_probes_in_debug(${target})
+endfunction()
+
+# The device tests' LlamaTestProbe; a release library has neither the probes nor their JNI export.
+function(add_test_probes_in_debug target)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_sources(${target} PRIVATE test_probes.cpp)
+        target_compile_definitions(${target} PRIVATE TURBOLLM_TEST_PROBES)
+    endif()
 endfunction()
 
 foreach(variant IN LISTS TURBOLLM_VARIANTS)

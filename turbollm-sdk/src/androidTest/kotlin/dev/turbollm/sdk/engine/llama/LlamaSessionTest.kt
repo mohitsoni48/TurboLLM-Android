@@ -68,6 +68,47 @@ class LlamaSessionTest {
         assertEquals(LlamaNative.CONTEXT_LENGTH_EXCEEDED, LlamaNative.prepare(session, tooLong))
     }
 
+    @Test(timeout = 180_000)
+    fun aPromptOfExactlyTheContextSizeIsRefusedWhileOneTokenShorterFits() {
+        reloadWithContext(BOUNDARY_CONTEXT_SIZE)
+        val contextSize = JSONObject(LlamaNative.modelInfo(session)).getInt("n_ctx")
+        val wordsOneShort = wordsForPromptTokens(contextSize - 1)
+
+        assertEquals(contextSize - 1, prepared(conversation(user(repeatedWord(wordsOneShort)))))
+        val exactlyFull = conversation(user(repeatedWord(wordsOneShort + 1)))
+        assertEquals(LlamaNative.CONTEXT_LENGTH_EXCEEDED, LlamaNative.prepare(session, exactlyFull))
+    }
+
+    /**
+     * The abort lands after the first batch and before the batch holding the password, so the follow-up may
+     * reuse only what was really decoded: reusing more would leave the password out of the cache.
+     */
+    @Test(timeout = 300_000)
+    fun aPromptSharingAPrefixWithAPrefillAbortedPartWayAnswersAsItWouldFromAFreshStart() {
+        val beforePassword = FILLER.repeat(FILLER_BEFORE_PASSWORD)
+        val shared = beforePassword + PASSWORD_SENTENCE + FILLER.repeat(FILLER_AFTER_PASSWORD)
+        val aborted = conversation(user(shared + FILLER.repeat(FILLER_ONLY_IN_THE_ABORTED_PROMPT)))
+        val followUp = withoutThinking(user(shared + PASSWORD_QUESTION))
+        val passwordStartsAfter = prepared(conversation(user(beforePassword))) - prepared(conversation(user("")))
+        forgetTheCachedPrompt()
+        val fullPrefillMs = prefillMillis(aborted)
+        forgetTheCachedPrompt()
+        val expected = generateGreedily(followUp)
+        forgetTheCachedPrompt()
+
+        assertEquals(LlamaNative.ABORTED, prepareAbortedAfter(aborted, (fullPrefillMs * ABORT_AT_FRACTION).toLong()))
+        LlamaNative.clearAbort(session)
+        val answer = generateGreedily(followUp)
+
+        assertTrue("even a fresh start did not recall the password: $expected", expected.contains(PASSWORD))
+        assertEquals(expected, answer)
+        val reused = reusedPromptTokens()
+        assertTrue(
+            "$reused tokens reused: the abort did not land after one batch and before the password",
+            reused in BATCH_SIZE until passwordStartsAfter,
+        )
+    }
+
     @Test(timeout = 60_000)
     fun anAbortDuringPrefillReturnsWithin500Milliseconds() {
         val longPrompt = conversation(user("count the words ".repeat(CONTEXT_SIZE / 4)))
@@ -106,6 +147,49 @@ class LlamaSessionTest {
         assertNotEquals(thinking, notThinking)
     }
 
+    private fun reloadWithContext(contextSize: Int) {
+        LlamaNative.freeSession(session)
+        session = LlamaNative.loadModel(testModelPath(), contextSize, THREADS)
+        assertNotEquals(LlamaNative.lastError(), 0L, session)
+    }
+
+    /** How many repeated words make a prompt of [promptTokens] tokens, checking each word is one token. */
+    private fun wordsForPromptTokens(promptTokens: Int): Int {
+        val shortPrompt = prepared(conversation(user(repeatedWord(PROBE_WORDS))))
+        val longerPrompt = prepared(conversation(user(repeatedWord(PROBE_WORDS * 2))))
+        assertEquals("each repeated word should be one token", PROBE_WORDS, longerPrompt - shortPrompt)
+        return promptTokens - (shortPrompt - PROBE_WORDS)
+    }
+
+    private fun repeatedWord(count: Int): String = List(count) { "hello" }.joinToString(" ")
+
+    private fun withoutThinking(vararg messages: JSONObject): String =
+        JSONObject().put("messages", JSONArray(messages.toList())).put("enable_thinking", false).toString()
+
+    private fun reusedPromptTokens(): Int {
+        val stats = JSONObject(LlamaNative.stats(session))
+        return stats.getInt("prompt_n") - stats.getInt("prompt_decoded")
+    }
+
+    private fun prefillMillis(request: String): Double {
+        prepared(request)
+        return JSONObject(LlamaNative.stats(session)).getDouble("prompt_ms")
+    }
+
+    /** Leaves only the chat template's opening in the cache, so the next prompt is prefilled from the start. */
+    private fun forgetTheCachedPrompt() {
+        prepared(conversation(user("Hi.")))
+    }
+
+    private fun prepareAbortedAfter(request: String, delayMs: Long): Int {
+        val result = AtomicInteger(Int.MIN_VALUE)
+        val prefill = thread { result.set(LlamaNative.prepare(session, request)) }
+        Thread.sleep(delayMs)
+        LlamaNative.requestAbort(session)
+        prefill.join(ABORT_DEADLINE_MS * 10)
+        return result.get()
+    }
+
     private fun generateGreedily(request: String): String {
         prepared(request)
         LlamaNative.startSampling(session, 0f, 1f, 0, 0L)
@@ -141,5 +225,16 @@ class LlamaSessionTest {
         const val MAX_GENERATED_TOKENS = 24
         const val PREFILL_HEAD_START_MS = 50L
         const val ABORT_DEADLINE_MS = 500L
+        const val BOUNDARY_CONTEXT_SIZE = 512
+        const val PROBE_WORDS = 50
+        const val BATCH_SIZE = 512
+        const val FILLER = "The grass is green and the sky is blue. "
+        const val FILLER_BEFORE_PASSWORD = 60
+        const val FILLER_AFTER_PASSWORD = 10
+        const val FILLER_ONLY_IN_THE_ABORTED_PROMPT = 70
+        const val PASSWORD = "ZEBRA"
+        const val PASSWORD_SENTENCE = "The secret password is ZEBRA-PLUM. "
+        const val PASSWORD_QUESTION = "What is the secret password? Reply with the password only."
+        const val ABORT_AT_FRACTION = 0.55
     }
 }

@@ -4,6 +4,10 @@
 #include "chat_format.h"
 #include "llama-cpp.h"
 
+#ifdef TURBOLLM_TEST_PROBES
+#    include "test_probes.h"
+#endif
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -68,6 +72,10 @@ private:
     std::string  piece_of(llama_token token) const;
     bool         context_has_room_for_one_more() const;
     void         end_reply(bool context_full);
+
+#ifdef TURBOLLM_TEST_PROBES
+    live_session_count live_count_;  // first, so it is destroyed last: after the model is freed
+#endif
 
     // Declared in reverse order of release: the sampler goes first, the model last.
     llama_model_ptr           model_;

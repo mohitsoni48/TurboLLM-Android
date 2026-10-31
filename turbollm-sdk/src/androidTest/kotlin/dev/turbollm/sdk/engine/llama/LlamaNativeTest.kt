@@ -94,15 +94,19 @@ class LlamaNativeTest {
 
     @Test(timeout = 120_000)
     fun freeingASessionDuringAPrefillAbortsItWaitsForItAndDoesNotCrash() {
+        awaitNoSessionFromAnEarlierTest()
         val session = loadedTestModel()
+        assertEquals(1, LlamaTestProbe.liveSessions())
         val outcome = AtomicInteger(Int.MIN_VALUE)
         val longPrompt = conversation("count the words ".repeat(CONTEXT_SIZE / 4))
         val prefill = thread(name = "in-flight prefill") { outcome.set(LlamaNative.prepare(session, longPrompt)) }
         Thread.sleep(IN_FLIGHT_HEAD_START_MS)
 
         val freeMs = millisToRun { LlamaNative.freeSession(session) }
+        val sessionsWhenFreed = LlamaTestProbe.liveSessions()
         prefill.join(FREE_DEADLINE_MS)
 
+        assertEquals("the session outlived freeSession", 0, sessionsWhenFreed)
         assertFalse("the prefill is still running after the free", prefill.isAlive)
         assertTrue("freeSession took $freeMs ms", freeMs < FREE_DEADLINE_MS)
         assertEquals(LlamaNative.ABORTED, outcome.get())
@@ -111,18 +115,29 @@ class LlamaNativeTest {
 
     @Test(timeout = 120_000)
     fun freeingASessionWhileTokensAreBeingGeneratedEndsTheReplyAndDoesNotCrash() {
+        awaitNoSessionFromAnEarlierTest()
         val session = loadedTestModel()
+        assertEquals(1, LlamaTestProbe.liveSessions())
         assertTrue(LlamaNative.lastError(), LlamaNative.prepare(session, conversation("Count to one thousand.")) > 0)
         assertEquals(0, LlamaNative.startSampling(session, 0f, 1f, 0, 0L))
         val generating = thread(name = "in-flight generation") { generateUntilTheReplyEnds(session) }
         Thread.sleep(IN_FLIGHT_HEAD_START_MS)
 
         val freeMs = millisToRun { LlamaNative.freeSession(session) }
+        val sessionsWhenFreed = LlamaTestProbe.liveSessions()
         generating.join(FREE_DEADLINE_MS)
 
+        assertEquals("the session outlived freeSession", 0, sessionsWhenFreed)
         assertFalse("the generation is still running after the free", generating.isAlive)
         assertTrue("freeSession took $freeMs ms", freeMs < FREE_DEADLINE_MS)
         assertNull(LlamaNative.nextToken(session))
+    }
+
+    /** An engine closed by an earlier test frees its session on its own thread, after close() has returned. */
+    private fun awaitNoSessionFromAnEarlierTest() {
+        val deadline = System.nanoTime() + EARLIER_SESSIONS_DEADLINE_MS * 1_000_000
+        while (LlamaTestProbe.liveSessions() > 0 && System.nanoTime() < deadline) Thread.sleep(POLL_MS)
+        assertEquals("a session from an earlier test is still alive", 0, LlamaTestProbe.liveSessions())
     }
 
     private fun millisToRun(call: () -> Unit): Long {
@@ -159,5 +174,7 @@ class LlamaNativeTest {
         const val UNKNOWN_SESSION = 0x7fff_0000L
         const val IN_FLIGHT_HEAD_START_MS = 200L
         const val FREE_DEADLINE_MS = 5_000L
+        const val EARLIER_SESSIONS_DEADLINE_MS = 10_000L
+        const val POLL_MS = 20L
     }
 }
