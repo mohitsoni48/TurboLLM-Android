@@ -33,6 +33,9 @@ internal class FakeLlama : LlamaBinding {
     val requests: MutableList<String> = CopyOnWriteArrayList()
     val samplings: MutableList<Sampling> = CopyOnWriteArrayList()
     val abortThreads: MutableList<Thread> = CopyOnWriteArrayList()
+
+    /** The order in which aborts, prefill ends and frees happened, whatever thread they came from. */
+    val lifecycle: MutableList<String> = CopyOnWriteArrayList()
     val prefillStarted = CountDownLatch(1)
 
     private val tokens = ArrayDeque<ByteArray>()
@@ -109,6 +112,7 @@ internal class FakeLlama : LlamaBinding {
 
     override fun requestAbort(session: Long) {
         abortThreads += Thread.currentThread()
+        lifecycle += "requestAbort"
         abortSignal.countDown()
     }
 
@@ -126,6 +130,7 @@ internal class FakeLlama : LlamaBinding {
     override fun freeSession(session: Long) {
         record("freeSession")
         freed += session
+        lifecycle += "freeSession"
     }
 
     override fun lastError(): String = error
@@ -135,6 +140,7 @@ internal class FakeLlama : LlamaBinding {
     private fun waitForAbort(): Int {
         prefillStarted.countDown()
         abortSignal.await(PREFILL_LIMIT_SECONDS, TimeUnit.SECONDS)
+        lifecycle += "prefill ended"
         return LlamaNative.ABORTED
     }
 

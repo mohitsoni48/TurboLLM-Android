@@ -73,7 +73,8 @@ auto empty_text(JNIEnv * env) {
     return [env](session_failure) { return env->NewStringUTF(""); };
 }
 
-turbollm::llama_session & session(jlong handle) {
+// The lease keeps the session alive until the call that found it returns, even if it is freed meanwhile.
+turbollm::session_lease session(jlong handle) {
     return sessions().find(handle);
 }
 
@@ -107,12 +108,12 @@ JNIEXPORT jlong JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_loadModel
 
 JNIEXPORT jstring JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_modelInfo(JNIEnv * env, jobject,
                                                                                   jlong handle) {
-    return guarded([&] { return java_from_utf8(env, session(handle).model_info_json()); }, empty_text(env));
+    return guarded([&] { return java_from_utf8(env, session(handle)->model_info_json()); }, empty_text(env));
 }
 
 JNIEXPORT jint JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_prepare(JNIEnv * env, jobject, jlong handle,
                                                                              jstring request_json) {
-    return guarded([&] { return static_cast<jint>(session(handle).prepare(utf8_from_java(env, request_json))); },
+    return guarded([&] { return static_cast<jint>(session(handle)->prepare(utf8_from_java(env, request_json))); },
                    failure_code);
 }
 
@@ -120,7 +121,7 @@ JNIEXPORT jint JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_startSampl
     JNIEnv *, jobject, jlong handle, jfloat temperature, jfloat top_p, jint top_k, jlong seed) {
     return guarded(
         [&] {
-            session(handle).start_sampling({ temperature, top_p, top_k, seed });
+            session(handle)->start_sampling({ temperature, top_p, top_k, seed });
             return jint{ 0 };
         },
         failure_code);
@@ -130,7 +131,7 @@ JNIEXPORT jbyteArray JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_next
                                                                                      jlong handle) {
     return guarded(
         [&]() -> jbyteArray {
-            const auto piece = session(handle).next_token();
+            const auto piece = session(handle)->next_token();
             return piece ? java_bytes(env, *piece) : nullptr;
         },
         no_token);
@@ -138,7 +139,7 @@ JNIEXPORT jbyteArray JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_next
 
 JNIEXPORT jstring JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_parseDelta(JNIEnv * env, jobject,
                                                                                    jlong handle, jboolean partial) {
-    return guarded([&] { return java_from_utf8(env, session(handle).parse_delta_json(partial == JNI_TRUE)); },
+    return guarded([&] { return java_from_utf8(env, session(handle)->parse_delta_json(partial == JNI_TRUE)); },
                    empty_text(env));
 }
 
@@ -148,15 +149,15 @@ JNIEXPORT void JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_requestAbo
 }
 
 JNIEXPORT void JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_clearAbort(JNIEnv *, jobject, jlong handle) {
-    guarded([&] { session(handle).clear_abort(); }, nothing_more);
+    guarded([&] { session(handle)->clear_abort(); }, nothing_more);
 }
 
 JNIEXPORT jstring JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_stats(JNIEnv * env, jobject, jlong handle) {
-    return guarded([&] { return java_from_utf8(env, session(handle).stats_json()); }, empty_text(env));
+    return guarded([&] { return java_from_utf8(env, session(handle)->stats_json()); }, empty_text(env));
 }
 
 JNIEXPORT void JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_freeSession(JNIEnv *, jobject, jlong handle) {
-    guarded([&] { sessions().release(handle).reset(); }, nothing_more);
+    guarded([&] { sessions().release(handle); }, nothing_more);
 }
 
 JNIEXPORT jstring JNICALL Java_dev_turbollm_sdk_engine_llama_LlamaNative_lastError(JNIEnv * env, jobject) {

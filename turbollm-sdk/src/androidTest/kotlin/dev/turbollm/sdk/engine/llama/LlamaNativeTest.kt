@@ -5,6 +5,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -12,6 +13,8 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 
 /**
  * The JNI edge itself: failures come back as sentinels plus [LlamaNative.lastError], handles are
@@ -89,6 +92,45 @@ class LlamaNativeTest {
         }
     }
 
+    @Test(timeout = 120_000)
+    fun freeingASessionDuringAPrefillAbortsItWaitsForItAndDoesNotCrash() {
+        val session = loadedTestModel()
+        val outcome = AtomicInteger(Int.MIN_VALUE)
+        val longPrompt = conversation("count the words ".repeat(CONTEXT_SIZE / 4))
+        val prefill = thread(name = "in-flight prefill") { outcome.set(LlamaNative.prepare(session, longPrompt)) }
+        Thread.sleep(IN_FLIGHT_HEAD_START_MS)
+
+        val freeMs = millisToRun { LlamaNative.freeSession(session) }
+        prefill.join(FREE_DEADLINE_MS)
+
+        assertFalse("the prefill is still running after the free", prefill.isAlive)
+        assertTrue("freeSession took $freeMs ms", freeMs < FREE_DEADLINE_MS)
+        assertEquals(LlamaNative.ABORTED, outcome.get())
+        assertEquals(LlamaNative.FAILED, LlamaNative.prepare(session, conversation("Hi")))
+    }
+
+    @Test(timeout = 120_000)
+    fun freeingASessionWhileTokensAreBeingGeneratedEndsTheReplyAndDoesNotCrash() {
+        val session = loadedTestModel()
+        assertTrue(LlamaNative.lastError(), LlamaNative.prepare(session, conversation("Count to one thousand.")) > 0)
+        assertEquals(0, LlamaNative.startSampling(session, 0f, 1f, 0, 0L))
+        val generating = thread(name = "in-flight generation") { generateUntilTheReplyEnds(session) }
+        Thread.sleep(IN_FLIGHT_HEAD_START_MS)
+
+        val freeMs = millisToRun { LlamaNative.freeSession(session) }
+        generating.join(FREE_DEADLINE_MS)
+
+        assertFalse("the generation is still running after the free", generating.isAlive)
+        assertTrue("freeSession took $freeMs ms", freeMs < FREE_DEADLINE_MS)
+        assertNull(LlamaNative.nextToken(session))
+    }
+
+    private fun millisToRun(call: () -> Unit): Long {
+        val startedAt = System.nanoTime()
+        call()
+        return (System.nanoTime() - startedAt) / 1_000_000
+    }
+
     private fun generateUntilTheReplyEnds(session: Long): Int {
         repeat(MAX_GENERATED_TOKENS) { generated ->
             LlamaNative.nextToken(session) ?: return generated
@@ -115,5 +157,7 @@ class LlamaNativeTest {
         const val THREADS = 4
         const val MAX_GENERATED_TOKENS = 1024
         const val UNKNOWN_SESSION = 0x7fff_0000L
+        const val IN_FLIGHT_HEAD_START_MS = 200L
+        const val FREE_DEADLINE_MS = 5_000L
     }
 }

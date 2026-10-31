@@ -17,7 +17,10 @@ import dev.turbollm.sdk.testing.FakeLlama.Opened
 import dev.turbollm.sdk.testing.FakeLlama.Sampling
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
@@ -49,9 +52,13 @@ class LlamaCppEngineFakeNativeTest {
 
     private val llama = FakeLlama()
     private val engine = LlamaCppEngine(llama, defaultThreads = { DEVICE_THREADS })
+    private val background = CoroutineScope(Dispatchers.Default)
 
     @After
-    fun closeTheEngine() = engine.close()
+    fun closeTheEngine() {
+        engine.close()
+        background.cancel()
+    }
 
     @Test
     fun aLoadOpensTheModelAtTheRequestedContextAndThreadsOnCpu() = runBlocking {
@@ -364,6 +371,29 @@ class LlamaCppEngineFakeNativeTest {
     }
 
     @Test
+    fun unloadingDuringAPrefillAbortsItAndReturnsOnlyOnceThePrefillHasEndedAndTheSessionIsFree() = runBlocking {
+        engine.load(spec())
+        startAPrefillThatOnlyAnAbortEnds()
+
+        val lifecycleWhenUnloaded = background.async { engine.unload(); llama.lifecycle.toList() }
+
+        val expected = listOf("requestAbort", "prefill ended", "freeSession")
+        assertEquals(expected, withTimeout(PROMPT_MILLIS) { lifecycleWhenUnloaded.await() })
+    }
+
+    @Test
+    fun closingDuringAPrefillAbortsItAndFreesTheSessionOnlyOnceThePrefillHasEnded() = runBlocking {
+        engine.load(spec())
+        val engineThread = llama.calls.first().thread
+        startAPrefillThatOnlyAnAbortEnds()
+
+        engine.close()
+        engineThread.join(STOP_MILLIS)
+
+        assertEquals(listOf("requestAbort", "prefill ended", "freeSession"), llama.lifecycle)
+    }
+
+    @Test
     fun aModelCanBeLoadedAgainAfterUnload() = runBlocking {
         engine.load(spec())
         engine.unload()
@@ -405,6 +435,13 @@ class LlamaCppEngineFakeNativeTest {
     }
 
     private fun loaded() = runBlocking { engine.load(spec()) }
+
+    /** A reply whose prefill, like a long real one, returns only once the native abort flag is set. */
+    private suspend fun startAPrefillThatOnlyAnAbortEnds() {
+        llama.prefillWaitsForAbort = true
+        background.launch { runCatching { engine.generate(QUESTION, PARAMS).toList() } }
+        withContext(Dispatchers.IO) { llama.prefillStarted.await(5, TimeUnit.SECONDS) }
+    }
 
     private fun generateAll() = runBlocking { engine.generate(QUESTION, PARAMS).toList() }
 

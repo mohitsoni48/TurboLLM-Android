@@ -63,8 +63,10 @@ internal class LlamaCppEngine(
         abortingWhenCancelled(reply) { emitAll(reply.events(messages, params).flowOn(thread)) }
     }
 
+    /** Returns only once the session is freed, so no native call of this engine is still running. */
     override suspend fun unload() {
         val thread = engineThread ?: return
+        abortTheRunningCall()
         withContext(thread) { freeSession() }
         stop(thread)
     }
@@ -72,6 +74,7 @@ internal class LlamaCppEngine(
     /** Frees the session on the engine thread after anything already queued there, then stops the thread. */
     override fun close() {
         val thread = engineThread ?: return
+        abortTheRunningCall()
         thread.executor.execute(::freeSession)
         stop(thread)
     }
@@ -93,6 +96,12 @@ internal class LlamaCppEngine(
         }
         session = handle
         return NativeModelInfo.from(llama.modelInfo(handle))
+    }
+
+    /** A prefill or decode in flight on the engine thread would otherwise hold the free back until it ends. */
+    private fun abortTheRunningCall() {
+        val running = session
+        if (running != NO_SESSION) llama.requestAbort(running)
     }
 
     private fun freeSession() {

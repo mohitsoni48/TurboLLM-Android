@@ -50,7 +50,10 @@ internal object LlamaNative {
     /** JSON: `prompt_n`, `prompt_decoded`, `prompt_ms`, `predicted_n`, `predicted_ms`, `context_full`. */
     external fun stats(session: Long): String
 
-    /** Frees the sampler, the templates, the context and the model, in that order. Idempotent. */
+    /**
+     * Frees the sampler, the templates, the context and the model, in that order. Idempotent. A call still
+     * running on the session is aborted first, and the free returns only after that call has returned.
+     */
     external fun freeSession(session: Long)
 
     /** The calling thread's last failure message. */
