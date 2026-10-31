@@ -84,7 +84,8 @@ function(add_jni_variant variant)
     add_llama_static_build(${variant} "${arch_flags}" archives)
 
     set(target turbollm_llama_${variant})
-    add_library(${target} SHARED turbollm_jni.cpp llama_session.cpp chat_format.cpp)
+    add_library(${target} SHARED
+        turbollm_jni.cpp jni_text.cpp session_registry.cpp llama_session.cpp chat_format.cpp)
     target_compile_features(${target} PRIVATE cxx_std_17)
     add_dependencies(${target} llama_${variant})
     target_include_directories(${target} PRIVATE

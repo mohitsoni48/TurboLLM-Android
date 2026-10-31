@@ -5,7 +5,12 @@ package dev.turbollm.sdk.engine.llama
  * [ByteArray] and opaque `Long` session handles cross the boundary. Every call except [requestAbort]
  * is made from the engine thread.
  *
- * [prepare] and [startSampling] return a negative sentinel on failure, and [lastError] then says why.
+ * No native exception reaches the JVM. A failed call returns a sentinel instead, and [lastError] then
+ * says why: [loadModel] 0, [prepare] and [startSampling] a negative constant below, [modelInfo],
+ * [parseDelta] and [stats] an empty string, and [nextToken] null. Every call except [lastError] resets
+ * the message, so a null from [nextToken] with an empty [lastError] is the normal end of the reply.
+ * A handle that was never issued, or was already freed, is refused like any other failure; [freeSession]
+ * and [requestAbort] simply do nothing with it.
  */
 internal object LlamaNative {
     const val FAILED = -1
