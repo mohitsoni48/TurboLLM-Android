@@ -20,6 +20,14 @@ set(ARM64_MARCH_i8mm    "armv8.6-a+dotprod+i8mm+fp16")
 
 set(LLAMA_STATIC_LIBS llama-common llama-common-base cpp-httplib llama ggml ggml-cpu ggml-base)
 
+# llama.cpp is always built optimised, even for a Debug SDK: unoptimised ggml is too slow to run the device
+# tests on an emulator. The SDK's own JNI sources keep the build type's flags, so they stay debuggable.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(LLAMA_BUILD_TYPE "RelWithDebInfo")
+else()
+    set(LLAMA_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
+endif()
+
 function(abi_supports_variant variant out_supported)
     if(ANDROID_ABI STREQUAL "arm64-v8a" AND DEFINED ARM64_MARCH_${variant})
         set(${out_supported} TRUE PARENT_SCOPE)
@@ -54,7 +62,7 @@ function(add_llama_static_build variant arch_flags out_archives)
             -DANDROID_ABI=${ANDROID_ABI}
             -DANDROID_PLATFORM=${ANDROID_PLATFORM}
             -DANDROID_STL=c++_static
-            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DCMAKE_BUILD_TYPE=${LLAMA_BUILD_TYPE}
             -DCMAKE_C_FLAGS=${hidden_flags}
             -DCMAKE_CXX_FLAGS=${hidden_flags}
             -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${archive_dir}
