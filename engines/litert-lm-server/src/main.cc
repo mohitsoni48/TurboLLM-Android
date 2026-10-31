@@ -655,40 +655,59 @@ ModelFileInfo ReadModelFileInfo(std::ifstream& in, const std::string& header) {
   return info;
 }
 
-// ModelFileInfo for the model file, read once per version of it (its size and modification time). A .litertlm starts
-// with "LITERTLM", three uint32 versions, 4 bytes of padding and a little-endian uint64 header-end offset (the same 32
-// bytes the daemon's models/litertlm.ts reads). The runtime allocates and zeroes header_end - 32 bytes before reading
-// the header, and the std::bad_alloc a bogus offset raises crosses the C API into std::terminate, killing the whole
-// server, so the offset is bounded here first. The bound is the runtime's own: it reads the header from the file's
-// first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's litert_lm_loader.h), so a larger offset can never load,
-// yet would still cost an allocation up to the file's size (hundreds of MB on a phone). Checked before the loaded
-// engine is released, which a bad file then leaves in place. A file that can't be read or lacks the magic is left to
-// the runtime, which reports it cleanly and more precisely (e.g. "Permission denied"), and says nothing here. Caller
-// holds g_engine_mu.
+// ModelFileInfo for the model file, read once per version of it: its device, inode, size, and modification and change
+// times to the nanosecond, from a stat, which is all a request costs while the file is unchanged. The change time moves
+// with every write, and nothing can set it back, so a rewrite that puts the old modification time back (cp -p,
+// touch -r, tar) is a new version too. Keyed by the size and the second, a model rewritten in place within the same
+// second at the same size kept the old file's info (an image sent to a model that now takes images was refused), and
+// every request opened the file and read it again. The stat comes before the read, so a file that changes in between is
+// read again next time. A .litertlm starts with "LITERTLM", three uint32 versions, 4 bytes of padding and a
+// little-endian uint64 header-end offset (the same 32 bytes the daemon's models/litertlm.ts reads). The runtime
+// allocates and zeroes header_end - 32 bytes before reading the header, and the std::bad_alloc a bogus offset raises
+// crosses the C API into std::terminate, killing the whole server, so the offset is bounded here first. The bound is
+// the runtime's own: it reads the header from the file's first 16 KiB only (kLitertLmHeaderMaxSize, LiteRT-LM 0.18.0's
+// litert_lm_loader.h), so a larger offset can never load, yet would still cost an allocation up to the file's size
+// (hundreds of MB on a phone). Refused, for every request to that version of the file, before the loaded engine is
+// released, which a bad file then leaves in place. A file that can't be read or lacks the magic is left to the runtime,
+// which reports it cleanly and more precisely (e.g. "Permission denied"), and says nothing here. Caller holds
+// g_engine_mu.
 const ModelFileInfo& FileInfo(const ModelRef& ref) {
   struct Cached {
-    long long size = -1, mtime = -1;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    off_t size = -1;
+    timespec mtime{}, ctime{};
+    std::string invalid;  // the 500 for a header offset the runtime cannot load
     ModelFileInfo info;
   };
   static std::map<std::string, Cached> cache;
-  struct stat st {};
-  unsigned char h[32] = {};
-  std::ifstream in(ref.path, std::ios::binary);
-  bool ok = ::stat(ref.path.c_str(), &st) == 0 && in.read(reinterpret_cast<char*>(h), sizeof h) &&
-            std::memcmp(h, "LITERTLM", 8) == 0;
-  uint64_t header_end = 0;
-  for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
-  constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
-  if (ok && (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize))) {
-    throw HttpError(500, "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
-                             ": invalid .litertlm header')");
-  }
   Cached& c = cache[ref.path];
-  if (c.size == static_cast<long long>(st.st_size) && c.mtime == static_cast<long long>(st.st_mtime)) return c.info;
-  c = Cached{static_cast<long long>(st.st_size), static_cast<long long>(st.st_mtime), ModelFileInfo()};
-  if (!ok) return c.info;
-  std::string header(header_end - 32, '\0');
-  if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) c.info = ReadModelFileInfo(in, header);
+  struct stat st {};
+  if (::stat(ref.path.c_str(), &st) != 0) {
+    c = Cached();
+    return c.info;
+  }
+  if (c.dev != st.st_dev || c.ino != st.st_ino || c.size != st.st_size || c.mtime.tv_sec != st.st_mtim.tv_sec ||
+      c.mtime.tv_nsec != st.st_mtim.tv_nsec || c.ctime.tv_sec != st.st_ctim.tv_sec ||
+      c.ctime.tv_nsec != st.st_ctim.tv_nsec) {
+    c = Cached{st.st_dev, st.st_ino, st.st_size, st.st_mtim, st.st_ctim, "", ModelFileInfo()};
+    if (g_verbose) Log("Reading the header of " + ref.path);
+    unsigned char h[32] = {};
+    std::ifstream in(ref.path, std::ios::binary);
+    if (in.read(reinterpret_cast<char*>(h), sizeof h) && std::memcmp(h, "LITERTLM", 8) == 0) {
+      uint64_t header_end = 0;
+      for (int i = 31; i >= 24; --i) header_end = (header_end << 8) | h[i];
+      constexpr uint64_t kRuntimeHeaderMaxSize = 16 * 1024;
+      if (header_end <= 32 || header_end > std::min<uint64_t>(st.st_size, kRuntimeHeaderMaxSize)) {
+        c.invalid = "Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for " + ref.path +
+                    ": invalid .litertlm header')";
+      } else {
+        std::string header(header_end - 32, '\0');
+        if (in.read(&header[0], static_cast<std::streamsize>(header.size()))) c.info = ReadModelFileInfo(in, header);
+      }
+    }
+  }
+  if (!c.invalid.empty()) throw HttpError(500, c.invalid);
   return c.info;
 }
 
@@ -715,8 +734,9 @@ struct EngineHolder {
   bool tools_unconstrained = false;
   // What the model file says about itself (ModelFileInfo), as it was when this engine was created.
   ModelFileInfo info;
-  // The backend the engine runs on: key.backend, or CPU when the model's own backend did not start.
-  std::string backend;
+  // The model's own backend, when no backend was set for this engine (else empty): the one it runs on (key.backend), or
+  // the one it fell back from because it did not start.
+  std::string backend_chosen;
   // The context window this engine has, in tokens (-1: unknown), and the larger one that was asked for, if any.
   int window = -1, window_asked = -1;
   // The model's decoder keeps a recurrent state (info.recurrent_state), and a message has been sent on this engine
@@ -845,6 +865,7 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // start falls back to the next one it lists (below); one the user set does not.
   const bool backend_set = !key.backend.empty();
   if (!backend_set) key.backend = info.text_backends.empty() ? "cpu" : info.text_backends.front();
+  const std::string chosen = backend_set ? "" : key.backend;
   // A vision or audio executor is created only when the engine settings name a backend for it (c/engine.cc,
   // CreateEngineSettingsHelper), and none was named, so an image sent to LFM2.5-VL-450M got a 500 "Vision executor
   // should not be null, please TryLoadingVisionExecutor() first." although the model takes images.
@@ -858,6 +879,22 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   if (info.capabilities_known && needs.audio && key.audio_backend.empty()) {
     throw HttpError(400, "Invalid messages: " + ref.id + " takes no audio input");
   }
+  // An engine is keyed by the backend it runs on, so a backend the request or the config sets gets an engine on that
+  // backend or that backend's error. Keyed by the model's choice, an engine that had fallen back to CPU served a request
+  // that set gpu. A request that sets none takes the engine made for the same choice of the model's, on whichever
+  // backend it fell back to, so the model's own is not tried again until another engine is loaded.
+  if (!chosen.empty() && g_engine.engine && g_engine.backend_chosen == chosen) {
+    EngineKey fallen = key;
+    fallen.backend = g_engine.key.backend;
+    if (g_engine.key == fallen) key = fallen;
+  }
+  // Nor does a request that sets none take one made for another choice of the model's, which only a replaced file
+  // (the choice is its header's) brings, even when that engine fell back to the backend the new file chooses: it was
+  // loaded from the old file, and its ModelFileInfo (sampler, context, recurrent state) is the old file's. A file
+  // replaced by one of the same choice, or used with a backend set, still keeps the engine, as it always has: the key
+  // holds no version of the file.
+  const bool other_choice = !chosen.empty() && g_engine.engine && !g_engine.backend_chosen.empty() &&
+                            g_engine.backend_chosen != chosen;
 
   // A model whose decoder keeps a recurrent state gets a new engine for every conversation after the first. LiteRT-LM
   // 0.18.0 starts each new conversation on an engine at step 0 and keeps the executor's buffers as they are there
@@ -868,8 +905,9 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   // France." after that same question's first turn and a title request, and with "The capital of Italy is **Rome**."
   // on a fresh one (LiteRT-LM #3165; the model card says to create a new Engine for each conversation). The C API has
   // no way to reset that state, so the engine is created again, with the same settings.
-  const bool fresh_state = g_engine.engine && g_engine.key == key && g_engine.info.recurrent_state && g_engine.state_used;
-  if (g_engine.engine && g_engine.key == key && !fresh_state) return g_engine.engine;
+  const bool fresh_state =
+      g_engine.engine && g_engine.key == key && !other_choice && g_engine.info.recurrent_state && g_engine.state_used;
+  if (g_engine.engine && g_engine.key == key && !other_choice && !fresh_state) return g_engine.engine;
   if (fresh_state) {
     static std::set<std::string> told;  // once per model file, not per conversation
     if (told.insert(ref.path).second) {
@@ -931,12 +969,12 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
     }
     return e;
   };
-  // A new engine for a fresh state (above) runs where the one before it did, so a model whose own backend fell back is
-  // not tried on that backend again for every conversation. A backend other than CPU that the model picked and that
-  // does not start falls back to the next one the model lists, and only to one it lists: a GPU-only bundle was tried
-  // on CPU, which cannot run it, and the error then gave the CPU's reason instead of the GPU's. When none starts, the
-  // error gives each one's reason.
-  std::vector<std::string> backends = {fresh_state ? g_engine.backend : key.backend};
+  // A new engine for a fresh state (above) has the key of the one before it, so it runs where that one did, and a model
+  // whose own backend fell back is not tried on that backend again for every conversation. A backend other than CPU that
+  // the model picked and that does not start falls back to the next one the model lists, and only to one it lists: a
+  // GPU-only bundle was tried on CPU, which cannot run it, and the error then gave the CPU's reason instead of the
+  // GPU's. When none starts, the error gives each one's reason.
+  std::vector<std::string> backends = {key.backend};
   if (!backend_set && backends[0] != "cpu") {
     auto at = std::find(info.text_backends.begin(), info.text_backends.end(), backends[0]);
     if (at != info.text_backends.end()) backends.insert(backends.end(), at + 1, info.text_backends.end());
@@ -956,7 +994,8 @@ LiteRtLmEngine* GetOrCreateEngine(const ModelRef& ref, const ModelConfig& mc, co
   if (window <= 0) window = RuntimeWindow(info, -1, backend);
   g_engine.engine = e;
   g_engine.key = key;
-  g_engine.backend = backend;
+  g_engine.key.backend = backend;
+  g_engine.backend_chosen = chosen;
   // The same model and settings again: what was found out about the model still holds.
   if (!fresh_state) g_engine.tools_unconstrained = false;
   g_engine.info = info;
@@ -993,20 +1032,22 @@ std::map<std::string, std::string> BuildNameByToolCallId(const json& messages) {
 constexpr int kMaxJsonDepth = 128;
 
 struct JsonTooDeep : std::runtime_error {
-  JsonTooDeep() : std::runtime_error("nested deeper than " + std::to_string(kMaxJsonDepth) + " levels") {}
+  explicit JsonTooDeep(int max_depth = kMaxJsonDepth)
+      : std::runtime_error("nested deeper than " + std::to_string(max_depth) + " levels") {}
 };
 
 // The DOM builder json::parse itself uses, counting the arrays and objects open: it throws JsonTooDeep at one that
-// kMaxJsonDepth others enclose. Not json::parse with a parser callback, which would be simpler: that parser's
+// max_depth others enclose. Not json::parse with a parser callback, which would be simpler: that parser's
 // end_object scans the whole enclosing array or object for a value the callback discarded, each time an object closes,
 // so a body holding N objects in one array or object took O(N^2). A normal chat request with an extra field of 50,000
 // empty objects (575 KB) kept a core busy for 16 s, on the connection thread and before any lock, and nothing stops
 // that once the client has gone. This builder's start and end are what json::parse does, so it stays linear.
 struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
-  using json_sax_dom_parser::json_sax_dom_parser;
+  BoundedDomParser(json& result, int max_depth) : json_sax_dom_parser(result, true), max_depth(max_depth) {}
+  const int max_depth;
   int depth = 0;
   bool start_object(std::size_t n) {
-    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    if (++depth > max_depth) throw JsonTooDeep(max_depth);
     return json_sax_dom_parser::start_object(n);
   }
   bool end_object() {
@@ -1014,7 +1055,7 @@ struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
     return json_sax_dom_parser::end_object();
   }
   bool start_array(std::size_t n) {
-    if (++depth > kMaxJsonDepth) throw JsonTooDeep();
+    if (++depth > max_depth) throw JsonTooDeep(max_depth);
     return json_sax_dom_parser::start_array(n);
   }
   bool end_array() {
@@ -1023,11 +1064,11 @@ struct BoundedDomParser : nlohmann::detail::json_sax_dom_parser<json> {
   }
 };
 
-// json::parse, throwing JsonTooDeep at an array or object that kMaxJsonDepth others enclose. A syntax error throws
+// json::parse, throwing JsonTooDeep at an array or object that max_depth others enclose. A syntax error throws
 // json::parse_error, as with json::parse (the builder is made with allow_exceptions).
-json ParseBounded(const std::string& s) {
+json ParseBounded(const std::string& s, int max_depth = kMaxJsonDepth) {
   json result;
-  BoundedDomParser builder(result, true);
+  BoundedDomParser builder(result, max_depth);
   json::sax_parse(s, &builder);
   return result;
 }
@@ -1402,12 +1443,26 @@ std::string ContentText(const json& content) {
   return out;
 }
 
+// Throws JsonTooDeep for a JSON chunk nested deeper than a request may be, its envelope aside. The runtime's chunk
+// carries the tool calls it parsed from the model's output, 4 levels down (the chunk, its tool_calls, the call, its
+// function), so a call's arguments may nest as deep as a request's, kMaxJsonDepth. Copying the tool calls (below) and
+// writing them out recurse once per level, and a stand-in's chunk with a tool call 200,000 levels deep killed the server
+// with SIGSEGV. LiteRT-LM 0.18.0 bounds what it parses itself (a JSON tool call at 128 levels), but the server does not
+// rely on what the runtime hands it.
 Piece ParseChunk(const std::string& s) {
   Piece p;
   if (s.empty()) return p;
   json j;
   try {
-    j = json::parse(s);
+    j = ParseBounded(s, kMaxJsonDepth + 4);
+  } catch (const JsonTooDeep&) {
+    // Text that is not JSON, however many brackets it opens, is plain text, as below. accept() builds nothing, so it
+    // does not recurse.
+    if (!json::accept(s)) {
+      p.text = s;
+      return p;
+    }
+    throw;
   } catch (...) {
     p.text = s;  // the Python client treats unparseable chunks as plain text, too
     return p;
@@ -1580,11 +1635,22 @@ struct Penalties {
   int window = 0;
 };
 
+// Why `v`, a number the request sets as `field`, cannot be passed to LiteRT-LM, which takes sampler values as floats,
+// or empty. A number beyond a float's range (FLT_MAX, 3.4028235e+38) passed every check the server made as a double and
+// became an infinity as a float: temperature 1e39 reached the sampler as inf, a penalty of 1e39 or -1e39 the decoder.
+std::string OutOfFloatRange(const char* field, const json& v) {
+  if (std::isfinite(static_cast<float>(v.get<double>()))) return "";
+  return std::string(field) + " must be within a float's range (-3.4028235e+38 to 3.4028235e+38), got " + v.dump();
+}
+
 std::optional<Penalties> ParsePenalties(const json& body) {
   auto has = [&](const char* k) { return body.contains(k) && !body[k].is_null(); };
   auto number = [&](const char* k) {
     if (!body[k].is_number() || !std::isfinite(body[k].get<double>())) {
       throw HttpError(400, std::string("Invalid sampler parameters: ValueError: ") + k + " must be a number");
+    }
+    if (std::string why = OutOfFloatRange(k, body[k]); !why.empty()) {
+      throw HttpError(400, "Invalid sampler parameters: ValueError: " + why);
     }
     return body[k].get<float>();
   };
@@ -1881,6 +1947,10 @@ void HandleChatCompletions(int fd, const Request& req) {
           SendError(fd, req, 400, "Invalid sampler parameters: ValueError: " + why + ", got " + body[k].dump());
           return;
         }
+        if (std::string range = OutOfFloatRange(k, body[k]); !range.empty()) {
+          SendError(fd, req, 400, "Invalid sampler parameters: ValueError: " + range);
+          return;
+        }
         has_sampler = true;
       }
     }
@@ -2002,7 +2072,7 @@ void HandleChatCompletions(int fd, const Request& req) {
     // Engine.create_conversation, with the options the serve path passes, but constrained decoding only with tools
     // (below).
     LiteRtLmSessionConfig* sc = L.litert_lm_session_config_create();
-    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.backend, ref.id, has_sampler)) {
+    if (auto sampling = SamplingFor(body, g_engine.info, g_engine.key.backend, ref.id, has_sampler)) {
       LiteRtLmSamplerParams* sp = L.litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP);
       L.litert_lm_sampler_params_set_top_k(sp, sampling->top_k);
       L.litert_lm_sampler_params_set_top_p(sp, sampling->top_p);
@@ -2284,7 +2354,20 @@ void HandleChatCompletions(int fd, const Request& req) {
         }
         break;
       }
-      Piece p = ParseChunk(item.text);
+      Piece p;
+      try {
+        p = ParseChunk(item.text);
+      } catch (const JsonTooDeep& e) {
+        // The model's output cannot be read: the request fails as on the runtime's own error, and the rest of the
+        // generation is not waited for.
+        if (!cancelled) {
+          cancelled = true;
+          L.litert_lm_conversation_cancel_process(conv.get());
+        }
+        error = std::string("the model's output, as the runtime parsed it, is ") + e.what() + " (" +
+                std::to_string(kMaxJsonDepth) + " within a tool call's arguments)";
+        break;
+      }
       p.text = apply_stops(p.text);
       if (stopped) p.tool_calls = json::array();
       if (!p.reasoning.empty()) ++reasoning_tokens;
@@ -2476,6 +2559,27 @@ void PrintHelp() {
       "The request's `model` field is the model path: <path>[,<backend>[,<max-tokens>]]\n");
 }
 
+#ifdef __linux__
+// Whether the process that started this one has already exited, which main() can tell only by this process now being
+// init's: an orphan is adopted by PID 1. Only the machine's own init counts, PID 1 of the root PID namespace. PID 1 of
+// a container's namespace is its entrypoint (tini, dumb-init, a shell), which starts the server as its child on purpose
+// (`docker run --init`), and such a server was refused. The kernel keeps no record of who forked a process, so there
+// an orphan, which that PID 1 adopts too, cannot be told from its child, and starts. On Android, where only the app
+// starts this binary, a parent of PID 1 is always the app gone, also where Android runs in a container (ChromeOS's
+// ARC++), so there it stays refused.
+bool ParentExited() {
+  if (::getppid() != 1) return false;
+#ifndef __ANDROID__
+  char ns[64];
+  const ssize_t n = ::readlink("/proc/self/ns/pid", ns, sizeof ns);
+  // The root PID namespace's inode, PROC_PID_INIT_INO in the kernel's proc_ns.h (since Linux 3.8). When /proc cannot
+  // be read, as before.
+  if (n > 0 && std::string(ns, static_cast<size_t>(n)) != "pid:[4026531836]") return false;
+#endif
+  return true;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2487,14 +2591,14 @@ int main(int argc, char** argv) {
   // covers every other way it is started: by a daemon without that helper, through the daemon's sh lifeline when the
   // helper fails its self-test, or by hand. Armed before anything else runs, so even a server stuck loading its
   // library goes. A parent process that ended before the prctl never sends it: this process was then already
-  // reparented to init, so the server does not start. This sees the process end, not the thread: had only the forking
-  // thread ended, this process would have moved to another thread of its parent and the signal would come when that
-  // one ends; the daemon's thread ends only with the daemon. A server that init starts on purpose is refused too;
-  // none is, as this binary ships only in the APK (host builds are for its tests).
+  // reparented to init, so the server does not start (ParentExited). This sees the process end, not the thread: had
+  // only the forking thread ended, this process would have moved to another thread of its parent and the signal would
+  // come when that one ends; the daemon's thread ends only with the daemon. A server that the machine's own init
+  // starts on purpose is refused too; none is on Android, where this binary ships only in the APK.
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
     std::fprintf(stderr, "prctl(PR_SET_PDEATHSIG) failed: %s; the server will not end with its parent\n",
                  std::strerror(errno));
-  } else if (::getppid() == 1) {
+  } else if (ParentExited()) {
     std::fprintf(stderr, "the process that started %s has already exited; not starting\n", kServerName);
     return 1;
   }

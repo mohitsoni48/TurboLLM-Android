@@ -19,8 +19,9 @@
 // "constrained=1 tools=1 provider=0 constraint=0 creates=3", where creates counts every litert_lm_conversation_create
 // call in the process; a message whose text starts with "say:" is answered with the rest of its text instead, three
 // bytes to a chunk, as a model streams, and one whose text is "too long" fails as a prompt longer than the context
-// window does. A regex that does not compile fails the send as llguidance does
-// (llg_constraint_provider.cc:155-160).
+// window does; one whose text is "nested:<n>" is answered with a tool call whose arguments nest n arrays, and one whose
+// text is "nested-text:<n>" with a chunk that is no JSON, n brackets and some text. A regex that does not compile fails
+// the send as llguidance does (llg_constraint_provider.cc:155-160).
 //
 // With FAKE_LITERT_LM_CALLS set to a file, the calls that say what the server asked the runtime for are appended to it,
 // one JSON object per line ({"call": "<function without litert_lm_>", ...its arguments}), for
@@ -253,6 +254,25 @@ int litert_lm_conversation_send_message_stream(LiteRtLmConversation* conv, const
                                    "tokens allowed: 4209 >= 4096",
                                true};
     callback(data, &failed);
+    return 0;
+  }
+  if (said.rfind("nested:", 0) == 0) {
+    // A tool call whose arguments nest n arrays, as the runtime parses one a model wrote with that many brackets.
+    // Written out by hand: nlohmann would build it recursively.
+    const size_t n = std::strtoul(said.c_str() + 7, nullptr, 10);
+    LiteRtLmStreamChunk call{"{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+                             "\"arguments\":{\"a\":" + std::string(n, '[') + std::string(n, ']') + "}}}]}",
+                             nullptr, false};
+    callback(data, &call);
+    LiteRtLmStreamChunk end{"", nullptr, true};
+    callback(data, &end);
+    return 0;
+  }
+  if (said.rfind("nested-text:", 0) == 0) {
+    LiteRtLmStreamChunk text{std::string(std::strtoul(said.c_str() + 12, nullptr, 10), '[') + " not json", nullptr, false};
+    callback(data, &text);
+    LiteRtLmStreamChunk end{"", nullptr, true};
+    callback(data, &end);
     return 0;
   }
   std::vector<std::string> chunks = {text};

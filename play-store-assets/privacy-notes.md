@@ -50,23 +50,23 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
    daemon at `http://127.0.0.1:7000`. `DaemonWebView.kt` loads the UI from there, and
    `DaemonAuth.kt` makes the app's other calls to it: the check that the daemon proves itself
    before the app sends its secret, and the authenticated requests from `EngineService.kt`
-   (activity, downloads, status, and the request to write the chat database to disk before
-   Quit and before a close with nothing running ends the app), `ModelImport.kt` (adding the
-   imported-models folder) and `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain`
-   points at `127.0.0.1:6996`; it is unused Spike A code that only the old `App()` screen, which
-   the Android app never shows, constructs.) The web UI in that WebView goes further, though: it
-   loads the images its pages point at from any https host, and from any host over plain http
-   on port 80. The daemon's CSP for the app allows that on purpose
-   (`APP_SECRET_CSP` in its `server.ts`: images and media from `'self'`, any `https:` host,
-   `http://*`, which with no port matches plain http on port 80 only, `data:` and `blob:`), and
-   `DaemonWebView.kt` refuses only other `127.0.0.1` ports. Those are the images in a model card
-   (the README in the Hugging Face dialog, which can embed images from any site) and markdown
-   images in chat replies and the other text the UI renders as markdown. An image in a reply loads
-   as soon as the reply shows, with no approval, so a reply (after a prompt injection in a pasted
-   file or a search result, say) can make the phone contact a host the model names and pass it
-   text from the chat in the image's URL. That behaviour is TurboLLM#287's "Known, not fixed
-   here" entry "Markdown images in chat", an owner decision; fill in the Data safety form with it
-   in mind.
+   (activity, with downloads and status when the daemon's activity answer does not carry them,
+   and the request to write the chat database to disk before Quit and before a close with nothing
+   running ends the app), `ModelImport.kt` (adding the imported-models folder) and
+   `StorageAccess.kt` (rescan). (`DaemonClient.kt` in `commonMain` points at `127.0.0.1:6996`; it
+   is unused Spike A code that only the old `App()` screen, which the Android app never shows,
+   constructs.) The web UI in that WebView goes further, though: it loads the images its pages
+   point at from any https host, and from any host over plain http on port 80. The daemon's CSP
+   for the app allows that on purpose (`APP_SECRET_CSP` in its `server.ts`: images and media from
+   `'self'`, any `https:` host, `http://*`, which with no port matches plain http on port 80
+   only, `data:` and `blob:`), and `DaemonWebView.kt` refuses only other `127.0.0.1` ports. Those
+   are the images in a model card (the README in the Hugging Face dialog, which can embed images
+   from any site) and markdown images in chat replies and the other text the UI renders as
+   markdown. An image in a reply loads as soon as the reply shows, with no approval, so a reply
+   (after a prompt injection in a pasted file or a search result, say) can make the phone contact
+   a host the model names and pass it text from the chat in the image's URL. That behaviour is
+   TurboLLM#287's "Known, not fixed here" entry "Markdown images in chat", an owner decision;
+   fill in the Data safety form with it in mind.
 2. **The embedded daemon (the same `turbollm` product code that runs on desktop) makes the same
    categories of outbound request desktop does, all user-initiated except where noted:**
    - Searching and browsing Hugging Face from Discover: opening it lists popular repos, typing

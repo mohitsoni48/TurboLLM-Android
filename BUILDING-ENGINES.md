@@ -394,7 +394,9 @@ the request sets a field, as before: LiteRT-LM leaves sampling to the model ther
 or below means no top-k limit, as in llama.cpp (TurboLLM's Top K 0 means disabled), and one above
 0 is passed as set, on GPU too, where LiteRT-LM 0.18.0 sets no limit of its own; a `top_p`
 outside 0 to 1, a negative `temperature`, and a `top_k` or `seed` with a fraction are a 400 that
-names the field instead of the runtime's 500.
+names the field instead of the runtime's 500. LiteRT-LM takes these values and the repetition
+penalties below as floats, so a `temperature` or penalty beyond a float's range (3.4028235e+38
+either way), which reached it as an infinity, is a 400 that names the field too.
 
 **Thinking is asked for the ways clients ask for it.** In order, the first that says: the
 top-level `reasoning_effort` (what the Python server reads, and what the daemon sends for a
@@ -458,7 +460,8 @@ puts gpu first), as `litert-lm serve` picks it. The server picked CPU for every 
 GPU-only bundle sent without a backend failed to load. When the model's own backend does not
 start, the engine falls back to the next one the model lists, CPU for most, and never to one it
 does not list, and the server logs why; when none starts, the error gives each one's reason. A
-backend the user set is used as set, failing as before.
+backend the user set is used as set, failing as before, also when an engine whose own backend fell
+back is loaded: an engine is kept for the backend it runs on.
 
 **A conversation that ends with the assistant's own words is a 400.** A client that prefills the
 start of a reply asks for it to be continued, which LiteRT-LM 0.18.0 can do only from C++
@@ -477,10 +480,14 @@ AddressSanitizer caught an exception being destroyed by the other runtime. See
 ends, and it exits 1 without starting when its parent is already init (the starter died before
 the `prctl`). The daemon's [engine tether](#the-engine-tether) does the same before it execs the
 server; this covers a server started any other way: by a daemon without the tether, through the
-daemon's `/system/bin/sh` fallback, or by hand. `node --test
-engines/litert-lm-server/parent-death.test.mjs` builds the server for the machine (Linux, `cc`
-and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing, and checks that a
-stand-in daemon's SIGKILL takes the listening server with it and that an orphaned start exits.
+daemon's `/system/bin/sh` fallback, or by hand. Off Android, a parent that is PID 1 of a
+container's PID namespace, its entrypoint (tini, a shell), is taken for the server's starter, as
+it usually is: the kernel keeps no record that would tell an orphan that PID 1 adopted from its
+child. `node --test engines/litert-lm-server/parent-death.test.mjs` builds the server for the
+machine (Linux, `cc` and `c++`) against a stand-in `liblitert-lm.so` whose functions do nothing,
+and checks that a stand-in daemon's SIGKILL takes the listening server with it, that an orphaned
+start exits (outside a container's PID namespace, where that test is skipped), and, where `unshare`
+can make a PID namespace, that a server its PID 1 starts runs.
 
 ### GPU
 

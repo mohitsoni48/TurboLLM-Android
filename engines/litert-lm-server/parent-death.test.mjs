@@ -6,7 +6,7 @@
 // when it ends.
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -118,11 +118,64 @@ test('a server whose parent exited before it started does not start', { skip }, 
       t.skip(`an orphan is adopted by pid ${ppid} here, not init`)
       return
     }
+    // PID 1 of a container's PID namespace is its entrypoint, whose child the server is taken for (main.cc
+    // ParentExited), so an orphan it adopted starts there by design (the next test). The server is in this process's
+    // namespace; one whose /proc cannot be read counts as the root one, as the server takes it.
+    let ns = null
+    try {
+      ns = readlinkSync('/proc/self/ns/pid')
+    } catch {}
+    if (ns !== null && ns !== 'pid:[4026531836]') {
+      t.skip('in a container\'s PID namespace, where an orphan its PID 1 adopted starts by design')
+      return
+    }
     outer.stdio[3].end('go\n')
     assert.ok(await waitFor(() => gone(pid), 3000), 'the server started')
     assert.match(readFileSync(errFile, 'utf8'), /the process that started turbollm-litertlm-server has already exited; not starting/)
   } finally {
     killAll(pids)
+  }
+})
+
+// A PID namespace of its own, as a container has: `unshare --pid --fork` makes its command that namespace's PID 1. Root
+// can make one, and elsewhere a user namespace (-r) can where the system allows those. --kill-child: unshare's child,
+// the namespace's PID 1, and with it everything in the namespace, dies with unshare.
+const unshare = skip ? undefined : [[], ['-r']].map((user) => [...user, '--pid', '--fork', '--kill-child', '--mount-proc'])
+  .find((flags) => spawnSync('unshare', [...flags, 'true'], { stdio: 'ignore', timeout: 10_000 }).status === 0)
+const skipNamespace = skip || (!unshare && 'unshare cannot make a PID namespace here')
+const tini = !skip && spawnSync('tini', ['--version'], { stdio: 'ignore', timeout: 10_000 }).status === 0
+// The pids whose parent is `pid`, from /proc.
+function children(pid) {
+  return readdirSync('/proc').filter((d) => /^\d+$/.test(d)).map(Number).filter((p) => stat(p)?.ppid === pid)
+}
+
+test('a server whose parent is PID 1 of its own PID namespace, as a container\'s entrypoint is, starts', { skip: skipNamespace }, async () => {
+  // A shell that starts the server as its child, as `docker run <image> sh -c '... &'` does, and tini, as
+  // `docker run --init` does.
+  const inits = [['sh', '-c', 'echo "sh is pid $$" >&2; "$0" serve --host 127.0.0.1 --port 0 & wait', server]]
+  if (tini) inits.push(['tini', '--', server, 'serve', '--host', '127.0.0.1', '--port', '0'])
+  for (const init of inits) {
+    const pids = []
+    try {
+      const outer = spawn('unshare', [...unshare, ...init], { stdio: ['ignore', 'ignore', 'pipe'] })
+      pids.push(outer.pid)
+      let err = ''
+      outer.stderr.setEncoding('utf8')
+      outer.stderr.on('data', (d) => { err += d })
+      const started = await waitFor(() => err.includes('Starting OpenAI-compatible API server') || err.includes('not starting'), 10_000)
+      assert.ok(started, `${init[0]}: no word from the server in 10 s: ${err}`)
+      assert.doesNotMatch(err, /not starting/, init[0])
+      if (init[0] === 'sh') assert.match(err, /^sh is pid 1$/m)
+      // The server is the child of the namespace's PID 1 (unshare's child), and it ends with it.
+      const [first] = children(outer.pid)
+      const [serverPid] = first ? children(first) : []
+      assert.ok(serverPid, `${init[0]}: the server is not the child of the namespace's PID 1`)
+      pids.push(first, serverPid)
+      process.kill(outer.pid, 'SIGKILL')
+      assert.ok(await waitFor(() => gone(serverPid), 3000), `${init[0]}: the server outlived its namespace's PID 1`)
+    } finally {
+      killAll(pids)
+    }
   }
 })
 
