@@ -1,0 +1,1 @@
+{"id":"chatcmpl-ID","object":"chat.completion","created":1730246400,"model":"org/repo/model-Q4_K_M","choices":[{"index":0,"message":{"content":"Hello world","role":"assistant"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10},"timings":{"prompt_n":7,"prompt_ms":10.0,"predicted_n":3,"predicted_ms":30.0,"predicted_per_second":100.0}}
