@@ -86,12 +86,21 @@ fun localProp(name: String): String? =
 val shipVulkanEngine: Boolean =
     providers.gradleProperty("turbollmVulkanEngine").orNull?.toBoolean() ?: false
 
-// Whether the LiteRT-LM engine is packaged. On by default: it is the engine Termux users get their
-// best speed from, and the app cannot provision it any other way (no Python, no executing files it
-// downloads). Costs ~14 MB compressed per ABI. -PturbollmLitertLmEngine=false builds without it;
-// the daemon then simply registers no LiteRT-LM engine (engines/seed.ts only registers what exists).
+// Whether the spawned CPU engine, llama-server and its sidecar libraries in src/androidMain/jniLibs, is packaged.
+// On by default in M1 (Option B): the in-process SDK engine is the default, and this stays as a fallback the user
+// can pick. -PturbollmSpawnedEngines=false builds the SDK engine alone; the daemon then registers no CPU engine
+// (engines/seed.ts only registers what exists). Removing it for good is M2.
+val shipSpawnedEngines: Boolean =
+    providers.gradleProperty("turbollmSpawnedEngines").orNull?.toBoolean() ?: true
+
+// Whether the spawned LiteRT-LM server is packaged. Off by default since M1: the SDK's AAR runs LiteRT-LM in
+// process. -PturbollmLitertLmEngine=true packages the server again beside it, as a rollback for one release;
+// it costs ~14 MB compressed per ABI.
 val shipLitertLmEngine: Boolean =
-    providers.gradleProperty("turbollmLitertLmEngine").orNull?.toBoolean() ?: true
+    providers.gradleProperty("turbollmLitertLmEngine").orNull?.toBoolean() ?: false
+
+// The engine tether ties a spawned engine to the app process, so it ships while any spawned engine does.
+val shipEngineTether: Boolean = shipSpawnedEngines || shipLitertLmEngine || shipVulkanEngine
 
 // The ABIs the APK carries. Shared by abiFilters and the LiteRT-LM staging task so the two can
 // never disagree about which engine builds exist.
@@ -238,8 +247,8 @@ android {
         // than src/: it is fetched and compiled on every machine, never committed.
         if (shipLitertLmEngine) jniLibs.srcDir(litertLmJniLibs)
         // The engine tether, staged into the build dir by stageTetherExec (below): compiled on every machine, like the
-        // LiteRT-LM server, and in every build.
-        jniLibs.srcDir(tetherJniLibs)
+        // LiteRT-LM server, and in every build that carries a spawned engine.
+        if (shipEngineTether) jniLibs.srcDir(tetherJniLibs)
     }
 
     // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
@@ -311,6 +320,14 @@ android {
             // file here means users simply see one engine.
             if (!shipVulkanEngine) {
                 excludes += "**/libllama_server_vk.so"
+            }
+            // The spawned CPU engine (shipSpawnedEngines). Named file by file, so that no pattern reaches the SDK
+            // engine's own libturbollm_llama_*.so.
+            if (!shipSpawnedEngines) {
+                excludes += listOf(
+                    "libllama_server.so", "libllama-server-impl.so", "libllama.so", "libllama-common.so",
+                    "libggml*.so", "libmtmd.so", "libomp.so",
+                ).map { "**/$it" }
             }
         }
     }
@@ -557,8 +574,8 @@ if (shipLitertLmEngine) {
 // process ends. Before, an engine's only tie to the app was system_server killing the app's cgroup after the process
 // had died. The daemon checks the helper at boot by watching it work, and without it (missing, or failing that check)
 // it ties each engine with a /system/bin/sh watcher instead: one more process per engine, counted against Android
-// 12+'s phantom process limit. So it is in every build, whatever the engine flags say, and its absence fails the build
-// like a missing LiteRT-LM engine does. See BUILDING-ENGINES.md, "The engine tether". Hooked to merge*JniLibFolders,
+// 12+'s phantom process limit. So it is in every build that carries a spawned engine (shipEngineTether), and its
+// absence fails such a build like a missing LiteRT-LM engine does. See BUILDING-ENGINES.md, "The engine tether". Hooked to merge*JniLibFolders,
 // as stageLitertLmEngine is; two clang runs of one small file, so it runs every time.
 val stageTetherExec by tasks.registering(Exec::class) {
     group = "build"
@@ -577,21 +594,23 @@ val stageTetherExec by tasks.registering(Exec::class) {
     }
 }
 
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
-    dependsOn(stageTetherExec)
-}
-// The APK/AAB tasks only, as for the LiteRT-LM engine above.
-val tetherPackagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
-tasks.matching { tetherPackagingTask.matches(it.name) }.configureEach {
-    doLast {
-        for (abi in shippedAbis) {
-            val f = tetherJniLibs.get().file("$abi/libtether_exec.so").asFile
-            if (!f.exists()) {
-                throw GradleException(
-                    "Engine tether missing: ${f.absolutePath}\n" +
-                        "The daemon would tie each engine with an extra sh process instead. " +
-                        "It is built by stageTetherExec (scripts/stage-tether-exec.mjs).",
-                )
+if (shipEngineTether) {
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+        dependsOn(stageTetherExec)
+    }
+    // The APK/AAB tasks only, as for the LiteRT-LM engine above.
+    val tetherPackagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
+    tasks.matching { tetherPackagingTask.matches(it.name) }.configureEach {
+        doLast {
+            for (abi in shippedAbis) {
+                val f = tetherJniLibs.get().file("$abi/libtether_exec.so").asFile
+                if (!f.exists()) {
+                    throw GradleException(
+                        "Engine tether missing: ${f.absolutePath}\n" +
+                            "The daemon would tie each engine with an extra sh process instead. " +
+                            "It is built by stageTetherExec (scripts/stage-tether-exec.mjs).",
+                    )
+                }
             }
         }
     }
