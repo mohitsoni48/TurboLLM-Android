@@ -1,10 +1,9 @@
 package dev.turbollm.sdk
 
-import dev.turbollm.sdk.api.TurboLLMException
+import dev.turbollm.sdk.engine.litert.LiteRtLmEngine
 import dev.turbollm.sdk.engine.llama.LlamaCppEngine
 import dev.turbollm.sdk.internal.Logger
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -21,11 +20,10 @@ class TurboLLMDependenciesTest {
     }
 
     @Test
-    fun theLiteRtLmEngineIsStillNotPartOfThisBuild() {
-        val failure = assertThrows(TurboLLMException.EngineUnavailable::class.java) {
-            engines.engineFor(ModelFormat.LITERTLM)
+    fun aLiteRtLmBundleRunsOnTheLiteRtLmEngineWithoutLoadingAnythingYet() {
+        engines.engineFor(ModelFormat.LITERTLM).use { engine ->
+            assertTrue(engine is LiteRtLmEngine)
+            assertEquals(EngineKind.LITERT_LM, engine.kind)
         }
-
-        assertEquals(EngineKind.LITERT_LM, failure.kind)
     }
 }

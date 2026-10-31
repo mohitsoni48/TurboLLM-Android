@@ -1,9 +1,9 @@
 package dev.turbollm.sdk
 
 import android.content.Context
-import dev.turbollm.sdk.api.TurboLLMException
-import dev.turbollm.sdk.engine.EngineFactory
 import dev.turbollm.sdk.engine.EngineRegistry
+import dev.turbollm.sdk.engine.litert.AarLiteRtRuntime
+import dev.turbollm.sdk.engine.litert.LiteRtLmEngine
 import dev.turbollm.sdk.engine.llama.JniLlamaBinding
 import dev.turbollm.sdk.engine.llama.LlamaCppEngine
 import dev.turbollm.sdk.internal.Clock
@@ -49,12 +49,7 @@ internal class TurboLLMDependencies(
         /** A fresh engine per load. Creating one loads no native code; its first load does, on its own thread. */
         fun productionEngines(logger: Logger) = EngineRegistry(
             llamaCpp = { LlamaCppEngine(JniLlamaBinding(logger), DeviceInfo::defaultThreadCount) },
-            liteRtLm = notInThisBuild(EngineKind.LITERT_LM, "LiteRT-LM"),
+            liteRtLm = { LiteRtLmEngine(AarLiteRtRuntime, DeviceInfo::defaultThreadCount, monotonicClock) },
         )
-
-        /** The LiteRT-LM adapter is not wired yet; a load says so plainly. */
-        private fun notInThisBuild(kind: EngineKind, name: String) = EngineFactory {
-            throw TurboLLMException.EngineUnavailable(kind, "The $name engine is not part of this build.")
-        }
     }
 }
