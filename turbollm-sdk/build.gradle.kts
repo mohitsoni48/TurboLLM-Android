@@ -64,8 +64,8 @@ kotlin {
 }
 
 dependencies {
-    implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.kotlinx.serialization.json)
+    api(libs.kotlinx.coroutines.android)
+    api(libs.kotlinx.serialization.json)
     implementation(libs.litertlm)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
