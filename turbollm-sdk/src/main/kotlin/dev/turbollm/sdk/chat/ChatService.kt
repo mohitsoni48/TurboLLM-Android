@@ -11,7 +11,9 @@ import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.api.Usage
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineHost
+import dev.turbollm.sdk.internal.Clock
 import dev.turbollm.sdk.internal.chatCompletionId
+import dev.turbollm.sdk.internal.monotonicClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -31,6 +33,7 @@ internal class ChatService(
     private val resolver: ModelResolver,
     private val gate: GenerationGate,
     private val host: EngineHost,
+    private val clock: Clock = monotonicClock,
     private val epochSeconds: () -> Long = { System.currentTimeMillis() / 1_000 },
 ) {
     fun stream(request: ChatCompletionRequest): Flow<ChatCompletionChunk> = flow {
@@ -51,7 +54,7 @@ internal class ChatService(
         gate.withPermit {
             host.withLoaded { loaded ->
                 emit(ReplyPart.Started)
-                emitAll(loaded.engine.generate(valid.messages, valid.params).toReplyParts(valid.stops))
+                emitAll(loaded.engine.generate(valid.messages, valid.params).toReplyParts(valid.stops, clock))
             }
         }
     }
@@ -71,23 +74,29 @@ internal sealed interface ReplyPart {
  * generation is never aborted. Engine errors other than the SDK's own and cancellation become
  * [TurboLLMException.EngineFailure].
  */
-private fun Flow<EngineEvent>.toReplyParts(stops: List<String>): Flow<ReplyPart> {
-    val reply = StoppableReply(StopMatcher(stops))
+private fun Flow<EngineEvent>.toReplyParts(stops: List<String>, clock: Clock): Flow<ReplyPart> {
+    val reply = StoppableReply(StopMatcher(stops), clock)
     return transformWhile { event -> reply.continueAfter(event, this) }
         .catch { failure -> throw failure.asEngineFailure() }
 }
 
-private class StoppableReply(private val matcher: StopMatcher) {
+private class StoppableReply(private val matcher: StopMatcher, private val clock: Clock) {
+    private var prefilled = EngineEvent.Prefilled(promptTokens = 0, promptMs = 0.0)
     private var generatedPieces = 0
+    private var firstPieceAt = 0L
 
     suspend fun continueAfter(event: EngineEvent, out: FlowCollector<ReplyPart>): Boolean = when (event) {
+        is EngineEvent.Prefilled -> {
+            prefilled = event
+            true
+        }
         is EngineEvent.Reasoning -> {
-            generatedPieces++
+            countPiece()
             out.emit(ReplyPart.Reasoning(event.text))
             true
         }
         is EngineEvent.Text -> {
-            generatedPieces++
+            countPiece()
             continueAfterContent(event.text, out)
         }
         is EngineEvent.Done -> {
@@ -104,12 +113,30 @@ private class StoppableReply(private val matcher: StopMatcher) {
         return !outcome.matched
     }
 
-    /** The engine is cancelled before it reports its counts; the pieces seen so far stand in for them. */
-    private fun endAtStop() = ReplyPart.End(
-        reason = FinishReason.STOP,
-        usage = Usage(promptTokens = 0, completionTokens = generatedPieces, totalTokens = generatedPieces),
-        timings = null,
-    )
+    private fun countPiece() {
+        if (generatedPieces == 0) firstPieceAt = clock.nowMillis()
+        generatedPieces++
+    }
+
+    /**
+     * The engine is cancelled before it reports its own counts. The prompt comes from its [EngineEvent.Prefilled]
+     * report; the pieces seen so far, and the time since the first, stand in for the generated tokens.
+     */
+    private fun endAtStop(): ReplyPart.End {
+        val promptTokens = prefilled.promptTokens
+        val genMs = (clock.nowMillis() - firstPieceAt).toDouble()
+        return ReplyPart.End(
+            reason = FinishReason.STOP,
+            usage = Usage(promptTokens, generatedPieces, promptTokens + generatedPieces),
+            timings = Timings(
+                promptTokens,
+                prefilled.promptMs,
+                generatedPieces,
+                genMs,
+                tokensPerSecond(generatedPieces, genMs),
+            ),
+        )
+    }
 
     private suspend fun FlowCollector<ReplyPart>.emitContent(text: String) {
         if (text.isNotEmpty()) emit(ReplyPart.Content(text))
@@ -119,11 +146,11 @@ private class StoppableReply(private val matcher: StopMatcher) {
 private fun EngineEvent.Done.toEnd() = ReplyPart.End(
     reason = reason,
     usage = Usage(promptTokens, completionTokens, promptTokens + completionTokens),
-    timings = Timings(promptTokens, promptMs, completionTokens, genMs, tokensPerSecond()),
+    timings = Timings(promptTokens, promptMs, completionTokens, genMs, tokensPerSecond(completionTokens, genMs)),
 )
 
-private fun EngineEvent.Done.tokensPerSecond(): Double =
-    if (genMs > 0) completionTokens * MILLIS_PER_SECOND / genMs else 0.0
+private fun tokensPerSecond(tokens: Int, genMs: Double): Double =
+    if (genMs > 0) tokens * MILLIS_PER_SECOND / genMs else 0.0
 
 private fun Throwable.asEngineFailure(): Throwable = when (this) {
     is CancellationException, is TurboLLMException -> this

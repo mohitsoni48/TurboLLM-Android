@@ -31,6 +31,7 @@ internal class LlamaReply(private val llama: LlamaBinding, private val session: 
 
     fun events(messages: List<ChatMessage>, params: GenerationParams): Flow<EngineEvent> = flow {
         prefill(messages, params)
+        emit(prefilled())
         startSampling(params)
         val reason = streamTokens(params.maxTokens)
         emitDelta(parse(isPartial = false))
@@ -104,6 +105,8 @@ internal class LlamaReply(private val llama: LlamaBinding, private val session: 
 
     private fun parse(isPartial: Boolean): ReplyDelta =
         sdkJson.decodeFromString(nativeJson(llama.parseDelta(session, isPartial), "read the reply"))
+
+    private fun prefilled(): EngineEvent.Prefilled = stats().let { EngineEvent.Prefilled(it.promptTokens, it.promptMs) }
 
     private fun doneWith(reason: FinishReason): EngineEvent.Done {
         val stats = stats()

@@ -45,6 +45,11 @@ sealed interface ContentPart {
 @Serializable
 data class StreamOptions(@SerialName("include_usage") val includeUsage: Boolean = false)
 
+/**
+ * OpenAI's token counts for one reply. When the reply ends at one of the request's stop sequences, the engine is
+ * cancelled before it can count, so [completionTokens] is the number of text pieces streamed, an estimate of the
+ * tokens generated; [promptTokens] is still the engine's own count.
+ */
 @Serializable
 data class Usage(
     @SerialName("prompt_tokens") val promptTokens: Int,

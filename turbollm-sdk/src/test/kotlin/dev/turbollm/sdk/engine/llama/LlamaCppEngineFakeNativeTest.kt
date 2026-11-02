@@ -15,6 +15,7 @@ import dev.turbollm.sdk.testing.FakeLlama
 import dev.turbollm.sdk.testing.FakeLlama.Companion.delta
 import dev.turbollm.sdk.testing.FakeLlama.Opened
 import dev.turbollm.sdk.testing.FakeLlama.Sampling
+import dev.turbollm.sdk.testing.pieces
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
@@ -154,7 +155,7 @@ class LlamaCppEngineFakeNativeTest {
     }
 
     @Test
-    fun aReplyStreamsReasoningAndTextThenDoneWithTheNativeStats() = runBlocking {
+    fun aReplyReportsItsPrefilledPromptThenStreamsReasoningAndTextThenDoneWithTheNativeStats() = runBlocking {
         engine.load(spec())
         llama.reply(
             "<think>" to delta(),
@@ -167,6 +168,7 @@ class LlamaCppEngineFakeNativeTest {
         val events = engine.generate(QUESTION, PARAMS).toList()
 
         val expected = listOf(
+            EngineEvent.Prefilled(promptTokens = 12, promptMs = 30.5),
             EngineEvent.Reasoning("hmm"),
             EngineEvent.Text("Hi"),
             EngineEvent.Text("!"),
@@ -182,7 +184,7 @@ class LlamaCppEngineFakeNativeTest {
 
         val events = engine.generate(QUESTION, PARAMS).toList()
 
-        assertEquals(listOf(EngineEvent.Reasoning("thought"), EngineEvent.Text("answer")), events.dropLast(1))
+        assertEquals(listOf(EngineEvent.Reasoning("thought"), EngineEvent.Text("answer")), events.pieces())
     }
 
     @Test
@@ -253,7 +255,7 @@ class LlamaCppEngineFakeNativeTest {
         val events = engine.generate(QUESTION, PARAMS).toList()
 
         assertEquals(2, llama.partialParses)
-        assertEquals(listOf(EngineEvent.Text("😀"), EngineEvent.Text("!")), events.dropLast(1))
+        assertEquals(listOf(EngineEvent.Text("😀"), EngineEvent.Text("!")), events.pieces())
     }
 
     @Test
@@ -340,7 +342,7 @@ class LlamaCppEngineFakeNativeTest {
         engine.load(spec())
         llama.endlessReply = true
 
-        withTimeout(PROMPT_MILLIS) { engine.generate(QUESTION, PARAMS).first() }
+        withTimeout(PROMPT_MILLIS) { engine.generate(QUESTION, PARAMS).first { it is EngineEvent.Text } }
         llama.endlessReply = false
         val next = withTimeout(PROMPT_MILLIS) { engine.generate(QUESTION, PARAMS).toList() }
 

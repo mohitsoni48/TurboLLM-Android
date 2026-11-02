@@ -30,6 +30,7 @@ import dev.turbollm.sdk.testing.FakeEngine.Step
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -125,6 +126,45 @@ class ChatServiceTest {
         assertEquals("hello ", chunks.mapNotNull { it.choices.singleOrNull()?.delta?.content }.joinToString(""))
         assertEquals(FinishReason.STOP, chunks.last().choices.single().finishReason)
         assertTrue(llamaEngine.cancelled)
+    }
+
+    @Test
+    fun aReplyCutByAStopReportsThePrefilledPromptAndTimesItsPiecesFromTheFirst() = runTest(timeout = 10.seconds) {
+        llamaEngine = FakeEngine(
+            listOf(
+                Step.Emit(EngineEvent.Prefilled(promptTokens = 12, promptMs = 30.0)),
+                Step.Emit(EngineEvent.Text("hel")),
+                Step.Pause(100),
+                Step.Emit(EngineEvent.Text("lo STOP")),
+                done(FinishReason.LENGTH),
+            ),
+        )
+        host.load(target(MODEL_ID))
+        val service = service(autoLoadOnRequest = false, clock = { testScheduler.currentTime })
+
+        val chunks = service.stream(request(stop = listOf("STOP"), includeUsage = true)).toList()
+
+        val finish = chunks[chunks.size - 2]
+        assertEquals(FinishReason.STOP, finish.choices.single().finishReason)
+        val expected = Timings(promptN = 12, promptMs = 30.0, predictedN = 2, predictedMs = 100.0, predictedPerSecond = 20.0)
+        assertEquals(expected, finish.timings)
+        assertEquals(Usage(promptTokens = 12, completionTokens = 2, totalTokens = 14), chunks.last().usage)
+    }
+
+    @Test
+    fun thePrefillReportAddsNothingToTheStream() = runTest(timeout = 10.seconds) {
+        val service = loadedService(
+            Step.Emit(EngineEvent.Prefilled(promptTokens = 12, promptMs = 30.0)),
+            Step.Emit(EngineEvent.Text("hi")),
+            done(FinishReason.STOP),
+        )
+
+        val chunks = service.stream(request()).toList()
+
+        assertEquals(
+            listOf(ChunkDelta(role = ChatRole.ASSISTANT), ChunkDelta(content = "hi"), ChunkDelta()),
+            chunks.map { it.choices.single().delta },
+        )
     }
 
     @Test
@@ -388,9 +428,9 @@ class ChatServiceTest {
         return service(autoLoadOnRequest = false)
     }
 
-    private fun service(autoLoadOnRequest: Boolean): ChatService {
+    private fun service(autoLoadOnRequest: Boolean, clock: Clock = Clock { 0 }): ChatService {
         val resolver = ModelResolver(store, host, autoLoadOnRequest, cacheDir = File(root, "cache"))
-        return ChatService(resolver, gate, host, epochSeconds = { CREATED })
+        return ChatService(resolver, gate, host, clock, epochSeconds = { CREATED })
     }
 
     private fun target(id: String) = LoadTarget(

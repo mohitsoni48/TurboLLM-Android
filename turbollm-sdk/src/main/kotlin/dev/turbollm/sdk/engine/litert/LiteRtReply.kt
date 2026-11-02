@@ -40,7 +40,7 @@ internal class LiteRtReply(private val model: LiteRtModel, private val clock: Cl
         val sent = clock.nowMillis()
         var firstChunkAt: Long? = null
         conversation.reply(prompt.userTurn).collect { chunk ->
-            if (firstChunkAt == null) firstChunkAt = clock.nowMillis()
+            if (firstChunkAt == null) firstChunkAt = reportPrefill(promptTokens, sent)
             emitParts(chunk)
         }
         val ended = clock.nowMillis()
@@ -53,6 +53,13 @@ internal class LiteRtReply(private val model: LiteRtModel, private val clock: Cl
             promptMs = (prefilled - sent).toDouble(),
             genMs = (ended - prefilled).toDouble(),
         )
+    }
+
+    /** LiteRT does not say when its prefill ends; the first chunk arriving is the earliest sign of it. */
+    private suspend fun FlowCollector<EngineEvent>.reportPrefill(promptTokens: Int, sent: Long): Long {
+        val firstChunkAt = clock.nowMillis()
+        emit(EngineEvent.Prefilled(promptTokens, (firstChunkAt - sent).toDouble()))
+        return firstChunkAt
     }
 
     /** Thinking first, as the model produced it before the answer; empty parts are not emitted. */

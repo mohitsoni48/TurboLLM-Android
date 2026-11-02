@@ -11,6 +11,7 @@ import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.GenerationParams
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.testing.FakeLiteRt
+import dev.turbollm.sdk.testing.pieces
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -139,7 +140,7 @@ class LiteRtLmEngineFakeRuntimeTest {
 
         val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
 
-        assertEquals(listOf(EngineEvent.Text("Hel"), EngineEvent.Text("lo")), events.dropLast(1))
+        assertEquals(listOf(EngineEvent.Text("Hel"), EngineEvent.Text("lo")), events.pieces())
         val done = events.last() as EngineEvent.Done
         assertEquals(FinishReason.STOP, done.reason)
         assertEquals(10, done.promptTokens)
@@ -159,13 +160,30 @@ class LiteRtLmEngineFakeRuntimeTest {
     }
 
     @Test
+    fun thePromptsTokensAndItsTimeToTheFirstChunkAreReportedBeforeTheFirstPiece() = runBlocking {
+        liteRt.chunks = listOf(LiteRtChunk(thought = "Hm."), LiteRtChunk(text = "Hi"))
+        liteRt.tokensBeforeReply = 10
+        liteRt.prefillMillis = 30
+        engine.load(spec())
+
+        val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
+
+        val expected = listOf(
+            EngineEvent.Prefilled(promptTokens = 10, promptMs = 30.0),
+            EngineEvent.Reasoning("Hm."),
+            EngineEvent.Text("Hi"),
+        )
+        assertEquals(expected, events.dropLast(1))
+    }
+
+    @Test
     fun anEmptyChunkIsNotEmitted() = runBlocking {
         liteRt.chunks = listOf(LiteRtChunk(), LiteRtChunk(text = "Hi"), LiteRtChunk(thought = ""))
         engine.load(spec())
 
         val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
 
-        assertEquals(listOf(EngineEvent.Text("Hi")), events.dropLast(1))
+        assertEquals(listOf(EngineEvent.Text("Hi")), events.pieces())
     }
 
     @Test
@@ -184,7 +202,7 @@ class LiteRtLmEngineFakeRuntimeTest {
             EngineEvent.Reasoning(" the user"),
             EngineEvent.Text("Yes."),
         )
-        assertEquals(expected, events.dropLast(1))
+        assertEquals(expected, events.pieces())
     }
 
     @Test
@@ -194,7 +212,7 @@ class LiteRtLmEngineFakeRuntimeTest {
 
         val events = withTimeout(WAIT_MILLIS) { engine.generate(QUESTION, UNSET).toList() }
 
-        assertEquals(listOf(EngineEvent.Reasoning("Done thinking."), EngineEvent.Text("Yes.")), events.dropLast(1))
+        assertEquals(listOf(EngineEvent.Reasoning("Done thinking."), EngineEvent.Text("Yes.")), events.pieces())
     }
 
     @Test

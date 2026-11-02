@@ -58,7 +58,12 @@ class TurboLLM private constructor(
     private val host: EngineHost = EngineHost(dependencies.engines, gate, sentinel) { previousUnload?.join() }
     private val store = ModelStore(modelRoot, dependencies.clock) { loadedModel()?.id }
     private val targets = LoadTargets(store, modelRoot, config.allowLoadByPath, cacheDir)
-    private val chatService = ChatService(ModelResolver(store, host, config.autoLoadOnRequest, cacheDir), gate, host)
+    private val chatService = ChatService(
+        ModelResolver(store, host, config.autoLoadOnRequest, cacheDir),
+        gate,
+        host,
+        dependencies.clock,
+    )
     private val localServer = LocalServer(dependencies.transport, dependencies.logger) { installRoutes(this) }
     private val serverLifecycle = Mutex()
     private val runningServer = MutableStateFlow<ServerHandle?>(null)
