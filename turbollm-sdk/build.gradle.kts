@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.time.Duration
 
 val allCpuVariants = "base;dotprod;i8mm"
 val debugCpuVariants = providers.gradleProperty("turbollmSdkAllVariants")
@@ -75,4 +76,8 @@ dependencies {
 
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
+}
+
+tasks.withType<Test>().configureEach {
+    timeout.set(Duration.ofMinutes(10))
 }
