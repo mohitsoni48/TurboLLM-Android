@@ -3,6 +3,7 @@ package dev.turbollm.sdk.chat
 import dev.turbollm.sdk.Backend
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.FinishReason
+import dev.turbollm.sdk.LoadOptions
 import dev.turbollm.sdk.ModelFormat
 import dev.turbollm.sdk.ModelRef
 import dev.turbollm.sdk.api.ChatCompletionMessage
@@ -22,10 +23,13 @@ import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.engine.LoadTarget
 import dev.turbollm.sdk.internal.Clock
 import dev.turbollm.sdk.internal.LoadSentinel
+import dev.turbollm.sdk.models.LoadTargets
 import dev.turbollm.sdk.models.ModelStore
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
 import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -42,6 +46,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -276,10 +281,36 @@ class ChatServiceTest {
     }
 
     @Test
+    fun theLoadedModelIsFoundByAPathThroughALinkedFolder() = runTest {
+        val real = temp.newFolder("real")
+        gguf(File(real, "models/o/r/m.gguf"))
+        val link = File(temp.root, "link")
+        assumeTrue("this platform cannot link folders", linkFolder(link, real))
+        val linkedPath = File(link, "models/o/r/m.gguf").absolutePath
+        val targets = LoadTargets(store, root, allowLoadByPath = true, cacheDir = File(root, "cache"))
+        llamaEngine = FakeEngine(listOf(Step.Emit(EngineEvent.Text("ok")), done(FinishReason.STOP)))
+        host.load(targets.of(ModelRef.File(linkedPath), LoadOptions()))
+
+        val reply = service(autoLoadOnRequest = false).complete(request(model = linkedPath))
+
+        assertEquals("ok", reply.choices.single().message.content)
+    }
+
+    @Test
     fun anUnknownModelIsNotFound() = runTest {
         val service = loadedService(done(FinishReason.STOP))
 
         val error = runCatching { service.complete(request(model = "org/repo/missing")) }.exceptionOrNull()
+
+        assertTrue("got $error", error is TurboLLMException.ModelNotFound)
+    }
+
+    @Test
+    fun anAbsolutePathToNoFileIsNotFound() = runTest {
+        val service = loadedService(done(FinishReason.STOP))
+
+        val error = runCatching { service.complete(request(model = File(root, "missing.gguf").absolutePath)) }
+            .exceptionOrNull()
 
         assertTrue("got $error", error is TurboLLMException.ModelNotFound)
     }
@@ -382,12 +413,13 @@ class ChatServiceTest {
 
     private fun done(reason: FinishReason) = Step.Emit(EngineEvent.Done(reason, 1, 1, 1.0, 1.0))
 
-    private fun gguf(relative: String) = write(relative, "GGUF", ONE_MIB)
+    private fun gguf(relative: String) = gguf(File(root, relative))
 
-    private fun litertlm(relative: String) = write(relative, "LITERTLM", 64)
+    private fun gguf(file: File) = write(file, "GGUF", ONE_MIB)
 
-    private fun write(relative: String, magic: String, size: Int): File {
-        val file = File(root, relative)
+    private fun litertlm(relative: String) = write(File(root, relative), "LITERTLM", 64)
+
+    private fun write(file: File, magic: String, size: Int): File {
         checkNotNull(file.parentFile).mkdirs()
         file.outputStream().use { out ->
             val magicBytes = magic.toByteArray(Charsets.US_ASCII)
@@ -395,6 +427,17 @@ class ChatServiceTest {
             out.write(ByteArray(size - magicBytes.size))
         }
         return file
+    }
+
+    private fun linkFolder(link: File, target: File): Boolean =
+        runCatching { Files.createSymbolicLink(link.toPath(), target.toPath()) }.isSuccess ||
+            junctionOnWindows(link, target)
+
+    /** Windows without Developer Mode refuses symlinks, but any user may make a junction, and toRealPath resolves it. */
+    private fun junctionOnWindows(link: File, target: File): Boolean {
+        if (!System.getProperty("os.name").orEmpty().startsWith("Windows")) return false
+        val mklink = ProcessBuilder("cmd", "/c", "mklink", "/J", link.path, target.path).redirectErrorStream(true).start()
+        return mklink.waitFor(30, TimeUnit.SECONDS) && mklink.exitValue() == 0
     }
 
     private companion object {

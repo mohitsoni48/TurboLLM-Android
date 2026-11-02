@@ -15,7 +15,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Finds the model a chat request names (architecture §4.2): the loaded model by its id or absolute path; else
+ * Finds the model a chat request names (architecture §4.2): the loaded model by its id or absolute path (also
+ * through a symlink, since a loaded model's path is its real path and `/data/user/0` links to `/data/data`); else
  * an installed, complete model, loaded first when [autoLoadOnRequest] is on and `ModelNotLoaded` otherwise;
  * else `ModelNotFound`.
  */
@@ -27,8 +28,15 @@ internal class ModelResolver(
 ) {
     suspend fun resolve(model: String): LoadedModel = loadedModelNamed(model) ?: loadOnRequest(installedModel(model))
 
-    private fun loadedModelNamed(model: String): LoadedModel? =
-        (host.state.value as? EngineState.Ready)?.model?.takeIf { model == it.id || model == it.path }
+    private suspend fun loadedModelNamed(model: String): LoadedModel? {
+        val loaded = (host.state.value as? EngineState.Ready)?.model ?: return null
+        return loaded.takeIf { model == it.id || model == it.path || realPathOf(model) == it.path }
+    }
+
+    private suspend fun realPathOf(model: String): String? {
+        if (!File(model).isAbsolute) return null
+        return withContext(Dispatchers.IO) { runCatching { File(model).toPath().toRealPath().toString() }.getOrNull() }
+    }
 
     private suspend fun installedModel(id: String): InstalledModel {
         val installed = withContext(Dispatchers.IO) { store.list() }.firstOrNull { it.id == id && it.complete }
