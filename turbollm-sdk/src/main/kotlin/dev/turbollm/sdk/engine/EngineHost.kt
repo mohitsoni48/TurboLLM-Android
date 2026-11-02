@@ -91,7 +91,11 @@ internal class EngineHost(
         publishedState.value = EngineState.Loading(target.ref)
     }
 
-    /** Runs a load whose lifecycle [claimLoad] holds, and releases it however the load ends. */
+    /**
+     * Runs a load whose lifecycle [claimLoad] holds, and releases it however the load ends. Any failure but a
+     * cancellation or a [VirtualMachineError] is published and thrown as a [TurboLLMException], so a background
+     * load never takes the process down.
+     */
     private suspend fun loadClaimed(target: LoadTarget): LoadedModel {
         try {
             unloadCurrent()
@@ -99,13 +103,26 @@ internal class EngineHost(
             publishedState.value = EngineState.Ready(model, busy = gate.busy, queued = gate.queued)
             return model
         } catch (failure: TurboLLMException) {
-            publishedState.value = EngineState.Failed(target.ref, failure)
-            throw failure
+            throw failed(target, failure)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            throw failed(target, loadFailureOf(failure))
+        } catch (failure: LinkageError) {
+            throw failed(target, loadFailureOf(failure))
         } finally {
             if (publishedState.value is EngineState.Loading) publishedState.value = EngineState.Idle
             lifecycle.unlock()
         }
     }
+
+    private fun failed(target: LoadTarget, failure: TurboLLMException): TurboLLMException {
+        publishedState.value = EngineState.Failed(target.ref, failure)
+        return failure
+    }
+
+    private fun loadFailureOf(cause: Throwable) =
+        TurboLLMException.ModelLoadFailed(cause.message ?: cause.javaClass.simpleName, cause)
 
     private suspend fun loadEngine(target: LoadTarget): LoadedEngine {
         val engine = registry.engineFor(target.format)
@@ -113,14 +130,14 @@ internal class EngineHost(
     }
 
     private suspend fun loadUnderSentinel(engine: Engine, target: LoadTarget): LoadedEngine {
-        sentinel.write(target.spec.path)
+        val marked = sentinel.write(target.spec.path)
         var succeeded = false
         try {
             val info = engine.load(target.spec)
             succeeded = true
             return LoadedEngine(engine, target.loadedModel(engine.kind, info))
         } finally {
-            sentinel.clear()
+            if (marked) sentinel.clear()
             if (!succeeded) engine.close()
         }
     }

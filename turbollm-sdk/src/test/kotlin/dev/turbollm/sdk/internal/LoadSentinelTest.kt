@@ -6,6 +6,7 @@ import kotlinx.serialization.json.buildJsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -26,6 +27,18 @@ class LoadSentinelTest {
 
         val expected = buildJsonObject { put("path", JsonPrimitive(model.absolutePath)) }
         assertEquals(expected, sdkJson.parseToJsonElement(sentinelFile.readText()))
+    }
+
+    @Test
+    fun aSentinelThatCannotBeWrittenIsReportedAsNotWritten() {
+        File(modelRoot, ".turbollm-sdk").writeText("a file where the sentinel folder belongs")
+
+        assertFalse(LoadSentinel(modelRoot).write(File(modelRoot, "m.gguf")))
+    }
+
+    @Test
+    fun aWrittenSentinelIsReportedAsWritten() {
+        assertTrue(LoadSentinel(modelRoot).write(File(modelRoot, "m.gguf")))
     }
 
     @Test

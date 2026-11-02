@@ -12,9 +12,11 @@ import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
 import java.io.File
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -156,6 +158,46 @@ class EngineHostTest {
     }
 
     @Test
+    fun aSentinelThatCannotBeWrittenNeverStopsTheLoad() = runTest {
+        File(modelRoot, ".turbollm-sdk").writeText("a file where the sentinel folder belongs")
+        val host = hostOf(FakeEngine())
+        val uncaught = mutableListOf<Throwable>()
+
+        host.loadInBackground(target("org/repo/a"), recordingScope(uncaught))
+        advanceUntilIdle()
+
+        assertEquals("org/repo/a", (host.state.value as EngineState.Ready).model.id)
+        assertEquals(emptyList<Throwable>(), uncaught)
+    }
+
+    @Test
+    fun aLoadThatCannotLinkItsNativeCodeEndsFailedAndNothingEscapes() = runTest {
+        val linkFailure = UnsatisfiedLinkError("no libturbollm-llama.so")
+        val host = hostOf(FakeEngine(loadFailure = linkFailure))
+        val target = target("org/repo/a")
+        val uncaught = mutableListOf<Throwable>()
+
+        host.loadInBackground(target, recordingScope(uncaught))
+        advanceUntilIdle()
+
+        val failure = (host.state.value as EngineState.Failed).error
+        assertTrue("got $failure", failure is TurboLLMException.ModelLoadFailed)
+        assertSame(linkFailure, failure.cause)
+        assertEquals(emptyList<Throwable>(), uncaught)
+    }
+
+    @Test
+    fun aLoadThatThrowsAPlainExceptionIsThrownToTheCallerAsModelLoadFailed() = runTest {
+        val crash = IllegalStateException("engine state")
+        val host = hostOf(FakeEngine(loadFailure = crash))
+
+        val thrown = runCatching { host.load(target("org/repo/a")) }.exceptionOrNull()
+
+        assertTrue("got $thrown", thrown is TurboLLMException.ModelLoadFailed)
+        assertSame(crash, thrown?.cause)
+    }
+
+    @Test
     fun aBackgroundLoadInACancelledScopeStillReleasesTheLifecycle() = runTest {
         val host = hostOf(FakeEngine(loadPauseMillis = 100), FakeEngine())
         val cancelledScope = CoroutineScope(Job().apply { cancel() } + StandardTestDispatcher(testScheduler))
@@ -233,6 +275,10 @@ class EngineHostTest {
         )
         return EngineHost(registry, gate, LoadSentinel(modelRoot))
     }
+
+    private fun TestScope.recordingScope(uncaught: MutableList<Throwable>) = CoroutineScope(
+        SupervisorJob() + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, e -> uncaught += e },
+    )
 
     private fun target(id: String, format: ModelFormat = ModelFormat.GGUF) = LoadTarget(
         ref = ModelRef.Installed(id),
