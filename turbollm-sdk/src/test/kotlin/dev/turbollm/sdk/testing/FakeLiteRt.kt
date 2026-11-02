@@ -9,6 +9,8 @@ import dev.turbollm.sdk.engine.litert.LiteRtPrompt
 import dev.turbollm.sdk.engine.litert.LiteRtRuntime
 import dev.turbollm.sdk.internal.Clock
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
@@ -34,6 +36,10 @@ internal class FakeLiteRt(val clock: SteppingClock = SteppingClock()) : LiteRtRu
     var failureOnCancel: Exception? = null
     var cancelFailure: Exception? = null
 
+    /** When set, [open] blocks the engine thread until it is counted down, as a slow native initialise does. */
+    var openGate: CountDownLatch? = null
+    val openStarted = CountDownLatch(1)
+
     val calls: MutableList<Call> = CopyOnWriteArrayList()
     val opened: MutableList<LiteRtModelConfig> = CopyOnWriteArrayList()
     val conversations: MutableList<FakeConversation> = CopyOnWriteArrayList()
@@ -45,6 +51,8 @@ internal class FakeLiteRt(val clock: SteppingClock = SteppingClock()) : LiteRtRu
     override fun open(config: LiteRtModelConfig): LiteRtModel {
         record("open")
         opened += config
+        openStarted.countDown()
+        openGate?.let { check(it.await(GATE_SECONDS, TimeUnit.SECONDS)) { "The open gate was never opened." } }
         failureOn(config.backend)?.let { throw it }
         return FakeModel()
     }
@@ -114,6 +122,8 @@ internal class FakeLiteRt(val clock: SteppingClock = SteppingClock()) : LiteRtRu
         }
     }
 }
+
+private const val GATE_SECONDS = 10L
 
 internal class SteppingClock(start: Long = 1_000L) : Clock {
     private val now = AtomicLong(start)

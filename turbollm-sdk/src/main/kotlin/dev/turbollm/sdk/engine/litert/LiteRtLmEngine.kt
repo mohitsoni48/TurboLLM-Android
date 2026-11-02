@@ -48,8 +48,7 @@ internal class LiteRtLmEngine(
     override suspend fun load(spec: LoadSpec): EngineModelInfo {
         check(engineThread == null) { "This engine already holds a model." }
         val thread = newEngineThread().also { engineThread = it }
-        val opened = withContext(thread) { reportingFailureAsModelLoad { open(spec) } }
-        model = opened.model
+        val opened = withContext(thread) { reportingFailureAsModelLoad { openAndHold(spec) } }
         return EngineModelInfo(opened.config.maxTokens, null, opened.backend, opened.notes)
     }
 
@@ -72,6 +71,12 @@ internal class LiteRtLmEngine(
         thread.executor.execute(::closeModel)
         stop(thread)
     }
+
+    /**
+     * Holds the model on the engine thread, not on the caller's: a load cancelled while LiteRT initialises
+     * discards [withContext]'s result, and the model must still be there for [close] to free.
+     */
+    private fun openAndHold(spec: LoadSpec): OpenedModel = open(spec).also { model = it.model }
 
     private fun open(spec: LoadSpec): OpenedModel {
         val threads = spec.threads ?: defaultThreads()

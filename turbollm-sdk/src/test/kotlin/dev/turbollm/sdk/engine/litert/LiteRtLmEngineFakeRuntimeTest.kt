@@ -12,6 +12,8 @@ import dev.turbollm.sdk.engine.GenerationParams
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.testing.FakeLiteRt
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -353,6 +355,25 @@ class LiteRtLmEngineFakeRuntimeTest {
         engine.close()
         engineThread.join(WAIT_MILLIS)
 
+        assertEquals(1, liteRt.modelsClosed)
+        assertFalse(engineThread.isAlive)
+    }
+
+    @Test
+    fun aLoadCancelledWhileTheModelOpensLeavesThatModelForCloseToFree() = runBlocking {
+        val openMayFinish = CountDownLatch(1)
+        liteRt.openGate = openMayFinish
+        val loading = launch(Dispatchers.Default) { engine.load(spec()) }
+        assertTrue(liteRt.openStarted.await(WAIT_MILLIS, TimeUnit.MILLISECONDS))
+
+        loading.cancel()
+        openMayFinish.countDown()
+        loading.join()
+        val engineThread = liteRt.calls.first().thread
+        engine.close()
+        engineThread.join(WAIT_MILLIS)
+
+        assertTrue(loading.isCancelled)
         assertEquals(1, liteRt.modelsClosed)
         assertFalse(engineThread.isAlive)
     }
