@@ -27,12 +27,14 @@ import kotlinx.coroutines.sync.withLock
 /**
  * The only holder of the live [Engine] (one model in M1). Load and unload are serialised; a load that finds
  * another load or unload running is refused with [TurboLLMException.LoadInProgress]. Unloading cancels any
- * in-flight generation, then waits for the [GenerationGate] before the engine unloads.
+ * in-flight generation, then waits for the [GenerationGate] before the engine unloads. Every load first awaits
+ * [awaitPrevious] (a closed core's unload still running), so only one model is ever resident.
  */
 internal class EngineHost(
     private val registry: EngineRegistry,
     private val gate: GenerationGate,
     private val sentinel: LoadSentinel,
+    private val awaitPrevious: suspend () -> Unit = {},
 ) {
     private val lifecycle = Mutex()
     private val publishedState = MutableStateFlow<EngineState>(EngineState.Idle)
@@ -98,6 +100,7 @@ internal class EngineHost(
      */
     private suspend fun loadClaimed(target: LoadTarget): LoadedModel {
         try {
+            awaitPrevious()
             unloadCurrent()
             val model = loadEngine(target).model
             publishedState.value = EngineState.Ready(model, busy = gate.busy, queued = gate.queued)

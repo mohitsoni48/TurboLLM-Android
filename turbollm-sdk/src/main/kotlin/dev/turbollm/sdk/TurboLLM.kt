@@ -23,8 +23,11 @@ import dev.turbollm.sdk.server.ModelListing
 import dev.turbollm.sdk.server.OpenAiRoutes
 import io.ktor.server.routing.Route
 import java.io.Closeable
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
@@ -48,9 +51,11 @@ class TurboLLM private constructor(
     private val modelRoot = config.modelRoot.canonicalFile
     private val cacheDir = config.cacheDir ?: dependencies.defaultCacheDir
     private val scope = CoroutineScope(SupervisorJob() + dependencies.coreDispatcher)
+    private val unloadScope = CoroutineScope(SupervisorJob() + dependencies.coreDispatcher)
+    private val previousUnload: Job? = closing
     private val gate: GenerationGate = GenerationGate(config.maxQueuedRequests) { host.showOccupancy() }
     private val sentinel = LoadSentinel(modelRoot)
-    private val host: EngineHost = EngineHost(dependencies.engines, gate, sentinel)
+    private val host: EngineHost = EngineHost(dependencies.engines, gate, sentinel) { previousUnload?.join() }
     private val store = ModelStore(modelRoot, dependencies.clock) { loadedModel()?.id }
     private val targets = LoadTargets(store, modelRoot, config.allowLoadByPath, cacheDir)
     private val chatService = ChatService(ModelResolver(store, host, config.autoLoadOnRequest, cacheDir), gate, host)
@@ -61,11 +66,12 @@ class TurboLLM private constructor(
     private val closed = AtomicBoolean(false)
 
     /**
-     * The model a native load was loading when the previous process ended, read once when this core was
-     * created; else null. The process may have crashed, been quit or been killed during that load: nothing
-     * tells these apart, so a host should not reload that model automatically.
+     * The model a native load was loading when the previous process ended, read by the first core of this
+     * process for its model root; else null (a later core never reads a closing core's live record). The process
+     * may have crashed, been quit or been killed during that load: nothing tells these apart, so a host should
+     * not reload that model automatically.
      */
-    val interruptedLoad: String? = sentinel.consumeStale()
+    val interruptedLoad: String? = staleLoadOnce(modelRoot, sentinel)
 
     val state: StateFlow<EngineState> = host.state
 
@@ -96,14 +102,18 @@ class TurboLLM private constructor(
     /**
      * Stops the server, cancels in-flight work and pauses running downloads, then unloads the model in the
      * background: it never blocks on a generation that has to finish on the caller's own thread. Afterwards
-     * [getOrCreate] makes a fresh core.
+     * [getOrCreate] makes a fresh core, whose loads wait until this unload has ended.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        forget(this)
+        val unloading = unloadScope.launch(start = CoroutineStart.LAZY) {
+            previousUnload?.join()
+            host.unload()
+        }
+        retire(this, unloading)
         stopServerNow()
         scope.cancel()
-        CoroutineScope(dependencies.coreDispatcher).launch { host.unload() }
+        unloading.start()
     }
 
     private fun stopServerNow() {
@@ -146,6 +156,12 @@ class TurboLLM private constructor(
         @Volatile
         private var live: TurboLLM? = null
 
+        /** The unload of the last closed core; the next core's loads wait for it. */
+        @Volatile
+        private var closing: Job? = null
+
+        private val rootsReadForStaleLoads = mutableSetOf<File>()
+
         /**
          * Process singleton. A second call returns the same instance; a config that differs from the live one
          * is refused (IllegalStateException), so two parts of one app cannot silently disagree.
@@ -163,8 +179,13 @@ class TurboLLM private constructor(
                 live?.sharedWith(config) ?: TurboLLM(config, dependencies()).also { live = it }
             }
 
-        private fun forget(core: TurboLLM) = synchronized(lock) {
+        private fun retire(core: TurboLLM, unloading: Job) = synchronized(lock) {
             if (live === core) live = null
+            closing = unloading
+        }
+
+        private fun staleLoadOnce(modelRoot: File, sentinel: LoadSentinel): String? = synchronized(lock) {
+            if (rootsReadForStaleLoads.add(modelRoot)) sentinel.consumeStale() else null
         }
     }
 }

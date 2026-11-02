@@ -8,6 +8,7 @@ import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineModelInfo
 import dev.turbollm.sdk.engine.GenerationParams
 import dev.turbollm.sdk.engine.LoadSpec
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -24,6 +25,7 @@ internal class FakeEngine(
     private val loadFailure: Throwable? = null,
     override val kind: EngineKind = EngineKind.LLAMA_CPP,
     private val loadPauseMillis: Long = 0,
+    private val loadGate: CompletableDeferred<Unit>? = null,
 ) : Engine {
 
     sealed interface Step {
@@ -54,6 +56,7 @@ internal class FakeEngine(
         recordedLoads += spec
         recordedHistory += "load"
         delay(loadPauseMillis)
+        loadGate?.await()
         loadFailure?.let { throw it }
         return modelInfo
     }

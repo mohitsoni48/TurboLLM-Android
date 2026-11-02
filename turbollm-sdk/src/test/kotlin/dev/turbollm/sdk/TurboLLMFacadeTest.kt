@@ -24,12 +24,14 @@ import io.ktor.server.application.Application
 import io.ktor.server.testing.testApplication
 import java.io.File
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -63,10 +65,16 @@ class TurboLLMFacadeTest {
     private var engine = FakeEngine(listOf(Step.Emit(EngineEvent.Text("hi")), done()))
 
     private val config: TurboLLMConfig get() = TurboLLMConfig(modelRoot = folder.root)
+    private var scheduler: TestCoroutineScheduler? = null
 
+    /**
+     * Lets the closed core's unload finish on this test's scheduler, as a live dispatcher would: the next test's
+     * core waits for it before any load.
+     */
     @After
     fun closeTheLiveCore() {
         TurboLLM.currentOrNull()?.close()
+        scheduler?.advanceUntilIdle()
     }
 
     @Test
@@ -196,6 +204,67 @@ class TurboLLMFacadeTest {
         assertNull(create().interruptedLoad)
     }
 
+    /**
+     * C-6: close() returns before its unload ends. The next core must neither read the closing core's live
+     * sentinel as a crash nor load its own model while the closing core's model is still resident.
+     */
+    @Test
+    fun aCoreCreatedWhileTheClosedOneStillLoadsWaitsForItsUnloadAndReportsNoInterruptedLoad() =
+        runTest(timeout = 10.seconds) {
+            val closingLoad = CompletableDeferred<Unit>()
+            val closingEngine = FakeEngine(listOf(done()), loadGate = closingLoad)
+            val nextEngine = FakeEngine(listOf(done()), loadGate = CompletableDeferred())
+            gguf("x.gguf")
+            val y = gguf("y.gguf")
+            engine = closingEngine
+            val closing = create()
+            backgroundScope.launch { closing.load(ModelRef.Installed("x")) }
+            closing.state.first { it is EngineState.Loading }
+            runCurrent()
+
+            closing.close()
+            engine = nextEngine
+            val next = create()
+            backgroundScope.launch { next.load(ModelRef.Installed("y")) }
+            next.state.first { it is EngineState.Loading }
+            runCurrent()
+
+            assertNull(next.interruptedLoad)
+            assertTrue("the next load began while the closed model was resident", nextEngine.loads.isEmpty())
+            closingLoad.complete(Unit)
+            runCurrent()
+            assertEquals(listOf("load", "unload", "close"), closingEngine.history)
+            assertEquals(1, nextEngine.loads.size)
+            assertEquals(y.canonicalPath, LoadSentinel(folder.root).consumeStale())
+        }
+
+    @Test
+    fun aCoreClosedBeforeItLoadsStillPassesTheEarlierUnloadOnToTheNextCore() = runTest(timeout = 10.seconds) {
+        val firstLoad = CompletableDeferred<Unit>()
+        val firstEngine = FakeEngine(listOf(done()), loadGate = firstLoad)
+        val thirdEngine = FakeEngine(listOf(done()))
+        gguf("x.gguf")
+        gguf("y.gguf")
+        engine = firstEngine
+        val first = create()
+        backgroundScope.launch { first.load(ModelRef.Installed("x")) }
+        first.state.first { it is EngineState.Loading }
+        runCurrent()
+
+        first.close()
+        create().close()
+        engine = thirdEngine
+        val third = create()
+        backgroundScope.launch { third.load(ModelRef.Installed("y")) }
+        third.state.first { it is EngineState.Loading }
+        runCurrent()
+
+        assertTrue("the third load began while the first model was resident", thirdEngine.loads.isEmpty())
+        firstLoad.complete(Unit)
+        runCurrent()
+        assertEquals(1, thirdEngine.loads.size)
+    }
+
     /** G-9: a Quit kills the process mid-load, so the load's own cleanup never runs. The next process must see it. */
     @Test
     fun aLoadTheProcessEndsDuringIsLeftForTheNextProcessAsInterrupted() = runTest(timeout = 10.seconds) {
@@ -248,6 +317,7 @@ class TurboLLMFacadeTest {
         config: TurboLLMConfig = this@TurboLLMFacadeTest.config,
         fetcher: HttpFetcher = NeverAnsweringFetcher(),
     ): TurboLLM {
+        scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dependencies = TurboLLMDependencies(
             engines = EngineRegistry(llamaCpp = EngineFactory(::nextEngine), liteRtLm = EngineFactory(::nextEngine)),

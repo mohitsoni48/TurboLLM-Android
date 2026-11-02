@@ -23,9 +23,12 @@ class LoadSentinelTest {
     fun aWrittenSentinelNamesTheModelsAbsolutePath() {
         val model = File(modelRoot, "org/repo/m.gguf")
 
-        LoadSentinel(modelRoot).write(model)
+        LoadSentinel(modelRoot, owner = "core-a").write(model)
 
-        val expected = buildJsonObject { put("path", JsonPrimitive(model.absolutePath)) }
+        val expected = buildJsonObject {
+            put("path", JsonPrimitive(model.absolutePath))
+            put("owner", JsonPrimitive("core-a"))
+        }
         assertEquals(expected, sdkJson.parseToJsonElement(sentinelFile.readText()))
     }
 
@@ -49,6 +52,19 @@ class LoadSentinelTest {
         sentinel.clear()
 
         assertFalse(sentinelFile.exists())
+    }
+
+    @Test
+    fun aCoreNeverClearsTheSentinelAnotherCoreWrote() {
+        val earlier = LoadSentinel(modelRoot, owner = "core-a")
+        val later = LoadSentinel(modelRoot, owner = "core-b")
+        val laterModel = File(modelRoot, "y.gguf")
+        earlier.write(File(modelRoot, "x.gguf"))
+        later.write(laterModel)
+
+        earlier.clear()
+
+        assertEquals(laterModel.absolutePath, LoadSentinel(modelRoot).consumeStale())
     }
 
     @Test
