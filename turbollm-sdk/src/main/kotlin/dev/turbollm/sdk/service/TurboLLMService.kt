@@ -119,16 +119,18 @@ open class TurboLLMService : Service() {
         @Volatile
         var defaultConfig: TurboLLMConfig? = null
 
-        fun start(context: Context) {
-            val intent = serviceIntent(context)
+        /** Starts [service], the class the host's manifest declares: this one, or the host's own subclass. */
+        fun start(context: Context, service: Class<out TurboLLMService> = TurboLLMService::class.java) {
+            val intent = serviceIntent(context, service)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
         }
 
-        fun stop(context: Context) {
-            context.stopService(serviceIntent(context))
+        /** Stops [service], the same class [start] was given. */
+        fun stop(context: Context, service: Class<out TurboLLMService> = TurboLLMService::class.java) {
+            context.stopService(serviceIntent(context, service))
         }
 
-        private fun serviceIntent(context: Context) = Intent(context, TurboLLMService::class.java)
+        internal fun serviceIntent(context: Context, service: Class<out TurboLLMService>) = Intent(context, service)
     }
 }

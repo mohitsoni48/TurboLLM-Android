@@ -19,5 +19,7 @@ permissions in your app's manifest:
 </application>
 ```
 
-A subclass is declared by its own class name instead. A `specialUse` service needs a Play Console
+A subclass is declared by its own class name instead, and started and stopped by that class:
+`TurboLLMService.start(context, MyService::class.java)` and `TurboLLMService.stop(context, MyService::class.java)`.
+A `specialUse` service needs a Play Console
 foreground-service declaration for your app.
