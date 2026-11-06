@@ -30,6 +30,14 @@ import kotlinx.coroutines.selects.select
 private const val DONE_DATA = "[DONE]"
 private const val PING_FRAME = ": ping\n\n"
 private const val PROBE_FRAME = ":\n\n"
+
+/**
+ * How long a stream may stay silent before [SseWriter] probes the client. CIO notices a closed socket only some
+ * four to six writes after the close, so 25 ms puts that inside about 150-200 ms (measured over loopback):
+ * well inside the 500 ms bound for freeing the gate during a prefill and the 1 s bound during generation, with
+ * room for a slow phone. 50 ms measured 310-330 ms, too close to 500 ms once a client's own polling is added.
+ * The price is one 3-byte comment (8 bytes on the wire) per 25 ms of silence.
+ */
 internal val LIVENESS_PROBE_INTERVAL = 25.milliseconds
 private val ROLE_ONLY_DELTA = ChunkDelta(role = ChatRole.ASSISTANT)
 
@@ -46,8 +54,13 @@ internal fun Flow<ChatCompletionChunk>.asStreamEvents(): Flow<StreamEvent> =
         .catch { failure -> emit(StreamEvent.Failure(failure.asReplyFailure())) }
 
 /**
- * The events with a [StreamEvent.Ping] every [interval] while the request is queued, loading or prefilling
- * (ADR-347: proxies and clients drop a silent connection). Pings stop at the first generated event.
+ * The events with a [StreamEvent.Ping] every [interval] while the request is queued, loading or prefilling.
+ * Pings stop at the first generated event.
+ *
+ * The ping and [SseWriter]'s liveness probe do different jobs. The ping is the visible keep-alive of ADR-347,
+ * `: ping`, for clients and proxies that watch for it before they give up on a slow first token. The probe is
+ * an empty `:` comment that exists only so the server finds a client that left (QA E-10, E-12); it also keeps
+ * the connection from ever being silent, but nothing should rely on that.
  */
 internal fun Flow<StreamEvent>.withKeepAlive(interval: Duration): Flow<StreamEvent> = channelFlow {
     val pinger = launch { pingEvery(interval) }
@@ -59,8 +72,9 @@ internal fun Flow<StreamEvent>.withKeepAlive(interval: Duration): Flow<StreamEve
 }
 
 /**
- * Writes one reply as Server-Sent Events: `data: <json>` frames, `: ping` comments, and `data: [DONE]` last. The
- * status line is already sent, so a failure travels as a `data: {"error":{...}}` event.
+ * Writes one reply as Server-Sent Events: `data: <json>` frames, `: ping` comments, empty `:` liveness probes,
+ * and `data: [DONE]` last. The status line is already sent, so a failure travels as a `data: {"error":{...}}`
+ * event.
  */
 internal class SseWriter(
     private val channel: ByteWriteChannel,
