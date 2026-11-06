@@ -7,6 +7,7 @@ import dev.turbollm.sdk.api.toErrorBody
 import dev.turbollm.sdk.internal.sdkJson
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.header
@@ -14,6 +15,7 @@ import io.ktor.server.response.respondText
 import kotlinx.serialization.json.JsonNull
 
 private const val TRANSPORT_ERROR_TYPE = "invalid_request_error"
+private const val EMBEDDINGS_PATH = "/v1/embeddings"
 
 /** An error the server answers with: a status, the OpenAI error envelope and, for a busy server, `Retry-After`. */
 internal class ErrorReply(val status: HttpStatusCode, val body: ErrorBody, val retryAfterSeconds: Int? = null)
@@ -36,6 +38,16 @@ internal suspend fun ApplicationCall.respondError(reply: ErrorReply) {
     reply.retryAfterSeconds?.let { response.header(HttpHeaders.RetryAfter, it) }
     respondText(sdkJson.encodeToString(ErrorBody.serializer(), reply.body), ContentType.Application.Json, reply.status)
 }
+
+/** A call no route answered (QA B-08): Ktor's own 404 has an empty body, which OpenAI clients cannot read. */
+internal fun noEndpointFor(method: HttpMethod, path: String): ErrorReply = transportRefusal(
+    404,
+    "not_found",
+    when (path) {
+        EMBEDDINGS_PATH -> "This server does not serve embeddings, only chat completions."
+        else -> "This server has no endpoint ${method.value} $path."
+    },
+)
 
 private fun transportRefusal(status: Int, code: String, message: String) = ErrorReply(
     status = HttpStatusCode.fromValue(status),

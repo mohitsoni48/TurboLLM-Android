@@ -30,6 +30,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.contentType
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -174,6 +175,27 @@ class OpenAiRoutesTest {
 
         assertEquals(HttpStatusCode.BadRequest, response.status)
         assertEquals("unsupported_parameter", errorCode(response))
+    }
+
+    @Test
+    fun embeddingsAreRefusedWithAnOpenAiErrorSayingTheyAreNotServed() = routesTest {
+        val response = authorizedPost("/v1/embeddings", """{"model":"$MODEL_ID","input":"hi"}""")
+
+        assertEquals(HttpStatusCode.NotFound, response.status)
+        assertEquals(ContentType.Application.Json, response.contentType()?.withoutParameters())
+        val expected = """{"error":{"message":"This server does not serve embeddings, only chat completions.",""" +
+            """"type":"invalid_request_error","param":null,"code":"not_found"}}"""
+        assertEquals(expected, response.bodyAsText())
+    }
+
+    @Test
+    fun anEndpointTheServerDoesNotHaveIsAnOpenAiShapedNotFound() = routesTest {
+        val response = authorizedGet("/v1/nothing-here")
+
+        assertEquals(HttpStatusCode.NotFound, response.status)
+        val expected = """{"error":{"message":"This server has no endpoint GET /v1/nothing-here.",""" +
+            """"type":"invalid_request_error","param":null,"code":"not_found"}}"""
+        assertEquals(expected, response.bodyAsText())
     }
 
     /**
