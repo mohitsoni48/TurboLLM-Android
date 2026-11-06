@@ -77,6 +77,9 @@ private const val ONE_MIB = 1024 * 1024
 private const val DONE_FRAME = "data: [DONE]\n\n"
 private val COMPLETION_ID = Regex("chatcmpl-[0-9a-f]{24}")
 
+/** These tests assert exact frames; a client leaving is covered over a real socket in ClientDisconnectOverSocketTest. */
+private val NO_LIVENESS_PROBES = Duration.INFINITE
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class OpenAiRoutesTest {
 
@@ -326,7 +329,7 @@ class OpenAiRoutesTest {
         keepAlive: Duration = 15.seconds,
         block: suspend ApplicationTestBuilder.() -> Unit,
     ) = testApplication {
-        val routes = OpenAiRoutes(chat, ModelListing(store) { host.state.value }, keepAlive)
+        val routes = OpenAiRoutes(chat, ModelListing(store) { host.state.value }, keepAlive, NO_LIVENESS_PROBES)
         application {
             installLocalServer(RequestPolicy(BearerAuth(TOKEN)) { PRETEND_BOUND_PORT }) { routes.install(this) }
         }

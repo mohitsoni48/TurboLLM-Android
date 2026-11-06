@@ -38,6 +38,7 @@ internal class OpenAiRoutes(
     private val chat: ChatService,
     private val listing: ModelListing,
     private val keepAliveInterval: Duration = KEEP_ALIVE_INTERVAL,
+    private val probeInterval: Duration = LIVENESS_PROBE_INTERVAL,
 ) {
     fun install(route: Route) {
         route.get(MODELS_PATH) { call.respondJson(ModelList.serializer(), listing.current()) }
@@ -69,7 +70,7 @@ internal class OpenAiRoutes(
         val events = replyEvents(request).produceIn(this)
         when (val first = events.receiveCatching().getOrNull()) {
             is StreamEvent.Failure -> respondError(first.error.toErrorReply())
-            else -> respondEventStream(first, events)
+            else -> respondEventStream(first, events, probeInterval)
         }
     }
 
@@ -77,9 +78,13 @@ internal class OpenAiRoutes(
         chat.stream(request).asStreamEvents().withKeepAlive(keepAliveInterval)
 }
 
-private suspend fun ApplicationCall.respondEventStream(first: StreamEvent?, rest: ReceiveChannel<StreamEvent>) {
+private suspend fun ApplicationCall.respondEventStream(
+    first: StreamEvent?,
+    rest: ReceiveChannel<StreamEvent>,
+    probeInterval: Duration,
+) {
     response.header(HttpHeaders.CacheControl, NO_CACHE)
-    respondBytesWriter(ContentType.Text.EventStream) { SseWriter(this).relay(first, rest) }
+    respondBytesWriter(ContentType.Text.EventStream) { SseWriter(this, probeInterval).relay(first, rest) }
 }
 
 private suspend fun <T> ApplicationCall.respondJson(serializer: KSerializer<T>, value: T) =
