@@ -9,6 +9,8 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.content.TextContent
+import io.ktor.http.withCharset
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.header
 import io.ktor.server.response.respondText
@@ -36,18 +38,30 @@ internal fun TurboLLMException.toErrorReply(): ErrorReply = ErrorReply(
 
 internal suspend fun ApplicationCall.respondError(reply: ErrorReply) {
     reply.retryAfterSeconds?.let { response.header(HttpHeaders.RetryAfter, it) }
-    respondText(sdkJson.encodeToString(ErrorBody.serializer(), reply.body), ContentType.Application.Json, reply.status)
+    respondText(reply.encodedBody(), ContentType.Application.Json, reply.status)
 }
 
-/** A call no route answered (QA B-08): Ktor's own 404 has an empty body, which OpenAI clients cannot read. */
-internal fun noEndpointFor(method: HttpMethod, path: String): ErrorReply = transportRefusal(
-    404,
-    "not_found",
-    when (path) {
-        EMBEDDINGS_PATH -> "This server does not serve embeddings, only chat completions."
-        else -> "This server has no endpoint ${method.value} $path."
-    },
-)
+/** The reply as content, for a reply already on its way out; the same JSON and type [respondError] sends. */
+internal fun ErrorReply.asTextContent() =
+    TextContent(encodedBody(), ContentType.Application.Json.withCharset(Charsets.UTF_8), status)
+
+private fun ErrorReply.encodedBody(): String = sdkJson.encodeToString(ErrorBody.serializer(), body)
+
+/**
+ * A call no route answered, with the [status] routing resolved (QA B-08): Ktor's own reply has an empty body,
+ * which OpenAI clients cannot read.
+ */
+internal fun unroutedCallReply(status: HttpStatusCode, method: HttpMethod, path: String): ErrorReply =
+    when (status) {
+        HttpStatusCode.MethodNotAllowed ->
+            transportRefusal(status.value, "method_not_allowed", "$path does not accept ${method.value}.")
+        else -> transportRefusal(status.value, "not_found", noEndpointMessage(method, path))
+    }
+
+private fun noEndpointMessage(method: HttpMethod, path: String): String = when (path) {
+    EMBEDDINGS_PATH -> "This server does not serve embeddings, only chat completions."
+    else -> "This server has no endpoint ${method.value} $path."
+}
 
 private fun transportRefusal(status: Int, code: String, message: String) = ErrorReply(
     status = HttpStatusCode.fromValue(status),

@@ -189,6 +189,28 @@ class OpenAiRoutesTest {
     }
 
     @Test
+    fun aWrongMethodOnARealEndpointIsAnOpenAiShapedMethodNotAllowed() = routesTest {
+        val response = authorizedGet("/v1/chat/completions")
+
+        assertEquals(HttpStatusCode.MethodNotAllowed, response.status)
+        val expected = """{"error":{"message":"/v1/chat/completions does not accept GET.",""" +
+            """"type":"invalid_request_error","param":null,"code":"method_not_allowed"}}"""
+        assertEquals(expected, response.bodyAsText())
+    }
+
+    @Test
+    fun anUnknownEndpointWithoutTheBearerIsStillUnauthorized() = routesTest {
+        val response = client.post("/v1/embeddings") {
+            header(HttpHeaders.Host, "127.0.0.1:$PRETEND_BOUND_PORT")
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            setBody("{}")
+        }
+
+        assertEquals(HttpStatusCode.Unauthorized, response.status)
+        assertEquals("invalid_api_key", errorCode(response))
+    }
+
+    @Test
     fun anEndpointTheServerDoesNotHaveIsAnOpenAiShapedNotFound() = routesTest {
         val response = authorizedGet("/v1/nothing-here")
 
