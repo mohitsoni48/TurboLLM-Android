@@ -20,6 +20,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -384,6 +385,17 @@ class LlamaCppEngineFakeNativeTest {
     }
 
     @Test
+    fun aReplyEndedByAnUnloadDoesNotAbortItsFreedSessionAgain() = runBlocking {
+        engine.load(spec())
+        val reply = startAPrefillThatOnlyAnAbortEnds()
+
+        engine.unload()
+        withTimeout(PROMPT_MILLIS) { reply.join() }
+
+        assertEquals(listOf("requestAbort", "prefill ended", "freeSession"), llama.lifecycle)
+    }
+
+    @Test
     fun closingDuringAPrefillAbortsItAndFreesTheSessionOnlyOnceThePrefillHasEnded() = runBlocking {
         engine.load(spec())
         val engineThread = llama.calls.first().thread
@@ -439,10 +451,11 @@ class LlamaCppEngineFakeNativeTest {
     private fun loaded() = runBlocking { engine.load(spec()) }
 
     /** A reply whose prefill, like a long real one, returns only once the native abort flag is set. */
-    private suspend fun startAPrefillThatOnlyAnAbortEnds() {
+    private suspend fun startAPrefillThatOnlyAnAbortEnds(): Job {
         llama.prefillWaitsForAbort = true
-        background.launch { runCatching { engine.generate(QUESTION, PARAMS).toList() } }
+        val reply = background.launch { runCatching { engine.generate(QUESTION, PARAMS).toList() } }
         withContext(Dispatchers.IO) { llama.prefillStarted.await(5, TimeUnit.SECONDS) }
+        return reply
     }
 
     private fun generateAll() = runBlocking { engine.generate(QUESTION, PARAMS).toList() }

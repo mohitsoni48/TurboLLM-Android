@@ -118,7 +118,9 @@ internal class LlamaCppEngine(
     /**
      * A prefill is one long native call that cannot see a coroutine cancel, so the native abort flag is set
      * from the cancelling thread itself: the unconfined watcher resumes there as soon as this scope is
-     * cancelled, without waiting for the engine thread. A reply that ends normally never sets the flag.
+     * cancelled, without waiting for the engine thread. A reply that ends normally never sets the flag, and
+     * neither does one that failed on its own: its native call has already returned, and an unload may have
+     * freed the session by the time the failure unwinds here.
      */
     private suspend fun abortingWhenCancelled(reply: LlamaReply, streaming: suspend () -> Unit) = coroutineScope {
         val replyEnded = AtomicBoolean(false)
@@ -129,7 +131,12 @@ internal class LlamaCppEngine(
                 if (!replyEnded.get()) reply.abort()
             }
         }
-        streaming()
+        try {
+            streaming()
+        } catch (failure: Exception) {
+            if (failure !is CancellationException) replyEnded.set(true)
+            throw failure
+        }
         replyEnded.set(true)
         watcher.cancel()
     }
