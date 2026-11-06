@@ -21,7 +21,7 @@ internal data class LiteRtSampler(val topK: Int, val topP: Double, val temperatu
 
 /**
  * One request as LiteRT-LM takes it (architecture §2.7): a fresh conversation seeded with [systemInstruction]
- * and [history], to which [userTurn] is then sent.
+ * and [history], to which [userTurn] is then sent. [enableThinking] false asks a thinking model not to think.
  */
 internal data class LiteRtPrompt(
     val systemInstruction: String?,
@@ -29,6 +29,7 @@ internal data class LiteRtPrompt(
     val userTurn: String,
     val sampler: LiteRtSampler,
     val maxOutputTokens: Int?,
+    val enableThinking: Boolean,
 ) {
     companion object {
         /** Throws `invalid_last_message` unless the final message is the user's: that is the turn LiteRT answers. */
@@ -41,6 +42,7 @@ internal data class LiteRtPrompt(
                 userTurn = userTurn.text(),
                 sampler = samplerOf(params),
                 maxOutputTokens = params.maxTokens,
+                enableThinking = params.enableThinking,
             )
         }
     }

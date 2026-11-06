@@ -7,8 +7,10 @@ import dev.turbollm.sdk.api.MessageContent
 import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.engine.GenerationParams
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** How an OpenAI conversation becomes one LiteRT-LM conversation and its final user turn (architecture §2.7). */
@@ -92,6 +94,16 @@ class LiteRtMessagesTest {
     fun theMaxTokensBecomeTheMaxOutputTokens() {
         assertEquals(16, LiteRtPrompt.of(listOf(user("Hi")), UNSET.copy(maxTokens = 16)).maxOutputTokens)
         assertNull(LiteRtPrompt.of(listOf(user("Hi")), UNSET).maxOutputTokens)
+    }
+
+    @Test
+    fun aRequestThatTurnsThinkingOffAsksLiteRtForNoThinking() {
+        assertFalse(LiteRtPrompt.of(listOf(user("Hi")), UNSET.copy(enableThinking = false)).enableThinking)
+    }
+
+    @Test
+    fun thinkingStaysOnUnlessTheRequestTurnsItOff() {
+        assertTrue(LiteRtPrompt.of(listOf(user("Hi")), UNSET).enableThinking)
     }
 
     private fun system(text: String) = ChatMessage(ChatRole.SYSTEM, MessageContent.Text(text))

@@ -6,6 +6,7 @@ import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.ThinkingConfig
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.api.TurboLLMException
 import java.io.File
@@ -67,13 +68,18 @@ private class AarModel(private val engine: AarEngine) : LiteRtModel {
     override fun close() = engine.close()
 }
 
-private fun conversationConfigOf(prompt: LiteRtPrompt): ConversationConfig {
+/**
+ * Thinking off is LiteRT-LM's own [ThinkingConfig] (QA B-38). Thinking on passes none, so the model keeps the
+ * default it had before the SDK could turn thinking off.
+ */
+internal fun conversationConfigOf(prompt: LiteRtPrompt): ConversationConfig {
     val sampler = prompt.sampler
     return ConversationConfig(
         systemInstruction = prompt.systemInstruction?.let { Contents.of(it) },
         initialMessages = prompt.history.map(::messageOf),
         samplerConfig = SamplerConfig(sampler.topK, sampler.topP, sampler.temperature, sampler.seed),
         maxOutputToken = prompt.maxOutputTokens,
+        thinkingConfig = if (prompt.enableThinking) null else ThinkingConfig(enableThinking = false),
     )
 }
 
