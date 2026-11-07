@@ -60,6 +60,9 @@ internal class EngineCatalog(private val slots: List<EngineSlot>) {
     fun resolve(format: ModelFormat, requested: EngineId?): EngineSlot =
         if (requested == null) firstAvailableReaderOf(format) else pinned(requested, format)
 
+    /** The slot a resolved load names. */
+    fun slot(id: EngineId): EngineSlot = slots.firstOrNull { it.id == id } ?: throw unknownEngine(id)
+
     /** Called when an engine failed to start at runtime; it stays unavailable for the rest of the process. */
     fun markUnavailable(id: EngineId, reason: String) {
         runtimeFailures[id] = reason
@@ -73,7 +76,7 @@ internal class EngineCatalog(private val slots: List<EngineSlot>) {
     }
 
     private fun pinned(requested: EngineId, format: ModelFormat): EngineSlot {
-        val slot = slots.firstOrNull { it.id == requested } ?: throw unknownEngine(requested)
+        val slot = slot(requested)
         if (format !in slot.formats) throw slot.cannotRead(format)
         whyUnavailable(slot)?.let { throw slot.unavailableBecause(it) }
         return slot

@@ -1,6 +1,7 @@
 package dev.turbollm.sdk.server
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.FinishReason
 import dev.turbollm.sdk.ModelFormat
@@ -91,12 +92,11 @@ class OpenAiRoutesTest {
     private val outsideRoot: File by lazy { temp.newFolder("elsewhere") }
     private val gate = GenerationGate(maxQueuedRequests = 1)
     private var engine = FakeEngine()
-    private val host by lazy {
-        EngineHost(testCatalog(llamaCpp = { engine }, liteRtLm = { engine }), gate, LoadSentinel(root))
-    }
+    private val catalog = testCatalog(llamaCpp = { engine }, liteRtLm = { engine })
+    private val host by lazy { EngineHost(catalog, gate, LoadSentinel(root)) }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
     private val chat by lazy {
-        val resolver = ModelResolver(store, host, autoLoadOnRequest = false, cacheDir = File(root, "cache"))
+        val resolver = ModelResolver(store, host, autoLoadOnRequest = false, cacheDir = File(root, "cache"), catalog)
         ChatService(resolver, gate, host, epochSeconds = { CREATED })
     }
 
@@ -391,6 +391,7 @@ class OpenAiRoutesTest {
         id = id,
         format = ModelFormat.GGUF,
         spec = LoadSpec(file, contextSize = null, threads = null, Backend.AUTO, File(root, "cache")),
+        engine = EngineId.LLAMA_CPP_CPU,
     )
 
     private suspend fun ApplicationTestBuilder.chatRequest(

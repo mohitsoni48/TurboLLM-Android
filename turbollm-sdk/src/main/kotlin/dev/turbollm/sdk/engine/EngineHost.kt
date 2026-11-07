@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.engine
 
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.EngineState
 import dev.turbollm.sdk.LoadedModel
@@ -127,9 +128,22 @@ internal class EngineHost(
     private fun loadFailureOf(cause: Throwable) =
         TurboLLMException.ModelLoadFailed(cause.message ?: cause.javaClass.simpleName, cause)
 
-    private suspend fun loadEngine(target: LoadTarget): LoadedEngine {
-        val engine = catalog.resolve(target.format, requested = null).factory.create()
-        return loadUnderSentinel(engine, target).also { loaded = it }
+    /** An engine that cannot run here stays unavailable in the catalog, and the refusal names it. */
+    private suspend fun loadEngine(target: LoadTarget): LoadedEngine =
+        try {
+            val engine = catalog.slot(target.engine).factory.create()
+            loadUnderSentinel(engine, target).also { loaded = it }
+        } catch (unavailable: TurboLLMException.EngineUnavailable) {
+            throw markedUnavailable(target.engine, unavailable)
+        }
+
+    private fun markedUnavailable(
+        engine: EngineId,
+        unavailable: TurboLLMException.EngineUnavailable,
+    ): TurboLLMException.EngineUnavailable {
+        val reason = unavailable.message.orEmpty()
+        catalog.markUnavailable(engine, reason)
+        return TurboLLMException.EngineUnavailable(unavailable.kind, reason, engineId = engine)
     }
 
     private suspend fun loadUnderSentinel(engine: Engine, target: LoadTarget): LoadedEngine {
@@ -155,7 +169,13 @@ internal class EngineHost(
     }
 }
 
-internal data class LoadTarget(val ref: ModelRef, val id: String, val format: ModelFormat, val spec: LoadSpec)
+internal data class LoadTarget(
+    val ref: ModelRef,
+    val id: String,
+    val format: ModelFormat,
+    val spec: LoadSpec,
+    val engine: EngineId,
+)
 
 internal class LoadedEngine(val engine: Engine, val model: LoadedModel)
 
@@ -167,4 +187,5 @@ private fun LoadTarget.loadedModel(kind: EngineKind, info: EngineModelInfo) = Lo
     contextSize = info.contextSize,
     backend = info.backend,
     notes = info.notes,
+    engineId = engine,
 )

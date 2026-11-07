@@ -1,6 +1,7 @@
 package dev.turbollm.sdk.server
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.FinishReason
 import dev.turbollm.sdk.ModelFormat
 import dev.turbollm.sdk.ModelRef
@@ -56,13 +57,13 @@ class ClientDisconnectOverSocketTest {
     private val gate = GenerationGate(maxQueuedRequests = 1)
     private val backgroundWork = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var engine = FakeEngine()
-    private val host by lazy {
-        EngineHost(testCatalog(llamaCpp = { engine }, liteRtLm = { engine }), gate, LoadSentinel(root))
-    }
+    private val catalog = testCatalog(llamaCpp = { engine }, liteRtLm = { engine })
+    private val host by lazy { EngineHost(catalog, gate, LoadSentinel(root)) }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
     private val server by lazy {
-        val targets = LoadTargets(store, root, allowLoadByPath = false, cacheDir = File(root, "cache"))
-        val chat = ChatService(ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache")), gate, host)
+        val targets = LoadTargets(store, root, allowLoadByPath = false, cacheDir = File(root, "cache"), catalog)
+        val resolver = ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache"), catalog)
+        val chat = ChatService(resolver, gate, host)
         val control = ControlRoutes(targets, host, gate, backgroundWork)
         val openAi = OpenAiRoutes(chat, ModelListing(store) { host.state.value })
         LocalServer(KtorTransport(), logger = {}) {
@@ -113,7 +114,7 @@ class ClientDisconnectOverSocketTest {
     private suspend fun load(vararg script: Step) {
         engine = FakeEngine(script.toList())
         val spec = LoadSpec(File(root, "$MODEL_ID.gguf"), contextSize = null, threads = null, Backend.AUTO, root)
-        host.load(LoadTarget(ModelRef.Installed(MODEL_ID), MODEL_ID, ModelFormat.GGUF, spec))
+        host.load(LoadTarget(ModelRef.Installed(MODEL_ID), MODEL_ID, ModelFormat.GGUF, spec, EngineId.LLAMA_CPP_CPU))
     }
 
     private fun done() = Step.Emit(EngineEvent.Done(FinishReason.STOP, 1, 1, 1.0, 1.0))

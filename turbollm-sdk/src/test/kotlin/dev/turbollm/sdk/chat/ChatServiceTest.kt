@@ -1,7 +1,9 @@
 package dev.turbollm.sdk.chat
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
+import dev.turbollm.sdk.EngineState
 import dev.turbollm.sdk.FinishReason
 import dev.turbollm.sdk.LoadOptions
 import dev.turbollm.sdk.ModelFormat
@@ -62,10 +64,8 @@ class ChatServiceTest {
     private val gate = GenerationGate(maxQueuedRequests = 1)
     private var llamaEngine = FakeEngine()
     private var liteRtEngine = FakeEngine(kind = EngineKind.LITERT_LM)
-    private val host by lazy {
-        val catalog = testCatalog(llamaCpp = { llamaEngine }, liteRtLm = { liteRtEngine })
-        EngineHost(catalog, gate, LoadSentinel(root))
-    }
+    private val catalog = testCatalog(llamaCpp = { llamaEngine }, liteRtLm = { liteRtEngine })
+    private val host by lazy { EngineHost(catalog, gate, LoadSentinel(root)) }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
 
     @Test
@@ -327,7 +327,7 @@ class ChatServiceTest {
         val link = File(temp.root, "link")
         assumeTrue("this platform cannot link folders", linkFolder(link, real))
         val linkedPath = File(link, "models/o/r/m.gguf").absolutePath
-        val targets = LoadTargets(store, root, allowLoadByPath = true, cacheDir = File(root, "cache"))
+        val targets = LoadTargets(store, root, allowLoadByPath = true, cacheDir = File(root, "cache"), catalog)
         llamaEngine = FakeEngine(listOf(Step.Emit(EngineEvent.Text("ok")), done(FinishReason.STOP)))
         host.load(targets.of(ModelRef.File(linkedPath), LoadOptions()))
 
@@ -422,6 +422,17 @@ class ChatServiceTest {
         assertEquals(mapOf("reasoning_effort" to "\"low\""), params.templateKwargs)
     }
 
+    @Test
+    fun aBundleLoadedOnRequestRunsOnLiteRtLmChosenByItsFormat() = runTest {
+        litertlm("org/lite/gemma.litertlm")
+        liteRtEngine = FakeEngine(listOf(Step.Emit(EngineEvent.Text("hi")), done(FinishReason.STOP)), kind = EngineKind.LITERT_LM)
+
+        service(autoLoadOnRequest = true).complete(request(model = "org/lite/gemma"))
+
+        assertEquals(EngineId.LITERT_LM, (host.state.value as EngineState.Ready).model.engineId)
+        assertEquals(1, liteRtEngine.loads.size)
+    }
+
     private suspend fun loadedService(vararg script: Step): ChatService {
         llamaEngine = FakeEngine(script.toList())
         host.load(target(MODEL_ID))
@@ -429,7 +440,7 @@ class ChatServiceTest {
     }
 
     private fun service(autoLoadOnRequest: Boolean, clock: Clock = Clock { 0 }): ChatService {
-        val resolver = ModelResolver(store, host, autoLoadOnRequest, cacheDir = File(root, "cache"))
+        val resolver = ModelResolver(store, host, autoLoadOnRequest, cacheDir = File(root, "cache"), catalog)
         return ChatService(resolver, gate, host, clock, epochSeconds = { CREATED })
     }
 
@@ -438,6 +449,7 @@ class ChatServiceTest {
         id = id,
         format = ModelFormat.GGUF,
         spec = LoadSpec(File(root, "$id.gguf"), contextSize = null, threads = null, Backend.AUTO, File(root, "cache")),
+        engine = EngineId.LLAMA_CPP_CPU,
     )
 
     private fun request(

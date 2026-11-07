@@ -4,6 +4,7 @@ import dev.turbollm.sdk.api.ChatCompletionRequest
 import dev.turbollm.sdk.api.ChatMessage
 import dev.turbollm.sdk.api.ChatRole
 import dev.turbollm.sdk.api.MessageContent
+import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineFactory
 import dev.turbollm.sdk.internal.Clock
@@ -306,6 +307,29 @@ class TurboLLMFacadeTest {
 
         advanceTimeBy(2_000)
         assertEquals(false to 0, core.state.value.occupancy())
+    }
+
+    @Test
+    fun aLoadPinnedToAnEngineThatCannotReadTheModelIsRefusedBeforeAnyEngineIsCreated() = runTest {
+        gguf("$MODEL_ID.gguf")
+        val core = create()
+
+        val refusal = runCatching {
+            core.load(ModelRef.Installed(MODEL_ID), LoadOptions(engine = EngineId.LITERT_LM))
+        }.exceptionOrNull()
+
+        assertEquals("engine_format_mismatch", (refusal as TurboLLMException.InvalidRequest).code)
+        assertEquals(0, enginesCreated)
+        assertEquals(EngineState.Idle, core.state.value)
+    }
+
+    @Test
+    fun aLoadPinnedToTheEngineThatReadsTheModelNamesIt() = runTest {
+        gguf("$MODEL_ID.gguf")
+
+        val loaded = create().load(ModelRef.Installed(MODEL_ID), LoadOptions(engine = EngineId.LLAMA_CPP_CPU))
+
+        assertEquals(EngineId.LLAMA_CPP_CPU, loaded.engineId)
     }
 
     private suspend fun TestScope.loadedCore(): TurboLLM {

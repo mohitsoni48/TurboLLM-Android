@@ -69,10 +69,8 @@ class ControlRoutesTest {
     private val backgroundWork = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var engine = FakeEngine()
     private var enginesCreated = 0
-    private val host by lazy {
-        val catalog = testCatalog(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine)
-        EngineHost(catalog, gate, LoadSentinel(root))
-    }
+    private val catalog by lazy { testCatalog(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine) }
+    private val host by lazy { EngineHost(catalog, gate, LoadSentinel(root)) }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
 
     @Test
@@ -379,9 +377,10 @@ class ControlRoutesTest {
         allowLoadByPath: Boolean = true,
         block: suspend ApplicationTestBuilder.() -> Unit,
     ) = testApplication {
-        val targets = LoadTargets(store, root, allowLoadByPath, cacheDir = File(root, "cache"))
+        val targets = LoadTargets(store, root, allowLoadByPath, cacheDir = File(root, "cache"), catalog)
         val control = ControlRoutes(targets, host, gate, backgroundWork)
-        val chat = ChatService(ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache")), gate, host)
+        val resolver = ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache"), catalog)
+        val chat = ChatService(resolver, gate, host)
         val openAi = OpenAiRoutes(chat, ModelListing(store) { host.state.value })
         application {
             installLocalServer(RequestPolicy(BearerAuth(TOKEN)) { PRETEND_BOUND_PORT }) {

@@ -32,8 +32,7 @@ data class LoadedModel(
     val contextSize: Int,
     val backend: Backend,
     val notes: List<String>,
-    // TODO(S-3): drop this default once every construction site names its engine.
-    val engineId: EngineId = EngineId(""),
+    val engineId: EngineId,
 )
 
 /** Wire names match the TurboLLM daemon's model formats. */

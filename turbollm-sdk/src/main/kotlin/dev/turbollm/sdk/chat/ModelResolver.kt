@@ -6,6 +6,7 @@ import dev.turbollm.sdk.InstalledModel
 import dev.turbollm.sdk.LoadedModel
 import dev.turbollm.sdk.ModelRef
 import dev.turbollm.sdk.api.TurboLLMException
+import dev.turbollm.sdk.engine.EngineCatalog
 import dev.turbollm.sdk.engine.EngineHost
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.engine.LoadTarget
@@ -25,6 +26,7 @@ internal class ModelResolver(
     private val host: EngineHost,
     private val autoLoadOnRequest: Boolean,
     private val cacheDir: File,
+    private val catalog: EngineCatalog,
 ) {
     suspend fun resolve(model: String): LoadedModel = loadedModelNamed(model) ?: loadOnRequest(installedModel(model))
 
@@ -53,5 +55,6 @@ internal class ModelResolver(
         id = id,
         format = format,
         spec = LoadSpec(File(path), contextSize = null, threads = null, backend = Backend.AUTO, cacheDir = cacheDir),
+        engine = catalog.resolve(format, requested = null).id,
     )
 }

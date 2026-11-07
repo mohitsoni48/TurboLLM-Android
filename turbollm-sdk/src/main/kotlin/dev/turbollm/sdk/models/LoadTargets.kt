@@ -3,6 +3,7 @@ package dev.turbollm.sdk.models
 import dev.turbollm.sdk.LoadOptions
 import dev.turbollm.sdk.ModelRef
 import dev.turbollm.sdk.api.TurboLLMException
+import dev.turbollm.sdk.engine.EngineCatalog
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.engine.LoadTarget
 import java.io.File
@@ -19,6 +20,7 @@ internal class LoadTargets(
     private val root: File,
     private val allowLoadByPath: Boolean,
     private val cacheDir: File,
+    private val catalog: EngineCatalog,
 ) {
     suspend fun of(ref: ModelRef, options: LoadOptions): LoadTarget {
         requirePositive(options.contextSize, "contextSize")
@@ -34,13 +36,15 @@ internal class LoadTargets(
     private fun installedTarget(ref: ModelRef.Installed, options: LoadOptions): LoadTarget {
         val model = store.list().firstOrNull { it.id == ref.id && it.complete }
             ?: throw TurboLLMException.ModelNotFound("No installed, complete model has the id '${ref.id}'.")
-        return LoadTarget(ref, model.id, model.format, options.toSpec(File(model.path)))
+        val engine = catalog.resolve(model.format, options.engine).id
+        return LoadTarget(ref, model.id, model.format, options.toSpec(File(model.path)), engine)
     }
 
     private fun fileTarget(ref: ModelRef.File, options: LoadOptions): LoadTarget {
         if (!allowLoadByPath) throw TurboLLMException.LoadByPathDisabled()
         val loadable = loadableModelFile(ref.path)
-        return LoadTarget(ref, idOf(loadable.file), loadable.format, options.toSpec(loadable.file))
+        val engine = catalog.resolve(loadable.format, options.engine).id
+        return LoadTarget(ref, idOf(loadable.file), loadable.format, options.toSpec(loadable.file), engine)
     }
 
     /** [file] is a real path (symlinks resolved), so it is compared with the root's real path. */

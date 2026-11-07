@@ -1,6 +1,8 @@
 package dev.turbollm.sdk.engine
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineAvailability
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.EngineState
 import dev.turbollm.sdk.LoadedModel
@@ -35,6 +37,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 @OptIn(ExperimentalCoroutinesApi::class)
+private val OTHER_GGUF_ENGINE = EngineId("other-gguf")
+
 class EngineHostTest {
 
     @get:Rule
@@ -63,6 +67,7 @@ class EngineHostTest {
             contextSize = 4096,
             backend = Backend.CPU,
             notes = emptyList(),
+            engineId = EngineId.LLAMA_CPP_CPU,
         )
         assertEquals(expected, load.await())
         assertEquals(EngineState.Ready(expected, busy = false, queued = 0), host.state.value)
@@ -93,6 +98,61 @@ class EngineHostTest {
 
         assertTrue("got $thrown", thrown is TurboLLMException.EngineUnavailable)
         assertEquals(EngineState.Failed(target.ref, thrown as TurboLLMException), host.state.value)
+    }
+
+    @Test
+    fun aLoadPinnedToAnEngineRunsOnThatEngineEvenWhenAnotherIsPreferredForTheFormat() = runTest {
+        val pinnedEngine = FakeEngine()
+        val catalog = EngineCatalog(
+            listOf(
+                llamaCppCpuSlot({ error("the preferred GGUF engine must not be created") }, probe = { null }),
+                llamaCppCpuSlot({ pinnedEngine }, probe = { null }).renamed(OTHER_GGUF_ENGINE),
+            ),
+        )
+        val host = EngineHost(catalog, gate, LoadSentinel(modelRoot))
+
+        val loaded = host.load(target("org/repo/pinned", engine = OTHER_GGUF_ENGINE))
+
+        assertEquals(OTHER_GGUF_ENGINE, loaded.engineId)
+        assertEquals(1, pinnedEngine.loads.size)
+    }
+
+    @Test
+    fun anEngineThatCannotBeCreatedIsMarkedUnavailableAndTheRefusalNamesIt() = runTest {
+        val catalog = testCatalog(
+            liteRtLm = { throw TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM, "LiteRT-LM did not link.") },
+        )
+        val host = EngineHost(catalog, gate, LoadSentinel(modelRoot))
+
+        val thrown = runCatching { host.load(target("org/repo/c", ModelFormat.LITERTLM)) }.exceptionOrNull()
+
+        assertEquals(EngineId.LITERT_LM, (thrown as TurboLLMException.EngineUnavailable).engineId)
+        assertEquals("LiteRT-LM did not link.", thrown.message)
+        assertEquals(EngineAvailability.Unavailable("LiteRT-LM did not link."), catalog.list()[1].availability)
+    }
+
+    @Test
+    fun anEngineWhoseLoadFindsNoNativeLibraryIsMarkedUnavailable() = runTest {
+        val noLibrary = TurboLLMException.EngineUnavailable(EngineKind.LLAMA_CPP, "No llama.cpp library runs here.")
+        val catalog = testCatalog(llamaCpp = { FakeEngine(loadFailure = noLibrary) })
+        val host = EngineHost(catalog, gate, LoadSentinel(modelRoot))
+
+        val thrown = runCatching { host.load(target("org/repo/d")) }.exceptionOrNull()
+
+        assertEquals(EngineId.LLAMA_CPP_CPU, (thrown as TurboLLMException.EngineUnavailable).engineId)
+        assertEquals(EngineAvailability.Unavailable("No llama.cpp library runs here."), catalog.list()[0].availability)
+    }
+
+    @Test
+    fun aPinnedLoadWritesTheSentinelDuringTheNativeLoadAndClearsItAfter() = runTest {
+        val host = hostOf(FakeEngine(loadPauseMillis = 100))
+
+        val load = async { host.load(target("org/repo/e", engine = EngineId.LLAMA_CPP_CPU)) }
+        runCurrent()
+        assertTrue("sentinel during the pinned load", sentinelFile.exists())
+        load.await()
+
+        assertFalse("sentinel after the pinned load", sentinelFile.exists())
     }
 
     @Test
@@ -277,14 +337,21 @@ class EngineHostTest {
         return EngineHost(catalog, gate, LoadSentinel(modelRoot))
     }
 
+    private fun EngineSlot.renamed(id: EngineId) = EngineSlot(id, name, kind, formats, backends, factory, probe)
+
     private fun TestScope.recordingScope(uncaught: MutableList<Throwable>) = CoroutineScope(
         SupervisorJob() + StandardTestDispatcher(testScheduler) + CoroutineExceptionHandler { _, e -> uncaught += e },
     )
 
-    private fun target(id: String, format: ModelFormat = ModelFormat.GGUF) = LoadTarget(
+    private fun target(
+        id: String,
+        format: ModelFormat = ModelFormat.GGUF,
+        engine: EngineId = testCatalog().resolve(format, requested = null).id,
+    ) = LoadTarget(
         ref = ModelRef.Installed(id),
         id = id,
         format = format,
+        engine = engine,
         spec = LoadSpec(
             path = File(modelRoot, "$id.gguf"),
             contextSize = null,

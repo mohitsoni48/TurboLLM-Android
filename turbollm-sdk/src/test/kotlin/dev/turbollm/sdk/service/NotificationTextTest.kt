@@ -1,6 +1,7 @@
 package dev.turbollm.sdk.service
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.EngineState
 import dev.turbollm.sdk.LoadedModel
@@ -51,5 +52,6 @@ class NotificationTextTest {
         contextSize = 4096,
         backend = Backend.CPU,
         notes = emptyList(),
+        engineId = EngineId.LLAMA_CPP_CPU,
     )
 }

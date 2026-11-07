@@ -57,9 +57,9 @@ class TurboLLM private constructor(
     private val sentinel = LoadSentinel(modelRoot)
     private val host: EngineHost = EngineHost(dependencies.engines, gate, sentinel) { previousUnload?.join() }
     private val store = ModelStore(modelRoot, dependencies.clock) { loadedModel()?.id }
-    private val targets = LoadTargets(store, modelRoot, config.allowLoadByPath, cacheDir)
+    private val targets = LoadTargets(store, modelRoot, config.allowLoadByPath, cacheDir, dependencies.engines)
     private val chatService = ChatService(
-        ModelResolver(store, host, config.autoLoadOnRequest, cacheDir),
+        ModelResolver(store, host, config.autoLoadOnRequest, cacheDir, dependencies.engines),
         gate,
         host,
         dependencies.clock,
