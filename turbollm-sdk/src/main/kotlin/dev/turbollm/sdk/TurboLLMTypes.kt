@@ -55,7 +55,6 @@ value class EngineId(val value: String) {
     companion object {
         val LLAMA_CPP_CPU = EngineId("llama.cpp-cpu")
         val LITERT_LM = EngineId("litert-lm")
-        // Next increment, not this one: val LLAMA_CPP_VULKAN = EngineId("llama.cpp-vulkan")
     }
 }
 
