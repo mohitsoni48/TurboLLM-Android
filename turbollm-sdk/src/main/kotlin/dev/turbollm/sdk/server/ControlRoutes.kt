@@ -2,6 +2,7 @@ package dev.turbollm.sdk.server
 
 import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.chat.GenerationGate
+import dev.turbollm.sdk.engine.EngineCatalog
 import dev.turbollm.sdk.engine.EngineHost
 import dev.turbollm.sdk.internal.sdkJson
 import dev.turbollm.sdk.models.LoadTargets
@@ -18,12 +19,14 @@ import kotlinx.serialization.KSerializer
 internal const val LOAD_PATH = "/sdk/v1/load"
 internal const val STATUS_PATH = "/sdk/v1/status"
 internal const val UNLOAD_PATH = "/sdk/v1/unload"
+internal const val ENGINES_PATH = "/sdk/v1/engines"
 
 /**
  * The control surface for hosts and the daemon's attach transport (architecture §4.3). A load is checked, then
  * accepted with 202 and run in [loadScope]: loads can outlast an HTTP client's patience, so callers poll status.
  */
 internal class ControlRoutes(
+    private val catalog: EngineCatalog,
     private val targets: LoadTargets,
     private val host: EngineHost,
     private val gate: GenerationGate,
@@ -33,6 +36,7 @@ internal class ControlRoutes(
         route.post(LOAD_PATH) { call.acceptLoad() }
         route.get(STATUS_PATH) { call.respondStatus() }
         route.post(UNLOAD_PATH) { call.unload() }
+        route.get(ENGINES_PATH) { call.respondEngines() }
     }
 
     private suspend fun ApplicationCall.acceptLoad() {
@@ -48,6 +52,9 @@ internal class ControlRoutes(
 
     private suspend fun ApplicationCall.respondStatus() =
         respondJson(EngineStatus.serializer(), engineStatus(host.state.value, gate.busy, gate.queued))
+
+    private suspend fun ApplicationCall.respondEngines() =
+        respondJson(EngineListReply.serializer(), engineListReply(catalog.list()))
 
     private suspend fun ApplicationCall.unload() {
         host.unload()

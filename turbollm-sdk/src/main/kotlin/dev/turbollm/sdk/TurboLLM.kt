@@ -127,7 +127,7 @@ class TurboLLM private constructor(
     }
 
     private fun installRoutes(route: Route) {
-        ControlRoutes(targets, host, gate, scope).install(route)
+        ControlRoutes(dependencies.engines, targets, host, gate, scope).install(route)
         OpenAiRoutes(chatService, ModelListing(store) { host.state.value }).install(route)
     }
 

@@ -1,6 +1,9 @@
 package dev.turbollm.sdk.server
 
 import dev.turbollm.sdk.Backend
+import dev.turbollm.sdk.EngineAvailability
+import dev.turbollm.sdk.EngineId
+import dev.turbollm.sdk.EngineInfo
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.EngineState
 import dev.turbollm.sdk.LoadOptions
@@ -19,6 +22,8 @@ internal data class LoadRequest(
     val contextSize: Int? = null,
     val threads: Int? = null,
     val backend: BackendName = BackendName.AUTO,
+    /** An engine id from `GET /sdk/v1/engines`; null routes by the file's format. */
+    val engine: String? = null,
 ) {
     fun modelRef(): ModelRef = when {
         model != null && path == null -> ModelRef.Installed(model)
@@ -26,7 +31,12 @@ internal data class LoadRequest(
         else -> throw TurboLLMException.InvalidRequest(param = null, "Name exactly one of 'model' and 'path'.")
     }
 
-    fun options() = LoadOptions(contextSize = contextSize, threads = threads, backend = backend.backend)
+    fun options() = LoadOptions(
+        contextSize = contextSize,
+        threads = threads,
+        backend = backend.backend,
+        engine = engine?.let(::EngineId),
+    )
 }
 
 /** The lowercase wire names of [Backend]; the public enum itself stays free of serialization. */
@@ -65,6 +75,7 @@ internal data class StatusModel(
     val path: String,
     val format: ModelFormat,
     val engine: EngineKind,
+    val engineId: String,
     val contextSize: Int,
     val backend: BackendName,
     val notes: List<String>,
@@ -72,6 +83,37 @@ internal data class StatusModel(
 
 @Serializable
 internal data class StatusError(val message: String, val code: String)
+
+/** `GET /sdk/v1/engines`: the engines this SDK build hosts, in preference order. */
+@Serializable
+internal data class EngineListReply(
+    @SerialName("object") val objectType: String = "list",
+    val data: List<EngineEntry>,
+)
+
+/** [reason] is present only when [available] is false. */
+@Serializable
+internal data class EngineEntry(
+    val id: String,
+    val name: String,
+    val kind: EngineKind,
+    val formats: List<ModelFormat>,
+    val backends: List<BackendName>,
+    val available: Boolean,
+    val reason: String? = null,
+)
+
+internal fun engineListReply(engines: List<EngineInfo>) = EngineListReply(data = engines.map(EngineInfo::toEngineEntry))
+
+private fun EngineInfo.toEngineEntry() = EngineEntry(
+    id = id.value,
+    name = name,
+    kind = kind,
+    formats = formats.toList(),
+    backends = backends.map(Backend::wireName),
+    available = availability == EngineAvailability.Available,
+    reason = (availability as? EngineAvailability.Unavailable)?.reason,
+)
 
 /** The status of [state], with [busy] and [queued] read live from the generation gate rather than the snapshot. */
 internal fun engineStatus(state: EngineState, busy: Boolean, queued: Int): EngineStatus = when (state) {
@@ -86,9 +128,12 @@ private fun LoadedModel.toStatusModel() = StatusModel(
     path = path,
     format = format,
     engine = engine,
+    engineId = engineId.value,
     contextSize = contextSize,
-    backend = BackendName.entries.single { it.backend == backend },
+    backend = backend.wireName(),
     notes = notes,
 )
+
+private fun Backend.wireName() = BackendName.entries.single { it.backend == this }
 
 private fun TurboLLMException.toStatusError() = StatusError(message = message.orEmpty(), code = code)

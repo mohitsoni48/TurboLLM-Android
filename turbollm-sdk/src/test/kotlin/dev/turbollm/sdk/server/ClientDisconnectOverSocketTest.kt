@@ -64,7 +64,7 @@ class ClientDisconnectOverSocketTest {
         val targets = LoadTargets(store, root, allowLoadByPath = false, cacheDir = File(root, "cache"), catalog)
         val resolver = ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache"), catalog)
         val chat = ChatService(resolver, gate, host)
-        val control = ControlRoutes(targets, host, gate, backgroundWork)
+        val control = ControlRoutes(catalog, targets, host, gate, backgroundWork)
         val openAi = OpenAiRoutes(chat, ModelListing(store) { host.state.value })
         LocalServer(KtorTransport(), logger = {}) {
             control.install(this)

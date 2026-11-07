@@ -40,6 +40,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -69,7 +70,10 @@ class ControlRoutesTest {
     private val backgroundWork = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var engine = FakeEngine()
     private var enginesCreated = 0
-    private val catalog by lazy { testCatalog(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine) }
+    private var liteRtLmProbe: () -> String? = { null }
+    private val catalog by lazy {
+        testCatalog(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine, liteRtLmProbe = { liteRtLmProbe() })
+    }
     private val host by lazy { EngineHost(catalog, gate, LoadSentinel(root)) }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
 
@@ -85,8 +89,74 @@ class ControlRoutesTest {
         assertEquals("loading", stateOf(status()))
         awaitState("ready")
         val expected = """{"state":"ready","model":{"id":"$MODEL_ID","path":${quoted(file.path)},"format":"gguf",""" +
-            """"engine":"llama.cpp","contextSize":4096,"backend":"cpu","notes":[]},"busy":false,"queued":0}"""
+            """"engine":"llama.cpp","engineId":"llama.cpp-cpu","contextSize":4096,"backend":"cpu","notes":[]},""" +
+            """"busy":false,"queued":0}"""
         assertEquals(json(expected), json(status().bodyAsText()))
+    }
+
+    @Test
+    fun theEnginesAreListedInPreferenceOrderWithWhatEachReadsAndRunsOn() = controlTest {
+        val response = engines()
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        val expected = """{"object":"list","data":[""" +
+            """{"id":"llama.cpp-cpu","name":"llama.cpp (CPU)","kind":"llama.cpp","formats":["gguf"],""" +
+            """"backends":["cpu"],"available":true},""" +
+            """{"id":"litert-lm","name":"LiteRT-LM","kind":"litert-lm","formats":["litertlm"],""" +
+            """"backends":["gpu","cpu"],"available":true}]}"""
+        assertEquals(json(expected), json(response.bodyAsText()))
+    }
+
+    @Test
+    fun anEngineThatCannotRunHereIsListedUnavailableWithItsReason() = controlTest {
+        liteRtLmProbe = { "No LiteRT-LM here." }
+
+        val liteRtLm = Json.parseToJsonElement(engines().bodyAsText()).jsonObject.getValue("data").jsonArray[1]
+
+        val expected = """{"id":"litert-lm","name":"LiteRT-LM","kind":"litert-lm","formats":["litertlm"],""" +
+            """"backends":["gpu","cpu"],"available":false,"reason":"No LiteRT-LM here."}"""
+        assertEquals(json(expected), liteRtLm)
+    }
+
+    @Test
+    fun theEnginesListRequiresTheBearer() = controlTest {
+        val response = client.get(ENGINES_PATH) { addressed() }
+
+        assertEquals(HttpStatusCode.Unauthorized, response.status)
+    }
+
+    @Test
+    fun aLoadNamingAnEngineThatCannotReadTheFileIsRefusedBeforeItIsAccepted() = controlTest {
+        gguf("$MODEL_ID.gguf")
+
+        val response = authorizedPost(LOAD_PATH, """{"model":"$MODEL_ID","engine":"litert-lm"}""")
+
+        val message = assertRefused(response, HttpStatusCode.BadRequest, "engine_format_mismatch", param = "engine")
+        assertEquals("LiteRT-LM (litert-lm) can't read GGUF models.", message)
+        assertNoLoadWasAttempted()
+        assertEquals("idle", stateOf(status()))
+    }
+
+    @Test
+    fun aLoadNamingAnEngineTheSdkDoesNotHaveIsAnUnknownEngine() = controlTest {
+        gguf("$MODEL_ID.gguf")
+
+        val response = authorizedPost(LOAD_PATH, """{"model":"$MODEL_ID","engine":"nope"}""")
+
+        assertRefused(response, HttpStatusCode.BadRequest, "unknown_engine", param = "engine")
+        assertNoLoadWasAttempted()
+    }
+
+    @Test
+    fun aLoadNamingTheEngineThatReadsTheFileRunsOnItAndStatusNamesIt() = controlTest {
+        gguf("$MODEL_ID.gguf")
+
+        val accepted = authorizedPost(LOAD_PATH, """{"model":"$MODEL_ID","engine":"llama.cpp-cpu"}""")
+
+        assertEquals(HttpStatusCode.Accepted, accepted.status)
+        awaitState("ready")
+        val model = Json.parseToJsonElement(status().bodyAsText()).jsonObject.getValue("model").jsonObject
+        assertEquals("llama.cpp-cpu", model.getValue("engineId").jsonPrimitive.content)
     }
 
     @Test
@@ -378,7 +448,7 @@ class ControlRoutesTest {
         block: suspend ApplicationTestBuilder.() -> Unit,
     ) = testApplication {
         val targets = LoadTargets(store, root, allowLoadByPath, cacheDir = File(root, "cache"), catalog)
-        val control = ControlRoutes(targets, host, gate, backgroundWork)
+        val control = ControlRoutes(catalog, targets, host, gate, backgroundWork)
         val resolver = ModelResolver(store, host, autoLoadOnRequest = false, File(root, "cache"), catalog)
         val chat = ChatService(resolver, gate, host)
         val openAi = OpenAiRoutes(chat, ModelListing(store) { host.state.value })
@@ -449,6 +519,11 @@ class ControlRoutesTest {
     }
 
     private suspend fun ApplicationTestBuilder.status() = client.get(STATUS_PATH) {
+        addressed()
+        header(HttpHeaders.Authorization, "Bearer $TOKEN")
+    }
+
+    private suspend fun ApplicationTestBuilder.engines() = client.get(ENGINES_PATH) {
         addressed()
         header(HttpHeaders.Authorization, "Bearer $TOKEN")
     }
