@@ -2,6 +2,7 @@ package dev.turbollm.sdk.api
 
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.FinishReason
+import dev.turbollm.sdk.LoadOptions
 import dev.turbollm.sdk.ModelFormat
 import dev.turbollm.sdk.internal.sdkJson
 import kotlinx.serialization.json.JsonElement
@@ -206,6 +207,11 @@ class JsonShapesTest {
 
         val expected = """{"format":"litertlm","engine":"litert-lm","size_bytes":1,"loaded":false}"""
         assertEquals(parse(expected), parse(sdkJson.encodeToString(ModelMeta.serializer(), meta)))
+    }
+
+    @Test
+    fun loadOptionsNameNoEngineByDefault() {
+        assertNull(LoadOptions().engine)
     }
 
     private fun decodeRequest(wire: String) = sdkJson.decodeFromString(ChatCompletionRequest.serializer(), wire)

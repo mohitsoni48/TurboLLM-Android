@@ -17,6 +17,8 @@ data class LoadOptions(
     /** null: the performance-core count, clamped to 1..8. */
     val threads: Int? = null,
     val backend: Backend = Backend.AUTO,
+    /** null: the first available engine that reads the file's format. */
+    val engine: EngineId? = null,
 )
 
 /** llama.cpp in M1 is CPU only: GPU falls back to CPU, with a note in [LoadedModel.notes]. */
@@ -30,6 +32,8 @@ data class LoadedModel(
     val contextSize: Int,
     val backend: Backend,
     val notes: List<String>,
+    // TODO(S-3): drop this default once every construction site names its engine.
+    val engineId: EngineId = EngineId(""),
 )
 
 /** Wire names match the TurboLLM daemon's model formats. */
@@ -44,6 +48,33 @@ enum class ModelFormat {
 enum class EngineKind {
     @SerialName("llama.cpp") LLAMA_CPP,
     @SerialName("litert-lm") LITERT_LM,
+}
+
+/** A stable id for one engine this SDK build hosts. Wire value = [value]. Open, so a new engine is one more value. */
+@JvmInline
+value class EngineId(val value: String) {
+    companion object {
+        val LLAMA_CPP_CPU = EngineId("llama.cpp-cpu")
+        val LITERT_LM = EngineId("litert-lm")
+        // Next increment, not this one: val LLAMA_CPP_VULKAN = EngineId("llama.cpp-vulkan")
+    }
+}
+
+data class EngineInfo(
+    val id: EngineId,
+    /** For people: "llama.cpp (CPU)", "LiteRT-LM". */
+    val name: String,
+    /** The runtime family. Two ids can share a kind. */
+    val kind: EngineKind,
+    val formats: Set<ModelFormat>,
+    /** What it can run on: CPU and/or GPU. Never AUTO. */
+    val backends: Set<Backend>,
+    val availability: EngineAvailability,
+)
+
+sealed interface EngineAvailability {
+    data object Available : EngineAvailability
+    data class Unavailable(val reason: String) : EngineAvailability
 }
 
 sealed interface EngineState {

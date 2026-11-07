@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -35,6 +36,8 @@ sealed class TurboLLMException(
             UNSUPPORTED_PARAMETER("unsupported_parameter"),
             UNSUPPORTED_CONTENT("unsupported_content"),
             INVALID_LAST_MESSAGE("invalid_last_message"),
+            UNKNOWN_ENGINE("unknown_engine"),
+            ENGINE_FORMAT_MISMATCH("engine_format_mismatch"),
         }
     }
 
@@ -73,6 +76,8 @@ sealed class TurboLLMException(
     class EngineUnavailable(
         val kind: EngineKind,
         message: String = "The engine is not available on this device.",
+        /** The engine the request resolved to, when it got that far. */
+        val engineId: EngineId? = null,
     ) : TurboLLMException(message, 501, SERVER_ERROR, "engine_unavailable")
 
     class InsufficientMemory(message: String = "Not enough memory to load the model.") :

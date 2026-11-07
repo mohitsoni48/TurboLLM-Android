@@ -1,5 +1,6 @@
 package dev.turbollm.sdk.api
 
+import dev.turbollm.sdk.EngineId
 import dev.turbollm.sdk.EngineKind
 import dev.turbollm.sdk.internal.sdkJson
 import org.junit.Assert.assertEquals
@@ -35,7 +36,10 @@ class ErrorJsonGoldenTest {
         }
 
         assertEquals(
-            listOf("invalid_request", "unsupported_parameter", "unsupported_content", "invalid_last_message"),
+            listOf(
+                "invalid_request", "unsupported_parameter", "unsupported_content", "invalid_last_message",
+                "unknown_engine", "engine_format_mismatch",
+            ),
             codes,
         )
     }
@@ -65,6 +69,20 @@ class ErrorJsonGoldenTest {
         assertEquals(EngineKind.LITERT_LM, TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM).kind)
     }
 
+    @Test
+    fun engineUnavailableNamesTheEngineIdWhenOneWasResolved() {
+        val error = TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM, engineId = EngineId.LITERT_LM)
+
+        assertEquals(EngineId.LITERT_LM, error.engineId)
+        assertEquals(501, error.httpStatus)
+        assertEquals("engine_unavailable", error.code)
+    }
+
+    @Test
+    fun engineUnavailableWithoutAResolvedEngineHasNoEngineId() {
+        assertEquals(null, TurboLLMException.EngineUnavailable(EngineKind.LLAMA_CPP).engineId)
+    }
+
     private fun encode(error: TurboLLMException): String =
         sdkJson.encodeToString(ErrorBody.serializer(), error.toErrorBody())
 
@@ -79,6 +97,22 @@ class ErrorJsonGoldenTest {
         Row(
             TurboLLMException.InvalidRequest(param = "messages", message = "messages must not be empty"),
             400, "invalid_request_error", "invalid_request",
+        ),
+        Row(
+            TurboLLMException.InvalidRequest(
+                param = "engine",
+                message = "This SDK has no engine named nope.",
+                reason = TurboLLMException.InvalidRequest.Reason.UNKNOWN_ENGINE,
+            ),
+            400, "invalid_request_error", "unknown_engine",
+        ),
+        Row(
+            TurboLLMException.InvalidRequest(
+                param = "engine",
+                message = "LiteRT-LM (litert-lm) can't read GGUF models.",
+                reason = TurboLLMException.InvalidRequest.Reason.ENGINE_FORMAT_MISMATCH,
+            ),
+            400, "invalid_request_error", "engine_format_mismatch",
         ),
         Row(TurboLLMException.ContextLengthExceeded(), 400, "invalid_request_error", "context_length_exceeded"),
         Row(TurboLLMException.TemplateUnsupported(), 400, "invalid_request_error", "chat_template_unsupported"),
