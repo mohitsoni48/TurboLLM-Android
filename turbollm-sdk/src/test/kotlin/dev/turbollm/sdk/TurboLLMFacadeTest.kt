@@ -8,6 +8,7 @@ import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineFactory
 import dev.turbollm.sdk.internal.Clock
+import dev.turbollm.sdk.internal.DebugFaults
 import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.internal.Logger
 import dev.turbollm.sdk.models.HttpFetcher
@@ -310,6 +311,18 @@ class TurboLLMFacadeTest {
     }
 
     @Test
+    fun aServerDisabledForTestingFailsToStartAndBindsNothing() = runTest {
+        val core = create(debugFaults = DebugFaults(unavailable = emptySet(), noServer = true))
+
+        val failure = runCatching { core.startServer() }.exceptionOrNull()
+
+        val expected = "The SDK server is disabled for testing (debug build)."
+        assertEquals(expected, (failure as IllegalStateException).message)
+        assertEquals(0, transport.starts)
+        assertNull(core.server.value)
+    }
+
+    @Test
     fun stateShowsTheModelFreeAgainOnceItsOnlyGenerationEnds() = runTest {
         engine = FakeEngine(listOf(Step.Pause(1_000), done()))
         val core = loadedCore()
@@ -354,6 +367,7 @@ class TurboLLMFacadeTest {
         config: TurboLLMConfig = this@TurboLLMFacadeTest.config,
         fetcher: HttpFetcher = NeverAnsweringFetcher(),
         liteRtLmProbe: () -> String? = { null },
+        debugFaults: DebugFaults = DebugFaults.NONE,
     ): TurboLLM {
         scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(testScheduler)
@@ -371,6 +385,7 @@ class TurboLLMFacadeTest {
             ioDispatcher = dispatcher,
             freeBytes = { Long.MAX_VALUE },
             defaultCacheDir = File(folder.root, ".cache"),
+            debugFaults = debugFaults,
         )
         return TurboLLM.createForTest(config, dependencies)
     }

@@ -100,6 +100,7 @@ class TurboLLM private constructor(
 
     /** Starts the loopback server once; while it runs, every call returns the same handle. */
     suspend fun startServer(options: ServerOptions = ServerOptions()): ServerHandle = serverLifecycle.withLock {
+        refuseServerDisabledForTesting()
         runningServer.value ?: localServer.start(options).also { runningServer.value = it }
     }
 
@@ -122,6 +123,12 @@ class TurboLLM private constructor(
         stopServerNow()
         scope.cancel()
         unloading.start()
+    }
+
+    private fun refuseServerDisabledForTesting() {
+        if (!dependencies.debugFaults.noServer) return
+        dependencies.logger.info("Local server not started: disabled for testing by the debug faults file.")
+        error("The SDK server is disabled for testing (debug build).")
     }
 
     private fun stopServerNow() {

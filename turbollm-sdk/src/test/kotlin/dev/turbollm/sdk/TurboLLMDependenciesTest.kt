@@ -2,6 +2,7 @@ package dev.turbollm.sdk
 
 import dev.turbollm.sdk.engine.litert.LiteRtLmEngine
 import dev.turbollm.sdk.engine.llama.LlamaCppEngine
+import dev.turbollm.sdk.internal.DebugFaults
 import dev.turbollm.sdk.internal.Logger
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -52,6 +53,16 @@ class TurboLLMDependenciesTest {
         assertEquals(filtered, TurboLLMDependencies.SHIPPED_ABIS)
     }
 
-    private fun productionEnginesOn(abis: List<String>) =
-        TurboLLMDependencies.productionEngines(Logger { }, deviceAbis = { abis }, cpuinfo = { "" })
+    @Test
+    fun anEngineFaultedForTestingIsUnavailableWithTheDebugReasonWhileTheOtherStaysAvailable() {
+        val faults = DebugFaults(unavailable = setOf(EngineId.LITERT_LM), noServer = false)
+
+        val listed = productionEnginesOn(abis = listOf("arm64-v8a"), faults = faults).list()
+
+        assertEquals(EngineAvailability.Available, listed[0].availability)
+        assertEquals(EngineAvailability.Unavailable("Disabled for testing (debug build)."), listed[1].availability)
+    }
+
+    private fun productionEnginesOn(abis: List<String>, faults: DebugFaults = DebugFaults.NONE) =
+        TurboLLMDependencies.productionEngines(Logger { }, deviceAbis = { abis }, cpuinfo = { "" }, faults = faults)
 }

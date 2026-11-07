@@ -1,6 +1,7 @@
 package dev.turbollm.sdk
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.os.Build
 import dev.turbollm.sdk.engine.EngineCatalog
 import dev.turbollm.sdk.engine.liteRtLmSlot
@@ -12,6 +13,7 @@ import dev.turbollm.sdk.engine.llama.JniLlamaBinding
 import dev.turbollm.sdk.engine.llama.LlamaCppEngine
 import dev.turbollm.sdk.engine.llama.readCpuinfo
 import dev.turbollm.sdk.internal.Clock
+import dev.turbollm.sdk.internal.DebugFaults
 import dev.turbollm.sdk.internal.DeviceInfo
 import dev.turbollm.sdk.internal.Logger
 import dev.turbollm.sdk.internal.androidLogger
@@ -25,6 +27,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 
 private const val CACHE_FOLDER = "turbollm"
+private const val DEBUG_FAULTS_FOLDER = "turbollm-sdk-debug"
 
 /** What the [TurboLLM] core runs on: the engines, the network, the socket, time and threads. Tests pass fakes. */
 internal class TurboLLMDependencies(
@@ -37,22 +40,27 @@ internal class TurboLLMDependencies(
     val ioDispatcher: CoroutineDispatcher,
     val freeBytes: (File) -> Long,
     val defaultCacheDir: File,
+    val debugFaults: DebugFaults = DebugFaults.NONE,
 ) {
     companion object {
         /** The ABIs this module builds native code for: `abiFilters` in `turbollm-sdk/build.gradle.kts`. */
         val SHIPPED_ABIS = listOf("arm64-v8a", "x86_64")
 
-        fun forAndroid(context: Context) = TurboLLMDependencies(
-            engines = productionEngines(androidLogger),
-            fetcher = UrlConnectionFetcher(),
-            transport = KtorTransport(),
-            logger = androidLogger,
-            clock = monotonicClock,
-            coreDispatcher = Dispatchers.Default,
-            ioDispatcher = Dispatchers.IO,
-            freeBytes = File::getUsableSpace,
-            defaultCacheDir = File(context.cacheDir, CACHE_FOLDER),
-        )
+        fun forAndroid(context: Context): TurboLLMDependencies {
+            val faults = debugFaultsOf(context)
+            return TurboLLMDependencies(
+                engines = productionEngines(androidLogger, faults = faults),
+                fetcher = UrlConnectionFetcher(),
+                transport = KtorTransport(),
+                logger = androidLogger,
+                clock = monotonicClock,
+                coreDispatcher = Dispatchers.Default,
+                ioDispatcher = Dispatchers.IO,
+                freeBytes = File::getUsableSpace,
+                defaultCacheDir = File(context.cacheDir, CACHE_FOLDER),
+                debugFaults = faults,
+            )
+        }
 
         /**
          * llama.cpp (CPU) first, then LiteRT-LM. A fresh engine per load; creating one loads no native code, its
@@ -62,21 +70,27 @@ internal class TurboLLMDependencies(
             logger: Logger,
             deviceAbis: () -> List<String> = { Build.SUPPORTED_ABIS.toList() },
             cpuinfo: () -> String = ::readCpuinfo,
+            faults: DebugFaults = DebugFaults.NONE,
         ): EngineCatalog {
             val abiProbe = { missingShippedAbi(deviceAbis()) }
             return EngineCatalog(
                 listOf(
                     llamaCppCpuSlot(
                         factory = { LlamaCppEngine(JniLlamaBinding(logger), DeviceInfo::defaultThreadCount) },
-                        probe = { abiProbe() ?: missingCpuVariant(cpuinfo()) },
+                        probe = faults.probeFor(EngineId.LLAMA_CPP_CPU) { abiProbe() ?: missingCpuVariant(cpuinfo()) },
                     ),
                     liteRtLmSlot(
                         factory = { LiteRtLmEngine(AarLiteRtRuntime, DeviceInfo::defaultThreadCount, monotonicClock) },
-                        probe = abiProbe,
+                        probe = faults.probeFor(EngineId.LITERT_LM, abiProbe),
                     ),
                 ),
             )
         }
+
+        private fun debugFaultsOf(context: Context) = DebugFaults.read(
+            File(context.filesDir, DEBUG_FAULTS_FOLDER),
+            debuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        )
 
         private fun missingShippedAbi(deviceAbis: List<String>): String? =
             if (deviceAbis.any { it in SHIPPED_ABIS }) {
@@ -86,6 +100,10 @@ internal class TurboLLMDependencies(
             }
 
         private fun missingCpuVariant(cpuinfo: String): String? =
-            if (CpuVariant.candidatesFor(cpuinfo).isEmpty()) "No llama.cpp library in this build runs on this CPU." else null
+            if (CpuVariant.candidatesFor(cpuinfo).isEmpty()) {
+                "No llama.cpp library in this build runs on this CPU."
+            } else {
+                null
+            }
     }
 }
