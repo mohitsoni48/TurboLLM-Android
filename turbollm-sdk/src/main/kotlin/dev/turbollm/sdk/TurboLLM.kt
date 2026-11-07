@@ -85,6 +85,9 @@ class TurboLLM private constructor(
 
     val server: StateFlow<ServerHandle?> = runningServer.asStateFlow()
 
+    /** The engines this SDK build hosts. Catalog order is the preference order for by-format routing. */
+    fun engines(): List<EngineInfo> = dependencies.engines.list()
+
     suspend fun load(model: ModelRef, options: LoadOptions = LoadOptions()): LoadedModel =
         host.load(targets.of(model, options))
 

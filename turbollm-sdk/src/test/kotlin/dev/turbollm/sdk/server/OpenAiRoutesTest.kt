@@ -61,6 +61,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.io.readString
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -310,6 +311,19 @@ class OpenAiRoutesTest {
             """{"id":"$MODEL_ID","object":"model","created":$CREATED,"owned_by":"turbollm-sdk",""" +
             """"meta":{"format":"gguf","engine":"llama.cpp","size_bytes":$ONE_MIB,"loaded":true}}]}"""
         assertEquals(expected, response.bodyAsText())
+    }
+
+    @Test
+    fun `listed = on disk, not availability (QG-6 decision)`() = routesTest(loaded = false) {
+        gguf("$MODEL_ID.gguf")
+        catalog.markUnavailable(EngineId.LLAMA_CPP_CPU, "No llama.cpp library in this build runs on this CPU.")
+
+        val response = authorizedGet("/v1/models")
+
+        val entry = Json.parseToJsonElement(response.bodyAsText()).jsonObject.getValue("data").jsonArray.single()
+        assertEquals(MODEL_ID, entry.jsonObject.getValue("id").jsonPrimitive.content)
+        val meta = entry.jsonObject.getValue("meta").jsonObject
+        assertEquals("llama.cpp", meta.getValue("engine").jsonPrimitive.content)
     }
 
     @Test

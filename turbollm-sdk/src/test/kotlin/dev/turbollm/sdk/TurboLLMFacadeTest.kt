@@ -297,6 +297,19 @@ class TurboLLMFacadeTest {
     }
 
     @Test
+    fun enginesListsTheCatalogInPreferenceOrderWithEachEnginesAvailability() = runTest {
+        val core = create(liteRtLmProbe = { "No LiteRT-LM here." })
+
+        val engines = core.engines()
+
+        assertEquals(listOf(EngineId.LLAMA_CPP_CPU, EngineId.LITERT_LM), engines.map { it.id })
+        assertEquals(
+            listOf(EngineAvailability.Available, EngineAvailability.Unavailable("No LiteRT-LM here.")),
+            engines.map { it.availability },
+        )
+    }
+
+    @Test
     fun stateShowsTheModelFreeAgainOnceItsOnlyGenerationEnds() = runTest {
         engine = FakeEngine(listOf(Step.Pause(1_000), done()))
         val core = loadedCore()
@@ -340,11 +353,16 @@ class TurboLLMFacadeTest {
     private fun TestScope.create(
         config: TurboLLMConfig = this@TurboLLMFacadeTest.config,
         fetcher: HttpFetcher = NeverAnsweringFetcher(),
+        liteRtLmProbe: () -> String? = { null },
     ): TurboLLM {
         scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dependencies = TurboLLMDependencies(
-            engines = testCatalog(llamaCpp = EngineFactory(::nextEngine), liteRtLm = EngineFactory(::nextEngine)),
+            engines = testCatalog(
+                llamaCpp = EngineFactory(::nextEngine),
+                liteRtLm = EngineFactory(::nextEngine),
+                liteRtLmProbe = liteRtLmProbe,
+            ),
             fetcher = fetcher,
             transport = transport,
             logger = Logger {},
