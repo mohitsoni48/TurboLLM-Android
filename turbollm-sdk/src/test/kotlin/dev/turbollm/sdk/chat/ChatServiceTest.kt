@@ -18,7 +18,6 @@ import dev.turbollm.sdk.api.TurboLLMException
 import dev.turbollm.sdk.api.Usage
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineHost
-import dev.turbollm.sdk.engine.EngineRegistry
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.engine.LoadTarget
 import dev.turbollm.sdk.internal.Clock
@@ -27,6 +26,7 @@ import dev.turbollm.sdk.models.LoadTargets
 import dev.turbollm.sdk.models.ModelStore
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
+import dev.turbollm.sdk.testing.testCatalog
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
@@ -63,8 +63,8 @@ class ChatServiceTest {
     private var llamaEngine = FakeEngine()
     private var liteRtEngine = FakeEngine(kind = EngineKind.LITERT_LM)
     private val host by lazy {
-        val registry = EngineRegistry(llamaCpp = { llamaEngine }, liteRtLm = { liteRtEngine })
-        EngineHost(registry, gate, LoadSentinel(root))
+        val catalog = testCatalog(llamaCpp = { llamaEngine }, liteRtLm = { liteRtEngine })
+        EngineHost(catalog, gate, LoadSentinel(root))
     }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
 

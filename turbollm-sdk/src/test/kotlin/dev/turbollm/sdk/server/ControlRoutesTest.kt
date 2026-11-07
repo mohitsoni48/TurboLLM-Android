@@ -8,13 +8,13 @@ import dev.turbollm.sdk.chat.GenerationGate
 import dev.turbollm.sdk.chat.ModelResolver
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineHost
-import dev.turbollm.sdk.engine.EngineRegistry
 import dev.turbollm.sdk.internal.Clock
 import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.models.LoadTargets
 import dev.turbollm.sdk.models.ModelStore
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
+import dev.turbollm.sdk.testing.testCatalog
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -70,8 +70,8 @@ class ControlRoutesTest {
     private var engine = FakeEngine()
     private var enginesCreated = 0
     private val host by lazy {
-        val registry = EngineRegistry(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine)
-        EngineHost(registry, gate, LoadSentinel(root))
+        val catalog = testCatalog(llamaCpp = ::nextEngine, liteRtLm = ::nextEngine)
+        EngineHost(catalog, gate, LoadSentinel(root))
     }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
 

@@ -11,6 +11,7 @@ import dev.turbollm.sdk.chat.GenerationGate
 import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
+import dev.turbollm.sdk.testing.testCatalog
 import java.io.File
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -269,11 +270,11 @@ class EngineHostTest {
 
     private fun hostOf(vararg llamaEngines: FakeEngine): EngineHost {
         val pending = ArrayDeque(llamaEngines.toList())
-        val registry = EngineRegistry(
+        val catalog = testCatalog(
             llamaCpp = { pending.removeFirst() },
             liteRtLm = { throw TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM) },
         )
-        return EngineHost(registry, gate, LoadSentinel(modelRoot))
+        return EngineHost(catalog, gate, LoadSentinel(modelRoot))
     }
 
     private fun TestScope.recordingScope(uncaught: MutableList<Throwable>) = CoroutineScope(

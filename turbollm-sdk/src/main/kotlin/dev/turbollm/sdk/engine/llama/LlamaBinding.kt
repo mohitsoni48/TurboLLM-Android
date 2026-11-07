@@ -47,25 +47,25 @@ internal class JniLlamaBinding(private val logger: Logger) : LlamaBinding {
 }
 
 private object NativeLlamaLibrary {
-    private const val CPUINFO = "/proc/cpuinfo"
-
     @Volatile
     private var loaded = false
 
     @Synchronized
     fun ensureLoaded(logger: Logger) {
         if (loaded) return
-        val variant = CpuVariant.loadBest(cpuinfo())
+        val variant = CpuVariant.loadBest(readCpuinfo())
         LlamaNative.backendInit()
         logger.info("llama.cpp loaded ${variant.libraryName}")
         loaded = true
     }
-
-    /** Without a readable cpuinfo, only the base build is known to run. */
-    private fun cpuinfo(): String =
-        try {
-            File(CPUINFO).readText()
-        } catch (_: IOException) {
-            ""
-        }
 }
+
+/** Without a readable cpuinfo, only the base build is known to run. */
+internal fun readCpuinfo(): String =
+    try {
+        File(CPUINFO).readText()
+    } catch (_: IOException) {
+        ""
+    }
+
+private const val CPUINFO = "/proc/cpuinfo"

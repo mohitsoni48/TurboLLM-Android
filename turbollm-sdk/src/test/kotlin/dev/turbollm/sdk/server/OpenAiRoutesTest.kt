@@ -14,7 +14,6 @@ import dev.turbollm.sdk.chat.GenerationGate
 import dev.turbollm.sdk.chat.ModelResolver
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineHost
-import dev.turbollm.sdk.engine.EngineRegistry
 import dev.turbollm.sdk.engine.LoadSpec
 import dev.turbollm.sdk.engine.LoadTarget
 import dev.turbollm.sdk.internal.Clock
@@ -22,6 +21,7 @@ import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.models.ModelStore
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
+import dev.turbollm.sdk.testing.testCatalog
 import io.ktor.client.HttpClient
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.get
@@ -92,7 +92,7 @@ class OpenAiRoutesTest {
     private val gate = GenerationGate(maxQueuedRequests = 1)
     private var engine = FakeEngine()
     private val host by lazy {
-        EngineHost(EngineRegistry(llamaCpp = { engine }, liteRtLm = { engine }), gate, LoadSentinel(root))
+        EngineHost(testCatalog(llamaCpp = { engine }, liteRtLm = { engine }), gate, LoadSentinel(root))
     }
     private val store by lazy { ModelStore(root, Clock { 0 }, loadedModelId = { null }) }
     private val chat by lazy {

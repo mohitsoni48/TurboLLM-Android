@@ -6,7 +6,6 @@ import dev.turbollm.sdk.api.ChatRole
 import dev.turbollm.sdk.api.MessageContent
 import dev.turbollm.sdk.engine.EngineEvent
 import dev.turbollm.sdk.engine.EngineFactory
-import dev.turbollm.sdk.engine.EngineRegistry
 import dev.turbollm.sdk.internal.Clock
 import dev.turbollm.sdk.internal.LoadSentinel
 import dev.turbollm.sdk.internal.Logger
@@ -15,6 +14,7 @@ import dev.turbollm.sdk.models.HttpResponse
 import dev.turbollm.sdk.server.HttpTransport
 import dev.turbollm.sdk.testing.FakeEngine
 import dev.turbollm.sdk.testing.FakeEngine.Step
+import dev.turbollm.sdk.testing.testCatalog
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
@@ -320,7 +320,7 @@ class TurboLLMFacadeTest {
         scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dependencies = TurboLLMDependencies(
-            engines = EngineRegistry(llamaCpp = EngineFactory(::nextEngine), liteRtLm = EngineFactory(::nextEngine)),
+            engines = testCatalog(llamaCpp = EngineFactory(::nextEngine), liteRtLm = EngineFactory(::nextEngine)),
             fetcher = fetcher,
             transport = transport,
             logger = Logger {},

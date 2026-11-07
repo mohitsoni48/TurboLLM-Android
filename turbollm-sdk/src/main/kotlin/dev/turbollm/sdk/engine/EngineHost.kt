@@ -31,7 +31,7 @@ import kotlinx.coroutines.sync.withLock
  * [awaitPrevious] (a closed core's unload still running), so only one model is ever resident.
  */
 internal class EngineHost(
-    private val registry: EngineRegistry,
+    private val catalog: EngineCatalog,
     private val gate: GenerationGate,
     private val sentinel: LoadSentinel,
     private val awaitPrevious: suspend () -> Unit = {},
@@ -128,7 +128,7 @@ internal class EngineHost(
         TurboLLMException.ModelLoadFailed(cause.message ?: cause.javaClass.simpleName, cause)
 
     private suspend fun loadEngine(target: LoadTarget): LoadedEngine {
-        val engine = registry.engineFor(target.format)
+        val engine = catalog.resolve(target.format, requested = null).factory.create()
         return loadUnderSentinel(engine, target).also { loaded = it }
     }
 
