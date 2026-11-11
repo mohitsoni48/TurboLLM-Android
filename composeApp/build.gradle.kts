@@ -103,6 +103,14 @@ val shipLitertLmEngine: Boolean =
 val shipWhisperServer: Boolean =
     providers.gradleProperty("turbollmWhisperServer").orNull?.toBoolean() ?: true
 
+// Whether the GPU build of the speech-to-text server is packaged too (libwhisper_server_vk.so, arm64-v8a): the same
+// whisper-server with ggml's Vulkan backend linked in, which the daemon runs when "Use the GPU" is on in Settings →
+// Voice, going back to the CPU one if it cannot start. Off by default, like the Vulkan llama.cpp engine and for the
+// same reasons: no phone has run it yet, it adds 23 MB (about 7 MB compressed), and building it needs a host C++
+// compiler, which a Windows machine only has under WSL. -PturbollmWhisperVulkan=true turns it on.
+val shipWhisperVulkan: Boolean =
+    shipWhisperServer && (providers.gradleProperty("turbollmWhisperVulkan").orNull?.toBoolean() ?: false)
+
 // The ABIs the APK carries. Shared by abiFilters and the LiteRT-LM staging task so the two can
 // never disagree about which engine builds exist.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
@@ -640,12 +648,16 @@ val stageWhisperServer by tasks.registering(Exec::class) {
         val exe = if (System.getProperty("os.name").lowercase().contains("windows")) ".exe" else ""
         val cmakeBin = androidExt.sdkDirectory.resolve("cmake/3.22.1/bin")
         commandLine(
-            "node", "scripts/stage-whisper-server.mjs",
-            "--ndk", androidExt.ndkDirectory.absolutePath,
-            "--out", outDir.get().asFile.absolutePath,
-            "--abis", shippedAbis.joinToString(","),
-            "--cmake", cmakeBin.resolve("cmake$exe").absolutePath,
-            "--ninja", cmakeBin.resolve("ninja$exe").absolutePath,
+            listOf(
+                "node", "scripts/stage-whisper-server.mjs",
+                "--ndk", androidExt.ndkDirectory.absolutePath,
+                "--out", outDir.get().asFile.absolutePath,
+                "--abis", shippedAbis.joinToString(","),
+                "--cmake", cmakeBin.resolve("cmake$exe").absolutePath,
+                "--ninja", cmakeBin.resolve("ninja$exe").absolutePath,
+                // Without it the script removes a GPU server staged by an earlier build, so the flag alone decides
+                // what the APK carries.
+            ) + (if (shipWhisperVulkan) listOf("--vulkan") else emptyList()),
         )
     }
 }
@@ -664,6 +676,15 @@ if (shipWhisperServer) {
                     throw GradleException(
                         "Speech-to-text server missing: ${f.absolutePath}\n" +
                             "Build with -PturbollmWhisperServer=false to leave it out on purpose.",
+                    )
+                }
+            }
+            // The GPU server exists for arm64-v8a only (scripts/stage-whisper-server.mjs, GPU_ABIS).
+            if (shipWhisperVulkan && "arm64-v8a" in shippedAbis) {
+                val f = whisperJniLibs.get().file("arm64-v8a/libwhisper_server_vk.so").asFile
+                if (!f.exists()) {
+                    throw GradleException(
+                        "-PturbollmWhisperVulkan=true, but the GPU speech-to-text server is missing: ${f.absolutePath}",
                     )
                 }
             }

@@ -7,7 +7,7 @@
 // ANDROID_NDK_ROOT, or the pinned version under ANDROID_HOME or ANDROID_SDK_ROOT).
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { after, test } from 'node:test'
@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url'
 
 import { ndkToolchain } from './stage-litert-lm-engine.mjs'
 import {
-  ABIS, buildStamp, checkoutCommit, cmakeArgs, SERVER, WHISPER_COMMIT, WHISPER_TAG,
+  ABIS, buildStamp, checkoutCommit, cmakeArgs, GPU_ABIS, GPU_PATCH, KHRONOS, SERVER, SERVER_GPU, WHISPER_COMMIT,
+  WHISPER_TAG,
 } from './stage-whisper-server.mjs'
 
 const script = fileURLToPath(new URL('./stage-whisper-server.mjs', import.meta.url))
@@ -122,23 +123,88 @@ test('bad arguments exit 1 with a FATAL line', () => {
   assert.equal(existsSync(out), false, 'nothing is staged on a bad command line')
 })
 
+// ── The GPU (Vulkan) server, pure ────────────────────────────────────────────────────────
+
+test('the GPU build is android-28 with Vulkan linked in, and the CPU build has none of it', () => {
+  const gpu = { khronos: join('/cache', 'khronos'), glslc: '/ndk/shader-tools/linux-x86_64/glslc' }
+  const tc = { toolchain: '/ndk/android.toolchain.cmake', ninja: '/sdk/ninja' }
+  const args = cmakeArgs('arm64-v8a', { ...tc, gpu })
+  for (const want of [
+    '-DANDROID_PLATFORM=android-28', '-DGGML_VULKAN=ON', '-DGGML_BACKEND_DL=OFF', '-DBUILD_SHARED_LIBS=OFF',
+    `-DVulkan_GLSLC_EXECUTABLE=${gpu.glslc}`, `-DVulkan_INCLUDE_DIR=${join(gpu.khronos, 'include')}`,
+    `-DCMAKE_PREFIX_PATH=${gpu.khronos}`,
+  ]) assert.ok(args.includes(want), want)
+  assert.ok(!args.includes('-DANDROID_PLATFORM=android-24'))
+  const cpu = cmakeArgs('arm64-v8a', tc)
+  assert.ok(cpu.includes('-DANDROID_PLATFORM=android-24'))
+  assert.deepEqual(cpu.filter((a) => /vulkan|BACKEND_DL|PREFIX_PATH/i.test(a)), [])
+})
+
+test('the GPU build stamp differs from the CPU one and follows the patch', () => {
+  const base = { commit: 'a'.repeat(40), ndk: '/ndk/27', script: 'hash' }
+  const cpu = buildStamp('arm64-v8a', base)
+  const gpu = buildStamp('arm64-v8a', { ...base, gpu: { patch: 'p1' } })
+  assert.notEqual(gpu, cpu)
+  assert.equal(buildStamp('arm64-v8a', { ...base, gpu: { patch: 'p1' } }), gpu)
+  assert.notEqual(buildStamp('arm64-v8a', { ...base, gpu: { patch: 'p2' } }), gpu)
+})
+
+test('the GPU pins are well formed', () => {
+  assert.ok(KHRONOS.length > 0)
+  for (const k of KHRONOS) {
+    assert.match(k.commit, /^[0-9a-f]{40}$/, k.name)
+    assert.match(k.repo, /^https:\/\/github\.com\/KhronosGroup\//, k.name)
+  }
+  assert.match(SERVER_GPU, /^lib[a-z0-9_]+\.so$/)
+  assert.notEqual(SERVER_GPU, SERVER)
+  for (const abi of GPU_ABIS) assert.ok(abi in ABIS, abi)
+  const patch = readFileSync(GPU_PATCH, 'utf8')
+  assert.match(patch, /^diff --git a\/ggml\/src\/ggml-vulkan\/ggml-vulkan\.cpp /m)
+  assert.ok(patch.includes('72d4bcd102d3b823c2bb1260fdc0e5da1af1f4b1'), 'the patch names the fork commit it comes from')
+})
+
+test('the daemon looks for the same GPU file name', { skip: !daemonBinary && 'no TurboLLM checkout found' }, () => {
+  assert.ok(readFileSync(daemonBinary, 'utf8').includes(`ANDROID_WHISPER_SERVER_GPU = '${SERVER_GPU}'`))
+})
+
+test('--vulkan is a flag with no value', () => {
+  const fakeNdk = mkdtempSync(join(work, 'fake-ndk-vk-'))
+  const out = join(work, 'vk-args-out')
+  for (const args of [
+    ['--vulkan', '--ndk', fakeNdk, '--out', out, '--abis', 'armeabi-v7a'],
+    ['--ndk', fakeNdk, '--out', out, '--abis', 'armeabi-v7a', '--vulkan'],
+  ]) {
+    const r = run(args)
+    assert.equal(r.status, 1)
+    assert.match(r.stderr, /FATAL: no whisper-server build for ABI armeabi-v7a/, args.join(' '))
+  }
+})
+
+const source0 = process.env.TURBOLLM_WHISPER_SOURCE
+test('the GPU patch applies to the pinned whisper.cpp', { skip: (!source0 || !existsSync(join(source0, 'CMakeLists.txt'))) && 'TURBOLLM_WHISPER_SOURCE is not set' || (!hasGit && 'no git on this machine') }, () => {
+  // --check changes nothing; a checkout that already has the patch passes the reverse check instead.
+  const check = (...extra) => spawnSync('git', ['-C', source0, 'apply', ...extra, '--check', GPU_PATCH], { encoding: 'utf8' })
+  const forward = check()
+  assert.ok(forward.status === 0 || check('--reverse').status === 0, forward.stderr)
+})
+
 // ── checkServer, on fixtures built with the NDK ──────────────────────────────────────────
 
 // checkServer reports a wrong architecture or alignment through checkElf, which prints FATAL and
 // exits the process, so it is called in a child process to see what it does.
-function check(file, abi) {
+function check(file, abi, gpu = false) {
   return spawnSync(process.execPath, ['--input-type=module', '-e',
     `import { checkServer } from ${JSON.stringify(scriptModule)}
-     try { checkServer(process.argv[1], process.argv[2]); console.log('ok') } catch (e) { console.error('ERROR: ' + e.message); process.exit(2) }`,
-    file, abi], { encoding: 'utf8' })
+     try { checkServer(process.argv[1], process.argv[2], { gpu: process.argv[3] === 'gpu' }); console.log('ok') } catch (e) { console.error('ERROR: ' + e.message); process.exit(2) }`,
+    file, abi, gpu ? 'gpu' : 'cpu'], { encoding: 'utf8' })
 }
 
-function fixture(name, { flags = [], source = 'int main(void) { return 0; }\n' } = {}) {
+function fixture(name, { flags = [], api = 24, source = 'int main(void) { return 0; }\n' } = {}) {
   const { clang } = ndkToolchain(ndk)
   const src = join(work, `${name}.c`)
   const out = join(work, name)
   writeFileSync(src, source)
-  const r = spawnSync(clang, ['--target=aarch64-linux-android24', '-fPIE', '-pie', '-O1', ...flags, '-o', out, src], { encoding: 'utf8' })
+  const r = spawnSync(clang, [`--target=aarch64-linux-android${api}`, '-fPIE', '-pie', '-O1', ...flags, '-o', out, src], { encoding: 'utf8' })
   assert.equal(r.status, 0, `clang failed:\n${r.stderr}`)
   return out
 }
@@ -174,6 +240,21 @@ test('checkServer rejects a file that needs a library other than libc, libm and 
   assert.match(r.stderr, /needs liblog\.so/)
 })
 
+const vulkanSource = '#include <vulkan/vulkan.h>\nint main(void) { return vkGetInstanceProcAddr(0, "vkCreateInstance") == 0; }\n'
+
+test('checkServer with the GPU rules wants libvulkan, and the CPU rules refuse it', { skip: noNdk }, () => {
+  const vk = fixture('vk', { api: 28, flags: ['-Wl,-z,max-page-size=16384', '-lvulkan'], source: vulkanSource })
+  const ok = check(vk, 'arm64-v8a', true)
+  assert.equal(ok.status, 0, ok.stderr)
+  const plain = fixture('vk-plain', { api: 28, flags: ['-Wl,-z,max-page-size=16384'] })
+  const missing = check(plain, 'arm64-v8a', true)
+  assert.equal(missing.status, 2, missing.stderr)
+  assert.match(missing.stderr, /Vulkan backend was not linked in/)
+  const cpu = check(vk, 'arm64-v8a')
+  assert.equal(cpu.status, 2, cpu.stderr)
+  assert.match(cpu.stderr, /needs libvulkan\.so/)
+})
+
 // ── End to end, opt-in: it builds whisper.cpp ────────────────────────────────────────────
 
 const source = process.env.TURBOLLM_WHISPER_SOURCE
@@ -199,4 +280,37 @@ test('the script builds, checks and stages the server, and a second run finds it
   assert.equal(second.status, 0, second.stdout + second.stderr)
   assert.match(second.stdout, /is up to date/)
   assert.equal(statSync(staged).mtimeMs, before)
+})
+
+// The script patches the source it builds from, so this one builds a copy and leaves the checkout alone.
+const vulkanSkip = e2eSkip || (process.env.TURBOLLM_WHISPER_VULKAN !== '1' && 'TURBOLLM_WHISPER_VULKAN=1 is not set') ||
+  (!hasGit && 'no git on this machine')
+
+test('the script builds the GPU server beside the CPU one, and drops it when not asked for', { skip: vulkanSkip, timeout: 1200000 }, () => {
+  const copy = join(work, 'vk-source')
+  cpSync(source, copy, { recursive: true })
+  const out = join(work, 'e2e-vk', 'jniLibs')
+  mkdirSync(out, { recursive: true })
+  const args = ['--ndk', ndk, '--source', copy, '--abis', 'arm64-v8a']
+  const first = run([...args, '--vulkan', '--out', out])
+  assert.equal(first.status, 0, first.stdout + first.stderr)
+  const cpu = join(out, 'arm64-v8a', SERVER)
+  const gpu = join(out, 'arm64-v8a', SERVER_GPU)
+  assert.ok(existsSync(cpu) && existsSync(gpu))
+  assert.equal(check(cpu, 'arm64-v8a').status, 0)
+  assert.equal(check(gpu, 'arm64-v8a', true).status, 0)
+  // The patch adds the use of this extension, so it being in the file shows the patched source was compiled.
+  assert.ok(readFileSync(gpu).includes('VK_KHR_timeline_semaphore'))
+  assert.ok(!readFileSync(cpu).includes('VK_KHR_timeline_semaphore'))
+  assert.deepEqual(readdirSync(join(out, 'arm64-v8a')).filter((n) => n.endsWith('.tmp')), [])
+
+  const second = run([...args, '--vulkan', '--out', out])
+  assert.equal(second.status, 0, second.stdout + second.stderr)
+  assert.match(second.stdout, new RegExp(`${SERVER} for arm64-v8a is up to date`))
+  assert.match(second.stdout, new RegExp(`${SERVER_GPU} for arm64-v8a is up to date`))
+
+  const third = run([...args, '--out', out])
+  assert.equal(third.status, 0, third.stdout + third.stderr)
+  assert.equal(existsSync(gpu), false, 'the GPU server is removed when it is not asked for')
+  assert.ok(existsSync(cpu))
 })

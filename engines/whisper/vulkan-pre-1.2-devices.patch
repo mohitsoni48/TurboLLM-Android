@@ -1,0 +1,56 @@
+Vulkan: do not crash on Android drivers that are below Vulkan 1.2 and still report its features.
+
+Applied by scripts/stage-whisper-server.mjs to whisper.cpp's ggml before the GPU build of
+whisper-server (libwhisper_server_vk.so). It is the change this project's llama.cpp fork carries for
+the Vulkan engine (mohitsoni48/TurboLLM-Android-Llama, commit 72d4bcd102d3b823c2bb1260fdc0e5da1af1f4b1,
+"vulkan: fix three null-pointer crashes on pre-1.2 devices reporting VK 1.2 features"), unchanged:
+whisper.cpp vendors the same ggml-vulkan.cpp and has the same three calls through null function
+pointers, seen on a Galaxy S21 FE (Mali-G78). See BUILDING-ENGINES.md, "Speech-to-text on the GPU".
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 75132c0..2112ce5 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6973,6 +6973,19 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         device->buffer_device_address = vk12_features.bufferDeviceAddress;
+         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
+ 
++        // Feature bit is core-1.2, but the proc address still needs the KHR extension
++        // enabled on a pre-1.2 device (some drivers report the feature without listing the
++        // extension name) -- otherwise the later call resolves to a null function pointer.
++        if (device->buffer_device_address && device->properties.apiVersion < VK_API_VERSION_1_2) {
++            device_extensions.push_back("VK_KHR_buffer_device_address");
++        }
++
++        // Same pre-1.2 gap as above, for timeline semaphores (used unconditionally, not
++        // behind a capability check).
++        if (vk12_features.timelineSemaphore && device->properties.apiVersion < VK_API_VERSION_1_2) {
++            device_extensions.push_back("VK_KHR_timeline_semaphore");
++        }
++
+         if (device->subgroup_size_control) {
+             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
+             device->subgroup_max_size = subgroup_size_control_props.maxSubgroupSize;
+@@ -7099,7 +7112,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             throw std::runtime_error("Unsupported device");
+         }
+ 
+-        device_extensions.push_back("VK_KHR_16bit_storage");
++        // Core since 1.1; some drivers stop listing it as an extension past that point.
++        if (device->properties.apiVersion < VK_API_VERSION_1_1) {
++            device_extensions.push_back("VK_KHR_16bit_storage");
++        }
+ 
+ #ifdef GGML_VULKAN_VALIDATE
+         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
+@@ -7223,6 +7239,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         device_create_info.setPNext(&device_features2);
+         device->device = device->physical_device.createDevice(device_create_info);
+ 
++        // Only ever init()'d against the instance; some ICDs don't resolve device-level
++        // extension functions through the instance-level trampoline alone.
++        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);
++
+         if (device->device_fault) {
+             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
+                 vkGetDeviceProcAddr(device->device, "vkGetDeviceFaultInfoEXT");

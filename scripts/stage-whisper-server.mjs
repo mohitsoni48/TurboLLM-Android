@@ -29,8 +29,22 @@
 // (<out>/../cache unless --cache says otherwise) and the CMake build directories in <out>/..;
 // both are reused, so a run with nothing to do costs well under a second.
 //
+// With --vulkan it also builds the GPU server, <out>/arm64-v8a/libwhisper_server_vk.so: the same program with ggml's
+// Vulkan backend linked in, which the daemon runs instead when "Use the GPU" is on in Settings → Voice (and goes back
+// to the CPU one if it cannot start). A second file, not a flag on the first, for the reason the Vulkan llama.cpp
+// engine is one (build-static-engine.sh): a Vulkan failure must not be able to take the CPU path with it. What that
+// build adds:
+//  - It is linked for API 28 (ggml-vulkan calls vkGetPhysicalDeviceFeatures2), so it cannot start below Android 9;
+//    and for arm64-v8a only, the one ABI with a GPU worth using.
+//  - Two more pinned inputs, fetched by commit: Khronos' Vulkan-Headers (the NDK has Vulkan's C header, not the C++
+//    one ggml-vulkan includes) and SPIRV-Headers, which ggml's CMake asks for.
+//  - A patch to ggml-vulkan.cpp (engines/whisper/vulkan-pre-1.2-devices.patch), the one this project's llama.cpp
+//    fork carries: without it the backend crashes on phones whose driver is below Vulkan 1.2.
+//  - A host C++ compiler: ggml compiles its shaders with a program it builds for the build machine. That is why it is
+//    opt-in (-PturbollmWhisperVulkan=true) and not in every build, and why on Windows it has to be run under WSL.
+//
 // Usage (Gradle runs this; see stageWhisperServer in composeApp/build.gradle.kts):
-//   node scripts/stage-whisper-server.mjs --ndk <ndk dir> --out <dir> [--abis arm64-v8a,x86_64]
+//   node scripts/stage-whisper-server.mjs --ndk <ndk dir> --out <dir> [--abis arm64-v8a,x86_64] [--vulkan]
 //                                         [--cmake <cmake>] [--ninja <ninja>] [--cache <dir>]
 //                                         [--source <whisper.cpp checkout>]
 import { createHash } from 'node:crypto'
@@ -38,7 +52,7 @@ import { execFileSync } from 'node:child_process'
 import {
   copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { checkElf, MIN_SDK, ndkToolchain, readDynamic } from './stage-litert-lm-engine.mjs'
@@ -63,15 +77,32 @@ export const ABIS = {
 // Anything else would have to be shipped beside it, in a folder it shares with every other engine.
 export const ALLOWED_NEEDED = ['libc.so', 'libm.so', 'libdl.so']
 
+// ── The GPU (Vulkan) server ──────────────────────────────────────────────────────────────
+export const SERVER_GPU = 'libwhisper_server_vk.so'
+export const GPU_ABIS = ['arm64-v8a']
+/** ggml-vulkan needs vkGetPhysicalDeviceFeatures2, which the NDK only has from API 28. */
+export const GPU_MIN_SDK = 28
+/** The GPU server also needs the system's Vulkan loader, which every device with Vulkan has. */
+export const ALLOWED_NEEDED_GPU = [...ALLOWED_NEEDED, 'libvulkan.so']
+/** Khronos' headers, by commit (Vulkan-Headers v1.4.368 and the SPIRV-Headers of the same week). Bump them together
+ *  with whisper.cpp when its ggml asks for newer ones. */
+export const KHRONOS = [
+  { name: 'Vulkan-Headers', repo: 'https://github.com/KhronosGroup/Vulkan-Headers', commit: '88487f687f3100ebe1d3559a8a34d971ee85b977' },
+  { name: 'SPIRV-Headers', repo: 'https://github.com/KhronosGroup/SPIRV-Headers', commit: '6efe5ae6b7c6ad29da3f2cc3f164b9c3d72b78b1' },
+]
+export const GPU_PATCH = fileURLToPath(new URL('../engines/whisper/vulkan-pre-1.2-devices.patch', import.meta.url))
+
 /** The CMake configure arguments for one ABI, after `-S <source> -B <build dir>`. Exported so the
- *  test can pin the ones that decide what kind of file comes out. */
-export function cmakeArgs(abi, { toolchain, ninja }) {
+ *  test can pin the ones that decide what kind of file comes out. `gpu` ({ khronos, glslc }: the
+ *  folder Khronos' headers are installed in, and the NDK's shader compiler) makes it the Vulkan
+ *  build. */
+export function cmakeArgs(abi, { toolchain, ninja, gpu }) {
   return [
     '-G', 'Ninja',
     `-DCMAKE_MAKE_PROGRAM=${ninja}`,
     `-DCMAKE_TOOLCHAIN_FILE=${toolchain}`,
     `-DANDROID_ABI=${abi}`,
-    `-DANDROID_PLATFORM=android-${MIN_SDK}`,
+    `-DANDROID_PLATFORM=android-${gpu ? GPU_MIN_SDK : MIN_SDK}`,
     '-DANDROID_STL=c++_static',
     '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON',
     '-DCMAKE_BUILD_TYPE=Release',
@@ -81,14 +112,28 @@ export function cmakeArgs(abi, { toolchain, ninja }) {
     '-DWHISPER_BUILD_TESTS=OFF',
     '-DWHISPER_BUILD_EXAMPLES=ON',
     '-DWHISPER_BUILD_SERVER=ON',
+    ...(gpu ? [
+      '-DGGML_VULKAN=ON',
+      // The backend is linked in, not loaded at run time: a loadable libggml-vulkan.so is what
+      // killed the CPU engine on a Mali phone by merely being in the folder (build-static-engine.sh).
+      '-DGGML_BACKEND_DL=OFF',
+      // The headers are outside the NDK's sysroot, where a cross build does not look by default.
+      `-DCMAKE_PREFIX_PATH=${gpu.khronos}`,
+      '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH',
+      '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH',
+      `-DVulkan_INCLUDE_DIR=${join(gpu.khronos, 'include')}`,
+      `-DVulkan_GLSLC_EXECUTABLE=${gpu.glslc}`,
+    ] : []),
   ]
 }
 
 /** What a build depends on, as one string: when it matches the stamp left beside a staged file,
  *  that file is still what this script would build. */
-export function buildStamp(abi, { commit, ndk, script }) {
-  const flags = cmakeArgs(abi, { toolchain: '<toolchain>', ninja: '<ninja>' }).join(' ')
-  return createHash('sha256').update([commit, ndk, script, flags].join('\n')).digest('hex')
+export function buildStamp(abi, { commit, ndk, script, gpu }) {
+  const flags = cmakeArgs(abi, { toolchain: '<toolchain>', ninja: '<ninja>', gpu: gpu ? { khronos: '<khronos>', glslc: '<glslc>' } : undefined }).join(' ')
+  // The GPU build is also made of the patch it applies and the headers it is compiled against.
+  const more = gpu ? [gpu.patch, ...KHRONOS.map((k) => k.commit)] : []
+  return createHash('sha256').update([commit, ndk, script, flags, ...more].join('\n')).digest('hex')
 }
 
 function parseArgs(argv) {
@@ -103,6 +148,7 @@ function parseArgs(argv) {
     else if (k === '--ninja') out.ninja = v
     else if (k === '--cache') out.cache = v
     else if (k === '--source') out.source = v
+    else if (k === '--vulkan') { out.vulkan = true; continue } // takes no value
     else throw new Error(`unknown argument ${k}`)
     i++
   }
@@ -170,21 +216,85 @@ function fetchSource(cacheDir) {
   return dest
 }
 
-function build(abi, source, opts) {
+// ── Khronos' headers, for the GPU build (cached, commit-pinned) ───────────────────────────
+// Each is fetched by its commit and installed, by its own CMake, into one folder the build is
+// pointed at: ggml's CMake finds SPIRV-Headers as a package, which only an install provides.
+function khronosHeaders(cacheDir, cmake) {
+  const prefix = join(cacheDir, `khronos-${createHash('sha256').update(KHRONOS.map((k) => k.commit).join()).digest('hex').slice(0, 12)}`)
+  if (existsSync(join(prefix, 'include', 'vulkan', 'vulkan.hpp')) && existsSync(join(prefix, '.complete'))) return prefix
+  rmSync(prefix, { recursive: true, force: true })
+  for (const { name, repo, commit } of KHRONOS) {
+    const src = join(cacheDir, `${name}-${commit.slice(0, 12)}`)
+    if (checkoutCommit(src) !== commit) {
+      rmSync(src, { recursive: true, force: true })
+      mkdirSync(src, { recursive: true })
+      console.log(`fetching ${name}…`)
+      try {
+        git(['init', '--quiet'], src)
+        git(['-c', 'core.autocrlf=false', 'fetch', '--quiet', '--depth', '1', repo, commit], src)
+        git(['-c', 'advice.detachedHead=false', 'checkout', '--quiet', 'FETCH_HEAD'], src)
+      } catch (e) {
+        rmSync(src, { recursive: true, force: true })
+        fail(`could not fetch ${name} ${commit} from ${repo}: ${String(e.stderr ?? e.message).trim()}`)
+      }
+      if (checkoutCommit(src) !== commit) fail(`${name}: fetched ${checkoutCommit(src)}, not the pinned ${commit}`)
+    }
+    try {
+      execFileSync(cmake, ['-S', src, '-B', join(cacheDir, `${name}-build`), `-DCMAKE_INSTALL_PREFIX=${prefix}`], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
+      execFileSync(cmake, ['--install', join(cacheDir, `${name}-build`)], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
+    } catch (e) {
+      fail(`installing ${name} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}`)
+    }
+  }
+  if (!existsSync(join(prefix, 'include', 'vulkan', 'vulkan.hpp'))) fail(`Vulkan-Headers installed no vulkan.hpp under ${prefix}`)
+  writeFileSync(join(prefix, '.complete'), '')
+  return prefix
+}
+
+/** Applies the GPU build's patch to `source`, unless it is already in. The CPU build compiles none of what it
+ *  touches (ggml-vulkan.cpp), so the one checkout serves both. */
+function applyGpuPatch(source) {
+  const apply = (extra) => execFileSync('git', ['apply', ...extra, GPU_PATCH], { cwd: source, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
+  try {
+    apply(['--reverse', '--check'])
+    return // already applied
+  } catch {
+    /* not applied yet */
+  }
+  try {
+    apply([])
+  } catch (e) {
+    fail(`${GPU_PATCH} does not apply to ${source}: ${String(e.stderr ?? e.message).trim()}\nIt was written against whisper.cpp ${WHISPER_TAG}; a bump has to carry it forward, or drop it once upstream has the fix.`)
+  }
+}
+
+/** Where the GPU build is told to find its headers and its shader compiler. */
+function gpuInputs(opts, cmake) {
+  const { clang } = ndkToolchain(opts.ndk)
+  const hostTag = basename(dirname(dirname(clang))) // linux-x86_64, darwin-x86_64
+  const glslc = join(opts.ndk, 'shader-tools', hostTag, 'glslc')
+  if (!existsSync(glslc)) fail(`the NDK has no shader compiler at ${glslc}`)
+  return { khronos: khronosHeaders(opts.cache, cmake), glslc }
+}
+
+function build(abi, source, opts, { gpu = false } = {}) {
   const toolchain = join(opts.ndk, 'build', 'cmake', 'android.toolchain.cmake')
   if (!existsSync(toolchain)) fail(`no NDK toolchain at ${toolchain}`)
   const cmake = findTool(opts.cmake, 'cmake')
   const ninja = findTool(opts.ninja, 'ninja')
-  const buildDir = join(opts.out, '..', `cmake-${abi}`)
-  console.log(`building ${SERVER} for ${abi}…`)
+  const buildDir = join(opts.out, '..', gpu ? `cmake-${abi}-vk` : `cmake-${abi}`)
+  console.log(`building ${gpu ? SERVER_GPU : SERVER} for ${abi}…`)
+  const args = cmakeArgs(abi, { toolchain, ninja, gpu: gpu ? gpuInputs(opts, cmake) : undefined })
   try {
     // CMake's own chatter (a screenful per ABI) is kept out of the Gradle log; a failure prints it.
-    execFileSync(cmake, ['-S', source, '-B', buildDir, ...cmakeArgs(abi, { toolchain, ninja })], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
+    execFileSync(cmake, ['-S', source, '-B', buildDir, ...args], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
   } catch (e) {
-    fail(`configuring whisper.cpp for ${abi} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}`)
+    const hint = gpu ? '\nThe Vulkan build compiles its shader generator for this machine, so it needs a host C++ compiler (gcc or clang) on PATH.' : ''
+    fail(`configuring whisper.cpp for ${abi} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}${hint}`)
   }
   try {
-    execFileSync(cmake, ['--build', buildDir, '--target', 'whisper-server'], { stdio: ['ignore', 'inherit', 'inherit'] })
+    // The Vulkan build's four hundred steps are mostly one shader each: their names are not worth a Gradle log.
+    execFileSync(cmake, ['--build', buildDir, '--target', 'whisper-server'], { stdio: ['ignore', gpu ? 'ignore' : 'inherit', 'inherit'] })
   } catch {
     fail(`building whisper-server for ${abi} failed (the compiler's or linker's message is above)`)
   }
@@ -195,13 +305,14 @@ function build(abi, source, opts) {
 
 /** Fails unless `path` is what may go into nativeLibraryDir as the server: the right
  *  architecture, 16 KB-aligned, and needing nothing but bionic. */
-export function checkServer(path, abi) {
+export function checkServer(path, abi, { gpu = false } = {}) {
   checkElf(path, ABIS[abi].elfMachine)
   const needed = readDynamic(readFileSync(path), path).needed.map((n) => n.name)
-  const extra = needed.filter((n) => !ALLOWED_NEEDED.includes(n))
+  const extra = needed.filter((n) => !(gpu ? ALLOWED_NEEDED_GPU : ALLOWED_NEEDED).includes(n))
   if (extra.length) {
     throw new Error(`${path} needs ${extra.join(', ')}: it must be one self-contained file, since a library shipped beside it would share nativeLibraryDir with llama.cpp's`)
   }
+  if (gpu && !needed.includes('libvulkan.so')) throw new Error(`${path} does not use libvulkan.so: the Vulkan backend was not linked in`)
 }
 
 function main() {
@@ -219,17 +330,30 @@ function main() {
   if (opts.source && !existsSync(join(opts.source, 'CMakeLists.txt'))) fail(`--source ${opts.source} is not a whisper.cpp checkout (no CMakeLists.txt)`)
   if (opts.source && sourceCommit !== WHISPER_COMMIT) console.warn(`WARNING: building whisper-server from ${opts.source} at ${sourceCommit}, not the pinned ${WHISPER_TAG} (${WHISPER_COMMIT})`)
 
-  for (const abi of opts.abis) {
+  const stage = (abi, { gpu }) => {
+    const name = gpu ? SERVER_GPU : SERVER
     const dir = join(opts.out, abi)
-    const staged = join(dir, SERVER)
-    const stampFile = join(opts.out, '..', `whisper-server-${abi}.stamp`)
-    const stamp = buildStamp(abi, { commit: sourceCommit, ndk: opts.ndk, script })
+    const staged = join(dir, name)
+    const stampFile = join(opts.out, '..', `whisper-server-${abi}${gpu ? '-vk' : ''}.stamp`)
+    const patch = gpu ? createHash('sha256').update(readFileSync(GPU_PATCH)).digest('hex') : ''
+    const stamp = buildStamp(abi, { commit: sourceCommit, ndk: opts.ndk, script, gpu: gpu ? { patch } : undefined })
     if (existsSync(staged) && existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() === stamp) {
-      console.log(`${SERVER} for ${abi} is up to date`)
-      continue
+      console.log(`${name} for ${abi} is up to date`)
+      return
+    }
+    if (gpu && process.platform === 'win32') {
+      // ggml's shader generator is a host program, and its CMake wants a GCC-style host compiler. A file built under
+      // WSL into this same folder is used as it is: its stamp names WSL's NDK path, so it can never match here.
+      if (existsSync(staged)) {
+        checkServer(staged, abi, { gpu })
+        console.log(`${name} for ${abi}: using the file already there (it cannot be rebuilt on Windows; rebuild it under WSL after a bump)`)
+        return
+      }
+      fail(`${name} cannot be built on Windows. Build it once under WSL, into this same folder:\n  node scripts/stage-whisper-server.mjs --vulkan --abis ${abi} --ndk <the Linux NDK> --out <this --out, as WSL sees it>`)
     }
     source ??= opts.source ?? fetchSource(opts.cache)
-    const built = build(abi, source, opts)
+    if (gpu) applyGpuPatch(source)
+    const built = build(abi, source, opts, { gpu })
     mkdirSync(dir, { recursive: true })
     // Stripped and checked beside its final name, and renamed once it has passed: a failed build
     // leaves no server the APK would carry, and the packaging check in build.gradle.kts stops it.
@@ -239,17 +363,25 @@ function main() {
     try {
       execFileSync(strip, ['--strip-all', tmp], { stdio: ['ignore', 'inherit', 'inherit'] })
     } catch {
-      fail(`stripping ${SERVER} for ${abi} failed (llvm-strip's message is above)`)
+      fail(`stripping ${name} for ${abi} failed (llvm-strip's message is above)`)
     }
     try {
-      checkServer(tmp, abi)
+      checkServer(tmp, abi, { gpu })
     } catch (e) {
       rmSync(tmp, { force: true })
       fail(e instanceof Error ? e.message : String(e))
     }
     renameSync(tmp, staged)
     writeFileSync(stampFile, `${stamp}\n`)
-    console.log(`staged ${SERVER} for ${abi}: ${(statSync(staged).size / 1e6).toFixed(1)} MB`)
+    console.log(`staged ${name} for ${abi}: ${(statSync(staged).size / 1e6).toFixed(1)} MB`)
+  }
+
+  for (const abi of opts.abis) stage(abi, { gpu: false })
+  // The GPU server, for the ABIs it exists for. Without --vulkan one staged earlier is removed: the APK packages
+  // whatever is in this folder, and a build that did not ask for it must not carry it.
+  for (const abi of opts.abis.filter((a) => GPU_ABIS.includes(a))) {
+    if (opts.vulkan) stage(abi, { gpu: true })
+    else rmSync(join(opts.out, abi, SERVER_GPU), { force: true })
   }
 }
 
