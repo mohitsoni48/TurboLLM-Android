@@ -1,6 +1,7 @@
 package com.turbollm.app
 
 import android.content.Context
+import android.content.Intent
 import android.media.AudioAttributes
 import android.net.Uri
 import android.os.Handler
@@ -16,6 +17,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 
 private const val TAG = "TurboLLM"
 
@@ -44,10 +46,17 @@ private const val MAX_UTTERANCE_CHARS = 4000
  * Messages are JSON text, both ways:
  *
  *     page → app   {"type":"tts.voices"}
- *                  {"type":"tts.speak","id":"u1","text":"…","voice":"<voice id or ''>","rate":1}
+ *                  {"type":"tts.speak","id":"u1","text":"…","voice":"<voice id or ''>","lang":"<language or ''>","rate":1}
  *                  {"type":"tts.stop"}
- *     app → page   {"type":"tts.voices","voices":[{"id":"…","name":"…","lang":"en-US"}]}   (empty: nothing can speak)
+ *                  {"type":"tts.install"}                      (open the engine's voice downloads)
+ *     app → page   {"type":"tts.voices","voices":[{"id":"…","name":"…","lang":"en-US","local":true}]}   (empty: nothing can speak)
  *                  {"type":"tts.done","id":"u1","ok":true}
+ *
+ * The page picks the voice: it knows the language of what it is reading, and reads a reply in Spanish with a Spanish
+ * voice (web/src/lib/voice/voice-choice.ts). So it is told every voice that can speak now, each with its language and
+ * whether it speaks on the phone (`local`) or through the engine maker's servers. A network voice is sent the text;
+ * the page uses one only after the user has allowed it, and this side never picks one by itself. Voices whose data is
+ * not downloaded are left out, and "tts.install" opens the engine's own screen for downloading them.
  *
  * The engine is started by the first message, not with the app: most sessions never ask for speech, and a bound
  * text-to-speech service is memory the model could use.
@@ -98,14 +107,16 @@ class TtsBridge(context: Context) : WebViewCompat.WebMessageListener {
                 val text = request.optString("text")
                 if (id.isEmpty()) return
                 val voice = request.optString("voice")
+                val language = request.optString("lang")
                 val rate = request.optDouble("rate", 1.0).toFloat()
-                whenReady { speak(id, text, voice, rate) }
+                whenReady { speak(id, text, voice, language, rate) }
             }
             "tts.stop" -> {
                 // Only a running engine has anything to stop; one still starting drops what it was asked to say.
                 waiting.clear()
                 engine?.stop()
             }
+            "tts.install" -> installVoices()
         }
     }
 
@@ -164,7 +175,7 @@ class TtsBridge(context: Context) : WebViewCompat.WebMessageListener {
         actions.forEach { it() }
     }
 
-    private fun speak(id: String, text: String, voiceId: String, rate: Float) {
+    private fun speak(id: String, text: String, voiceId: String, language: String, rate: Float) {
         val tts = engine
         if (ready != true || tts == null || text.isBlank()) {
             done(id, false)
@@ -172,8 +183,27 @@ class TtsBridge(context: Context) : WebViewCompat.WebMessageListener {
         }
         try {
             tts.setSpeechRate(rate.coerceIn(0.25f, 4f))
-            // An id the engine does not know (the page's "automatic", a voice since removed) is the engine's own choice.
-            (voicesOf(tts).firstOrNull { it.name == voiceId } ?: tts.defaultVoice)?.let { tts.voice = it }
+            val voices = voicesOf(tts)
+            val named = voices.firstOrNull { it.name == voiceId }
+            if (named != null) {
+                tts.voice = named
+            } else {
+                // No voice the engine knows by that id (none was named, or it has since been removed): one for the
+                // text's language, and only one that speaks on the phone. An engine that lists no voices is told the
+                // language itself. Failing both, the engine's own default.
+                val locale = if (language.isEmpty()) null else Locale.forLanguageTag(language)
+                val forLanguage = locale?.let { want -> voices.firstOrNull { !it.isNetworkConnectionRequired && it.locale.language == want.language } }
+                when {
+                    forLanguage != null -> tts.voice = forLanguage
+                    voices.isEmpty() -> {
+                        // Back to the phone's own language for text whose language is not known, so the last
+                        // reply's does not stick.
+                        val want = locale ?: Locale.getDefault()
+                        if (tts.isLanguageAvailable(want) >= TextToSpeech.LANG_AVAILABLE) tts.language = want
+                    }
+                    else -> tts.defaultVoice?.let { tts.voice = it }
+                }
+            }
             // FLUSH: the page sends one piece at a time and waits for its end, so anything still queued is stale.
             val queued = tts.speak(text.take(MAX_UTTERANCE_CHARS), TextToSpeech.QUEUE_FLUSH, null, id)
             if (queued != TextToSpeech.SUCCESS) done(id, false)
@@ -193,32 +223,53 @@ class TtsBridge(context: Context) : WebViewCompat.WebMessageListener {
                     JSONObject()
                         .put("id", voice.name)
                         .put("name", "${voice.locale.displayName} · ${voice.name}")
-                        .put("lang", voice.locale.toLanguageTag()),
+                        .put("lang", voice.locale.toLanguageTag())
+                        .put("local", !voice.isNetworkConnectionRequired),
                 )
             }
             // An engine that speaks but lists no voices still has its one.
             if (list.length() == 0) {
                 val locale = try { tts.defaultVoice?.locale } catch (e: Exception) { null }
                 list.put(
+                    // Its language is left out: what such an engine can speak is not known from here, so the page
+                    // must not take it for a voice of one language only.
                     JSONObject()
                         .put("id", DEFAULT_VOICE_ID)
-                        .put("name", "System voice")
-                        .put("lang", locale?.toLanguageTag() ?: ""),
+                        .put("name", if (locale != null) "System voice (${locale.displayName})" else "System voice")
+                        .put("lang", "")
+                        .put("local", true),
                 )
             }
         }
         post(JSONObject().put("type", "tts.voices").put("voices", list))
     }
 
-    /** The voices that speak on the device itself. A network voice would send the reply's text to its server, which
-     *  is not what reading a local model's answer aloud should do. */
+    /** The voices that can speak now: those whose data is on the phone, and the engine's network voices. A voice
+     *  still to be downloaded is not one (the engine would stay silent, or fetch it without saying). */
     private fun voicesOf(tts: TextToSpeech): List<Voice> = try {
-        tts.voices.orEmpty().filter {
-            !it.isNetworkConnectionRequired && !it.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
-        }
+        tts.voices.orEmpty().filter { !it.features.orEmpty().contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) }
     } catch (e: Exception) {
         // Some engines throw here rather than answer null.
         emptyList()
+    }
+
+    /** Opens the speech engine's screen for downloading voices, or the system's text-to-speech settings when the
+     *  engine has none. The page offers this when a reply is in a language no voice on the phone speaks. */
+    private fun installVoices() {
+        val enginePackage = try { engine?.defaultEngine } catch (e: Exception) { null }
+        val intents = listOf(
+            Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA).apply { if (!enginePackage.isNullOrEmpty()) setPackage(enginePackage) },
+            Intent("com.android.settings.TTS_SETTINGS"),
+        )
+        for (intent in intents) {
+            try {
+                appContext.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return
+            } catch (e: Exception) {
+                // No such screen on this phone: try the next.
+            }
+        }
+        Log.i(TAG, "tts: no voice download or text-to-speech settings screen could be opened")
     }
 
     private fun done(id: String, ok: Boolean) {
