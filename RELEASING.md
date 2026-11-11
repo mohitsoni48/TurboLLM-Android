@@ -26,11 +26,13 @@ leave LiteRT-LM out, which also drops the PyPI requirement, and `-PturbollmWhisp
 speech-to-text, which drops the git requirement; with both, CMake is not needed either. See
 [Speech-to-text](BUILDING-ENGINES.md#speech-to-text-whispercpp).
 
-`-PturbollmWhisperVulkan=true` additionally builds a GPU speech-to-text server, `libwhisper_server_vk.so`
-(23.4 MB, about 7.4 MB compressed; arm64-v8a, Android 9 and later). It is off by default because it has not been run
-on a phone. It also needs a host C++ compiler (gcc or clang) and network access to github.com for the Khronos Vulkan
-and SPIR-V headers, and on Windows has to be built under WSL. CI does not pass it: `pr-alpha.yml` sets no
-`turbollmWhisperVulkan` (or other whisper) property, so CI builds carry the CPU server only.
+Every build also compiles the GPU speech-to-text server, `libwhisper_server_vk.so` (23.4 MB, about 7.4 MB
+compressed; arm64-v8a, Android 9 and later), which the app runs when the user turns on "Use the GPU" in Settings →
+Voice. It needs two things more than the CPU server: a host C++ compiler (gcc or clang) on `PATH`, and network access
+to github.com for the Khronos Vulkan and SPIR-V headers. A machine without a compiler (Windows, usually) builds it
+once under WSL; see [Speech-to-text on the GPU](BUILDING-ENGINES.md#speech-to-text-on-the-gpu).
+`-PturbollmWhisperVulkan=false` leaves it out. CI passes no whisper property (`pr-alpha.yml`) and runs on
+`ubuntu-latest`, which has gcc, so CI builds carry both servers. The GPU server has not been run on a phone yet.
 
 ## One-time: the upload keystore
 

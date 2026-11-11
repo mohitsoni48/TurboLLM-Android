@@ -40,8 +40,10 @@ paste into a search box in three months.
   [the LiteRT-LM engine](#the-litert-lm-engine).
 - **Speech-to-text?** Nothing to do — every build compiles `libwhisper_server.so` from a pinned
   whisper.cpp (`stageWhisperServer`; git and network access to github.com on the first build).
-  `-PturbollmWhisperServer=false` leaves it out. `-PturbollmWhisperVulkan=true` adds an opt-in GPU
-  server (`libwhisper_server_vk.so`, not run on a phone yet). See [Speech-to-text](#speech-to-text-whispercpp).
+  `-PturbollmWhisperServer=false` leaves it out. Every build also compiles its GPU twin,
+  `libwhisper_server_vk.so`, which needs a host C++ compiler on `PATH` (under WSL on a Windows
+  machine without one); `-PturbollmWhisperVulkan=false` leaves that out. It has not been run on a
+  phone yet. See [Speech-to-text](#speech-to-text-whispercpp).
 - **The engine tether?** Nothing to do — every build compiles `libtether_exec.so`, the helper
   that makes the kernel end each engine with the app, with the same NDK (`stageTetherExec`). See
   [the engine tether](#the-engine-tether).
@@ -275,8 +277,8 @@ check then does not expect it.
   llama.cpp's ([gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two)).
 - `GGML_OPENMP=OFF`: no `libomp.so` to ship, or to duplicate beside the one Build A ships.
 - `GGML_NATIVE=OFF`: the build machine's CPU is not the phone's.
-- CPU only: the default server has no GPU backend. The GPU one is the opt-in build
-  [below](#speech-to-text-on-the-gpu-opt-in).
+- CPU only: this server has no GPU backend. The GPU one is a second file, built
+  [below](#speech-to-text-on-the-gpu).
 - `ANDROID_PLATFORM=android-24`: the app's minSdk.
 - `ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON`: 16 KB-page devices.
 - Stripped after the build.
@@ -305,10 +307,12 @@ a copy of the checkout, in a few minutes.
 The server listens on a loopback port the daemon picks and only the daemon talks to it, so the
 WebView's rule against other `127.0.0.1` ports does not apply.
 
-#### Speech-to-text on the GPU (opt-in)
+#### Speech-to-text on the GPU
 
-**Status.** The GPU server has been built and its ELF checked. It has not been run on any phone,
-and no speedup has been measured. It is opt-in for that reason, like the Vulkan llama.cpp engine.
+**Status.** The GPU server is in every build, and using it is the user's choice: "Use the GPU" in
+Settings → Voice, off until they turn it on. It has been built and its ELF checked. It has not
+been run on any phone, and no speedup has been measured, which is why the daemon never depends on
+it: when it cannot start, the CPU server does the work (see "At run time" below).
 
 **What it is.** `libwhisper_server_vk.so`: the same `whisper-server` with ggml's Vulkan backend
 linked in, for arm64-v8a only. It is a second file, not a flag on the first, for the reason the
@@ -317,9 +321,10 @@ Vulkan llama.cpp engine is one ([gotcha 1](#gotcha-1-ggml_backend_dlon-means-one
 with it. So the Vulkan backend is static (`GGML_BACKEND_DL=OFF`), and the CPU server is built and
 shipped whether or not this one is.
 
-**Turning it on.** Build with `-PturbollmWhisperVulkan=true` (off by default); the same script
-takes `--vulkan`. A release without it has no GPU file, and a build that does not ask for it
-deletes one staged earlier, because the APK packages whatever is in the folder.
+**Leaving it out.** `-PturbollmWhisperVulkan=false` builds the app without it (Gradle then does
+not pass the script `--vulkan`): speech-to-text runs on the CPU only, and Settings → Voice does not
+offer the GPU. Such a build deletes a GPU server staged earlier, because the APK packages whatever
+is in the folder.
 
 **What the build needs**, on top of the CPU build:
 
@@ -332,15 +337,18 @@ deletes one staged earlier, because the APK packages whatever is in the folder.
 
 A clean build of it takes about a minute and a half on top of the CPU build.
 
-**Windows.** The shader generator is a host program and ggml's CMake wants a GCC-style compiler, so
-the script does not build the GPU server on Windows. Build it once under WSL into the same folder:
+**A machine with no host compiler** (Windows, usually). The shader generator is a host program,
+so without gcc or clang on `PATH` the GPU build stops, showing the compiler's error and what to
+do. Not tried on Windows with a compiler installed. The way that is known to work is to build it
+once under WSL into the same folder, with the same NDK version:
 
 ```
 node scripts/stage-whisper-server.mjs --vulkan --abis arm64-v8a --ndk <the Linux NDK> --out <the --out Gradle uses, as WSL sees it>
 ```
 
-A Windows build then uses the file already there after checking it, and fails with this command
-if there is none. Rebuild it under WSL after a bump.
+The stamp names the NDK by its version (`Pkg.Revision`), not its path, so the Windows build then
+finds that file up to date and does not try to rebuild it. After a bump (whisper.cpp, the NDK, the
+patch, the script) the stamp no longer matches: build it under WSL again.
 
 **The patch.** `engines/whisper/vulkan-pre-1.2-devices.patch` is the `ggml-vulkan.cpp` part of
 commit `72d4bcd102d3b823c2bb1260fdc0e5da1af1f4b1` of this project's llama.cpp fork

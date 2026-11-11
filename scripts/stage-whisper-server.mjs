@@ -40,8 +40,10 @@
 //    one ggml-vulkan includes) and SPIRV-Headers, which ggml's CMake asks for.
 //  - A patch to ggml-vulkan.cpp (engines/whisper/vulkan-pre-1.2-devices.patch), the one this project's llama.cpp
 //    fork carries: without it the backend crashes on phones whose driver is below Vulkan 1.2.
-//  - A host C++ compiler: ggml compiles its shaders with a program it builds for the build machine. That is why it is
-//    opt-in (-PturbollmWhisperVulkan=true) and not in every build, and why on Windows it has to be run under WSL.
+//  - A host C++ compiler (gcc or clang): ggml compiles its shaders with a program it builds for the build machine.
+//    Gradle asks for the GPU server in every build (-PturbollmWhisperVulkan=false leaves it out), so a machine
+//    without one, which a Windows machine usually is, builds it once under WSL into the same folder: the stamp names
+//    the NDK by its version, not its path, so the Windows build then finds that file up to date.
 //
 // Usage (Gradle runs this; see stageWhisperServer in composeApp/build.gradle.kts):
 //   node scripts/stage-whisper-server.mjs --ndk <ndk dir> --out <dir> [--abis arm64-v8a,x86_64] [--vulkan]
@@ -134,6 +136,31 @@ export function buildStamp(abi, { commit, ndk, script, gpu }) {
   // The GPU build is also made of the patch it applies and the headers it is compiled against.
   const more = gpu ? [gpu.patch, ...KHRONOS.map((k) => k.commit)] : []
   return createHash('sha256').update([commit, ndk, script, flags, ...more].join('\n')).digest('hex')
+}
+
+/** The NDK's version (`Pkg.Revision` in its source.properties), or its path where that cannot be read. What a
+ *  build is stamped with: the same NDK is one path under WSL and another on Windows, and a file built with it in
+ *  either is the same file. */
+export function ndkRevision(ndk) {
+  try {
+    const revision = /^Pkg\.Revision\s*=\s*(\S+)/m.exec(readFileSync(join(ndk, 'source.properties'), 'utf8'))?.[1]
+    if (revision) return revision
+  } catch {
+    /* not an NDK with one: the path will do */
+  }
+  return ndk
+}
+
+/** What to do about a GPU server that could not be built. */
+function gpuHelp(abi) {
+  return [
+    `${SERVER_GPU} is part of every build. Building it needs a host C++ compiler on PATH (gcc or clang: ggml compiles its`,
+    'shader generator for this machine) and github.com, for Khronos\' headers.',
+    'On a machine without one (Windows, usually), build it once under WSL into this same folder, with the same NDK',
+    'version, and this build will find it up to date:',
+    `  node scripts/stage-whisper-server.mjs --vulkan --abis ${abi} --ndk <the Linux NDK> --out <this --out, as WSL sees it>`,
+    '-PturbollmWhisperVulkan=false builds the app without it: speech-to-text then runs on the CPU only.',
+  ].join('\n')
 }
 
 function parseArgs(argv) {
@@ -235,18 +262,18 @@ function khronosHeaders(cacheDir, cmake) {
         git(['-c', 'advice.detachedHead=false', 'checkout', '--quiet', 'FETCH_HEAD'], src)
       } catch (e) {
         rmSync(src, { recursive: true, force: true })
-        fail(`could not fetch ${name} ${commit} from ${repo}: ${String(e.stderr ?? e.message).trim()}`)
+        throw new Error(`could not fetch ${name} ${commit} from ${repo}: ${String(e.stderr ?? e.message).trim()}`)
       }
-      if (checkoutCommit(src) !== commit) fail(`${name}: fetched ${checkoutCommit(src)}, not the pinned ${commit}`)
+      if (checkoutCommit(src) !== commit) throw new Error(`${name}: fetched ${checkoutCommit(src)}, not the pinned ${commit}`)
     }
     try {
       execFileSync(cmake, ['-S', src, '-B', join(cacheDir, `${name}-build`), `-DCMAKE_INSTALL_PREFIX=${prefix}`], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
       execFileSync(cmake, ['--install', join(cacheDir, `${name}-build`)], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
     } catch (e) {
-      fail(`installing ${name} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}`)
+      throw new Error(`installing ${name} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}`)
     }
   }
-  if (!existsSync(join(prefix, 'include', 'vulkan', 'vulkan.hpp'))) fail(`Vulkan-Headers installed no vulkan.hpp under ${prefix}`)
+  if (!existsSync(join(prefix, 'include', 'vulkan', 'vulkan.hpp'))) throw new Error(`Vulkan-Headers installed no vulkan.hpp under ${prefix}`)
   writeFileSync(join(prefix, '.complete'), '')
   return prefix
 }
@@ -264,7 +291,7 @@ function applyGpuPatch(source) {
   try {
     apply([])
   } catch (e) {
-    fail(`${GPU_PATCH} does not apply to ${source}: ${String(e.stderr ?? e.message).trim()}\nIt was written against whisper.cpp ${WHISPER_TAG}; a bump has to carry it forward, or drop it once upstream has the fix.`)
+    throw new Error(`${GPU_PATCH} does not apply to ${source}: ${String(e.stderr ?? e.message).trim()}\nIt was written against whisper.cpp ${WHISPER_TAG}; a bump has to carry it forward, or drop it once upstream has the fix.`)
   }
 }
 
@@ -272,14 +299,14 @@ function applyGpuPatch(source) {
 function gpuInputs(opts, cmake) {
   const { clang } = ndkToolchain(opts.ndk)
   const hostTag = basename(dirname(dirname(clang))) // linux-x86_64, darwin-x86_64
-  const glslc = join(opts.ndk, 'shader-tools', hostTag, 'glslc')
-  if (!existsSync(glslc)) fail(`the NDK has no shader compiler at ${glslc}`)
+  const glslc = join(opts.ndk, 'shader-tools', hostTag, process.platform === 'win32' ? 'glslc.exe' : 'glslc')
+  if (!existsSync(glslc)) throw new Error(`the NDK has no shader compiler at ${glslc}`)
   return { khronos: khronosHeaders(opts.cache, cmake), glslc }
 }
 
 function build(abi, source, opts, { gpu = false } = {}) {
   const toolchain = join(opts.ndk, 'build', 'cmake', 'android.toolchain.cmake')
-  if (!existsSync(toolchain)) fail(`no NDK toolchain at ${toolchain}`)
+  if (!existsSync(toolchain)) throw new Error(`no NDK toolchain at ${toolchain}`)
   const cmake = findTool(opts.cmake, 'cmake')
   const ninja = findTool(opts.ninja, 'ninja')
   const buildDir = join(opts.out, '..', gpu ? `cmake-${abi}-vk` : `cmake-${abi}`)
@@ -290,16 +317,20 @@ function build(abi, source, opts, { gpu = false } = {}) {
     execFileSync(cmake, ['-S', source, '-B', buildDir, ...args], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
   } catch (e) {
     const hint = gpu ? '\nThe Vulkan build compiles its shader generator for this machine, so it needs a host C++ compiler (gcc or clang) on PATH.' : ''
-    fail(`configuring whisper.cpp for ${abi} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}${hint}`)
+    throw new Error(`configuring whisper.cpp for ${abi} failed:\n${e.stdout ?? ''}${e.stderr ?? e.message}${hint}`)
   }
   try {
-    // The Vulkan build's four hundred steps are mostly one shader each: their names are not worth a Gradle log.
-    execFileSync(cmake, ['--build', buildDir, '--target', 'whisper-server'], { stdio: ['ignore', gpu ? 'ignore' : 'inherit', 'inherit'] })
-  } catch {
-    fail(`building whisper-server for ${abi} failed (the compiler's or linker's message is above)`)
+    // The Vulkan build's four hundred steps are mostly one shader each: their names are not worth a Gradle log, so
+    // its output is kept and only the end of it shown, when it fails.
+    execFileSync(cmake, ['--build', buildDir, '--target', 'whisper-server'], {
+      stdio: ['ignore', gpu ? 'pipe' : 'inherit', 'inherit'], encoding: 'utf8', maxBuffer: 256 * 1024 * 1024,
+    })
+  } catch (e) {
+    const said = gpu ? `:\n${String(e.stdout ?? '').trimEnd().split('\n').slice(-30).join('\n')}` : " (the compiler's or linker's message is above)"
+    throw new Error(`building whisper-server for ${abi} failed${said}`)
   }
   const built = join(buildDir, 'bin', 'whisper-server')
-  if (!existsSync(built)) fail(`the build produced no ${built}`)
+  if (!existsSync(built)) throw new Error(`the build produced no ${built}`)
   return built
 }
 
@@ -336,24 +367,19 @@ function main() {
     const staged = join(dir, name)
     const stampFile = join(opts.out, '..', `whisper-server-${abi}${gpu ? '-vk' : ''}.stamp`)
     const patch = gpu ? createHash('sha256').update(readFileSync(GPU_PATCH)).digest('hex') : ''
-    const stamp = buildStamp(abi, { commit: sourceCommit, ndk: opts.ndk, script, gpu: gpu ? { patch } : undefined })
+    const stamp = buildStamp(abi, { commit: sourceCommit, ndk: ndkRevision(opts.ndk), script, gpu: gpu ? { patch } : undefined })
     if (existsSync(staged) && existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() === stamp) {
       console.log(`${name} for ${abi} is up to date`)
       return
     }
-    if (gpu && process.platform === 'win32') {
-      // ggml's shader generator is a host program, and its CMake wants a GCC-style host compiler. A file built under
-      // WSL into this same folder is used as it is: its stamp names WSL's NDK path, so it can never match here.
-      if (existsSync(staged)) {
-        checkServer(staged, abi, { gpu })
-        console.log(`${name} for ${abi}: using the file already there (it cannot be rebuilt on Windows; rebuild it under WSL after a bump)`)
-        return
-      }
-      fail(`${name} cannot be built on Windows. Build it once under WSL, into this same folder:\n  node scripts/stage-whisper-server.mjs --vulkan --abis ${abi} --ndk <the Linux NDK> --out <this --out, as WSL sees it>`)
-    }
     source ??= opts.source ?? fetchSource(opts.cache)
-    if (gpu) applyGpuPatch(source)
-    const built = build(abi, source, opts, { gpu })
+    let built
+    try {
+      if (gpu) applyGpuPatch(source)
+      built = build(abi, source, opts, { gpu })
+    } catch (e) {
+      throw gpu ? new Error(`${e instanceof Error ? e.message : String(e)}\n\n${gpuHelp(abi)}`) : e
+    }
     mkdirSync(dir, { recursive: true })
     // Stripped and checked beside its final name, and renamed once it has passed: a failed build
     // leaves no server the APK would carry, and the packaging check in build.gradle.kts stops it.

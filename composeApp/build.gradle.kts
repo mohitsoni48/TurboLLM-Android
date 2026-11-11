@@ -105,11 +105,12 @@ val shipWhisperServer: Boolean =
 
 // Whether the GPU build of the speech-to-text server is packaged too (libwhisper_server_vk.so, arm64-v8a): the same
 // whisper-server with ggml's Vulkan backend linked in, which the daemon runs when "Use the GPU" is on in Settings →
-// Voice, going back to the CPU one if it cannot start. Off by default, like the Vulkan llama.cpp engine and for the
-// same reasons: no phone has run it yet, it adds 23 MB (about 7 MB compressed), and building it needs a host C++
-// compiler, which a Windows machine only has under WSL. -PturbollmWhisperVulkan=true turns it on.
+// Voice, going back to the CPU one if it cannot start. On by default, so that option is in every build of the app. It
+// adds 23 MB (about 7 MB compressed), and building it needs a host C++ compiler on PATH and github.com for Khronos'
+// headers: a machine without a compiler builds it once under WSL (the staging script says how when it fails).
+// -PturbollmWhisperVulkan=false leaves it out; speech-to-text then runs on the CPU only.
 val shipWhisperVulkan: Boolean =
-    shipWhisperServer && (providers.gradleProperty("turbollmWhisperVulkan").orNull?.toBoolean() ?: false)
+    shipWhisperServer && (providers.gradleProperty("turbollmWhisperVulkan").orNull?.toBoolean() ?: true)
 
 // The ABIs the APK carries. Shared by abiFilters and the LiteRT-LM staging task so the two can
 // never disagree about which engine builds exist.
@@ -684,7 +685,8 @@ if (shipWhisperServer) {
                 val f = whisperJniLibs.get().file("arm64-v8a/libwhisper_server_vk.so").asFile
                 if (!f.exists()) {
                     throw GradleException(
-                        "-PturbollmWhisperVulkan=true, but the GPU speech-to-text server is missing: ${f.absolutePath}",
+                        "GPU speech-to-text server missing: ${f.absolutePath}\n" +
+                            "Build with -PturbollmWhisperVulkan=false to leave it out on purpose.",
                     )
                 }
             }

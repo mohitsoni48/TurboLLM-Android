@@ -17,6 +17,7 @@ import { ndkToolchain } from './stage-litert-lm-engine.mjs'
 import {
   ABIS, buildStamp, checkoutCommit, cmakeArgs, GPU_ABIS, GPU_PATCH, KHRONOS, SERVER, SERVER_GPU, WHISPER_COMMIT,
   WHISPER_TAG,
+  ndkRevision,
 } from './stage-whisper-server.mjs'
 
 const script = fileURLToPath(new URL('./stage-whisper-server.mjs', import.meta.url))
@@ -37,6 +38,24 @@ const noNdk = !ndk && 'no NDK found'
 const run = (args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' })
 
 // ── Pure ─────────────────────────────────────────────────────────────────────────────────
+
+test('a build is stamped with the NDK\'s version, so one built under WSL counts on Windows', () => {
+  // The same NDK is /root/ndk/… under WSL and C:\\…\\ndk\\… on Windows. Stamped by path, a server built in one
+  // would never be up to date in the other, and Windows cannot build the GPU one without a host compiler.
+  const a = join(work, 'ndk-a')
+  const b = join(work, 'some', 'other', 'place', 'ndk')
+  for (const dir of [a, b]) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'source.properties'), 'Pkg.Desc = Android NDK\nPkg.Revision = 27.0.12077973\n')
+  }
+  assert.equal(ndkRevision(a), '27.0.12077973')
+  assert.equal(ndkRevision(a), ndkRevision(b))
+  // A folder that does not say what it is falls back to its path, which still tells two apart.
+  const bare = join(work, 'ndk-bare')
+  mkdirSync(bare, { recursive: true })
+  assert.equal(ndkRevision(bare), bare)
+  assert.notEqual(ndkRevision(bare), ndkRevision(a))
+})
 
 test('the CMake arguments pin what decides the kind of file that comes out', () => {
   for (const abi of Object.keys(ABIS)) {
