@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The chat's voice input: the web UI records a voice message with the WebView's getUserMedia, which needs
+         this. Asked for the first time the user taps the microphone (DaemonWebView.kt onPermissionRequest), never at
+         startup, and used only while the app is on screen: nothing records in the background, so the foreground
+         service declares no microphone type. Not required: a device without a microphone still gets the app. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- A normal permission (no prompt): the WebView's audio stack will not open a recording device without it. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Model folders in shared storage (/sdcard/AI…), Android 10 and older only: the ordinary storage permissions,
          read to scan and load, write because the daemon downloads into the primary model folder. On Android 11+ the
          app holds none, so in shared storage it reads only the files it created itself (downloads into a primary
@@ -14,6 +22,14 @@
          system file picker instead, which needs no permission (ModelImport.kt, StorageAccess.kt). -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+    <!-- "Read aloud" speaks with the device's text-to-speech engine (TtsBridge.kt). An app targeting Android 11+
+         cannot see that engine's service, and so cannot start TextToSpeech, without naming it here. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"

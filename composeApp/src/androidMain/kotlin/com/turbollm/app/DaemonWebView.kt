@@ -1,16 +1,19 @@
 package com.turbollm.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -64,6 +67,13 @@ private val DAEMON_URL = "http://127.0.0.1:$ANDROID_DAEMON_PORT/"
 
 /** The daemon UI's origin, with the trailing slash so a look-alike host cannot match. */
 private val DAEMON_ORIGIN = DAEMON_URL
+
+/** The same origin as a rule for WebViewCompat.addWebMessageListener, which takes scheme, host and port with no path
+ *  (TtsBridge.attach). */
+private val DAEMON_ORIGIN_RULE = "http://127.0.0.1:$ANDROID_DAEMON_PORT"
+
+/** What the page may be granted of a WebView permission request: the microphone, for the chat's voice input. */
+private val MICROPHONE = arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
 
 /** Schemes the WebView loads itself: web pages, and what the UI's own frames use. Navigations to any other scheme are
  *  never loaded (shouldOverrideUrlLoading); turbollm-app is handled before that check. */
@@ -455,6 +465,20 @@ private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
         pendingFiles.value = null
     }
 
+    // The chat's microphone (voice input): the page asks the WebView with getUserMedia, and a WebView grants nothing
+    // unless the app answers onPermissionRequest. Granting it takes two yeses: Android's own RECORD_AUDIO, asked the
+    // first time the user taps the microphone and not at startup, and then the page's request. `pendingMic` holds the
+    // page's request while the system dialog is up; like the file chooser's callback it is answered exactly once.
+    val pendingMic = remember { mutableStateOf<PermissionRequest?>(null) }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        pendingMic.value?.let { request -> if (granted) request.grant(MICROPHONE) else request.deny() }
+        pendingMic.value = null
+    }
+    // "Read aloud": Android's text-to-speech, offered to the page over a channel only its own main frame gets
+    // (TtsBridge.kt). One per WebView, let go with it (onRelease).
+    val context = LocalContext.current
+    val ttsBridge = remember { TtsBridge(context) }
+
     AndroidView(
         // The WebView gets exactly the area nothing draws over: system bars, display cutout and the keyboard.
         // targetSdk 36 makes the window edge-to-edge on Android 15+ whatever the theme says, and the web-side
@@ -632,7 +656,34 @@ private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
                             false
                         }
                     }
+
+                    // Only the microphone, only for the daemon's own page, and only when it is all that is asked
+                    // for: a request that also wants the camera is refused whole rather than granted in part, since
+                    // nothing in the UI asks for one. A chat artifact runs in a sandboxed frame with no origin of
+                    // its own, so it cannot make this request as the daemon's page.
+                    override fun onPermissionRequest(request: PermissionRequest) {
+                        val fromDaemon = request.origin?.toString()?.startsWith(DAEMON_ORIGIN) == true
+                        val microphoneOnly = request.resources.contentEquals(MICROPHONE)
+                        if (!fromDaemon || !microphoneOnly) {
+                            request.deny()
+                            return
+                        }
+                        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                            request.grant(MICROPHONE)
+                            return
+                        }
+                        // The page asked again while the system dialog is still up: the older request is answered
+                        // (denied) rather than left hanging, and the newer one waits for the user.
+                        pendingMic.value?.deny()
+                        pendingMic.value = request
+                        micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+
+                    override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                        if (pendingMic.value === request) pendingMic.value = null
+                    }
                 }
+                ttsBridge.attach(this, DAEMON_ORIGIN_RULE)
                 // The daemon trusts only loopback requests that carry the app secret (DAEMON_APP_SECRET); this cookie is
                 // how every request the page makes carries it, WebSocket handshakes included. HttpOnly: page scripts
                 // (a chat artifact included) cannot read it. Set before the first load, every launch, since the secret
@@ -652,6 +703,10 @@ private fun TurboLLMWebView(onRendererGone: (didCrash: Boolean) -> Boolean) {
         // and the renderer sooner. Loading is stopped first, then the WebView is destroyed: it is never used again.
         onRelease = { webView ->
             if (webViewRef === webView) webViewRef = null
+            // A request still waiting on the system's microphone dialog belongs to a page that is going away.
+            pendingMic.value?.deny()
+            pendingMic.value = null
+            ttsBridge.shutdown()
             webView.stopLoading()
             webView.destroy()
         },

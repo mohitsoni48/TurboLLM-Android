@@ -36,6 +36,8 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.androidx.appcompat)
+            // WebViewCompat.addWebMessageListener: the origin-scoped channel the text-to-speech bridge uses (TtsBridge.kt).
+            implementation(libs.androidx.webkit)
             implementation(libs.android.material)
             implementation(libs.ktor.client.android)
             implementation(libs.lottie.compose)
