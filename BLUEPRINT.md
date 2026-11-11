@@ -448,6 +448,12 @@ Carried over from spec 28 §6, unchanged by the `nodejs-mobile` swap:
   (the web UI already depends on both for the desktop/LAN case).
 - `onShowFileChooser` wired up (chat attachments need this in a raw `WebView`, unlike a
   real browser).
+- `onPermissionRequest` answered for the microphone only (the chat's voice input): a raw
+  `WebView` denies `getUserMedia` unless the app grants it, and Android's own
+  `RECORD_AUDIO` is asked for at that moment, not at startup.
+- "Read aloud" through Android's `TextToSpeech` (`TtsBridge.kt`): the System WebView has no
+  working `speechSynthesis`, so the page is handed a message channel instead, scoped to the
+  daemon's origin and its main frame so a chat artifact's sandboxed frame never sees it.
 - No navigation chrome, no address bar; back button → `WebView.goBack()` when there's
   history, else exits.
 - A real loading/splash state while the daemon finishes starting (§7's service), not a

@@ -232,6 +232,43 @@ shipped beside it, which is the whole point of [gotcha 1](#gotcha-1-ggml_backend
 
 The whole directory is gitignored, so none of these are in a fresh clone.
 
+### Speech-to-text (whisper.cpp) — not bundled yet
+
+The web UI's voice input has two ways to use a recording: send it to a model that hears audio, or
+have whisper.cpp turn it into text first. In this app only the first works today. The second needs
+whisper.cpp's `whisper-server`, and on Android that has to be one more executable in
+`nativeLibraryDir`, for the reason this whole document is about: the daemon cannot run a binary it
+downloads.
+
+The daemon side is already in place and needs no change here. It looks for
+**`libwhisper_server.so`** in `TURBOLLM_ANDROID_NATIVE_LIB_DIR` before anything else
+(`turbollm/src/voice/whisper-binary.ts`, `ANDROID_WHISPER_SERVER`), runs it under the engine tether
+like `llama-server`, and downloads the whisper model the user picks into its data dir at run time
+(`whisper/models/`), so no model is bundled. Until that file is in the APK, Settings → Voice says
+speech-to-text is not part of the Android app, and the chat's microphone offers a recording only to
+a model that hears (a LiteRT-LM bundle with an audio encoder, on the native server).
+
+What a build of it has to be, from the constraints above (nobody has built it, so treat this as the
+starting point, not a recipe that is known to work):
+
+- **One static file.** whisper.cpp builds its own `libggml*.so`. Shipped beside llama.cpp's in the
+  flat `nativeLibraryDir` they would collide by name, which is what
+  [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two) is about. So
+  `-DBUILD_SHARED_LIBS=OFF`, as `scripts/build-static-engine.sh` does for the Vulkan engine, with
+  only system libraries left in `NEEDED`.
+- **The same toolchain flags as Build A**: the NDK's `android.toolchain.cmake`,
+  `-DANDROID_ABI=arm64-v8a` (and `x86_64` for the emulator), `-DANDROID_PLATFORM=android-24`,
+  16 KB page alignment, `-DGGML_OPENMP=OFF` (or the NDK's `libomp.so`, which is already shipped),
+  target `whisper-server`, from a pinned whisper.cpp tag. The daemon's desktop install pins
+  `b5454` (`WHISPER_BUILD`); matching it keeps the two on one HTTP contract.
+- **Staged like the other helpers**: a `stage-*.mjs` script and Gradle task modelled on
+  `stageTetherExec`, with the same ELF and alignment checks, so a release cannot be assembled with
+  the file missing once it is expected.
+
+The server needs nothing from the app beyond being runnable: it listens on a loopback port the
+daemon picks and only the daemon talks to it, so the WebView's rule against other `127.0.0.1`
+ports does not apply.
+
 ---
 
 ## The LiteRT-LM engine
