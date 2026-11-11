@@ -38,6 +38,9 @@ paste into a search box in three months.
   build its server with the NDK AGP already uses (`stageLitertLmEngine`, needs network on the
   first build). `-PturbollmLitertLmEngine=false` leaves it out. See
   [the LiteRT-LM engine](#the-litert-lm-engine).
+- **Speech-to-text?** Nothing to do — every build compiles `libwhisper_server.so` from a pinned
+  whisper.cpp (`stageWhisperServer`; git and network access to github.com on the first build).
+  `-PturbollmWhisperServer=false` leaves it out. See [Speech-to-text](#speech-to-text-whispercpp).
 - **The engine tether?** Nothing to do — every build compiles `libtether_exec.so`, the helper
   that makes the kernel end each engine with the app, with the same NDK (`stageTetherExec`). See
   [the engine tether](#the-engine-tether).
@@ -232,42 +235,68 @@ shipped beside it, which is the whole point of [gotcha 1](#gotcha-1-ggml_backend
 
 The whole directory is gitignored, so none of these are in a fresh clone.
 
-### Speech-to-text (whisper.cpp) — not bundled yet
+### Speech-to-text (whisper.cpp)
 
 The web UI's voice input has two ways to use a recording: send it to a model that hears audio, or
-have whisper.cpp turn it into text first. In this app only the first works today. The second needs
-whisper.cpp's `whisper-server`, and on Android that has to be one more executable in
-`nativeLibraryDir`, for the reason this whole document is about: the daemon cannot run a binary it
-downloads.
+have whisper.cpp turn it into text first. The second needs whisper.cpp's `whisper-server`, and on
+Android that has to be one more executable in `nativeLibraryDir`, for the reason this whole
+document is about: the daemon cannot run a binary it downloads.
 
-The daemon side is already in place and needs no change here. It looks for
-**`libwhisper_server.so`** in `TURBOLLM_ANDROID_NATIVE_LIB_DIR` before anything else
-(`turbollm/src/voice/whisper-binary.ts`, `ANDROID_WHISPER_SERVER`), runs it under the engine tether
-like `llama-server`, and downloads the whisper model the user picks into its data dir at run time
-(`whisper/models/`), so no model is bundled. Until that file is in the APK, Settings → Voice says
-speech-to-text is not part of the Android app, and the chat's microphone offers a recording only to
-a model that hears (a LiteRT-LM bundle with an audio encoder, on the native server).
+**What ships.** `libwhisper_server.so` for each ABI, which is `whisper-server` renamed to fit the
+`lib*.so` rule. It is an HTTP server: the daemon runs it on `127.0.0.1` on a port the OS picks,
+under the engine tether like `llama-server`, starts it when a recording needs transcribing and
+stops it after 10 minutes unused. Only the server is bundled. The user picks a whisper model in
+Settings → Voice, and the daemon downloads it at run time from Hugging Face
+(`ggerganov/whisper.cpp`) into its data dir (`whisper/models/`).
 
-What a build of it has to be, from the constraints above (nobody has built it, so treat this as the
-starting point, not a recipe that is known to work):
+**How the daemon finds it.** It looks for `libwhisper_server.so` in `TURBOLLM_ANDROID_NATIVE_LIB_DIR`
+before any other source (`turbollm/src/voice/whisper-binary.ts`, `ANDROID_WHISPER_SERVER`). When the
+file is absent, Settings → Voice says speech-to-text is not part of this build, and the chat's
+microphone offers a recording only to a model that hears (a LiteRT-LM bundle with an audio encoder,
+on the native server).
 
-- **One static file.** whisper.cpp builds its own `libggml*.so`. Shipped beside llama.cpp's in the
-  flat `nativeLibraryDir` they would collide by name, which is what
-  [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two) is about. So
-  `-DBUILD_SHARED_LIBS=OFF`, as `scripts/build-static-engine.sh` does for the Vulkan engine, with
-  only system libraries left in `NEEDED`.
-- **The same toolchain flags as Build A**: the NDK's `android.toolchain.cmake`,
-  `-DANDROID_ABI=arm64-v8a` (and `x86_64` for the emulator), `-DANDROID_PLATFORM=android-24`,
-  16 KB page alignment, `-DGGML_OPENMP=OFF` (or the NDK's `libomp.so`, which is already shipped),
-  target `whisper-server`, from a pinned whisper.cpp tag. The daemon's desktop install pins
-  `b5454` (`WHISPER_BUILD`); matching it keeps the two on one HTTP contract.
-- **Staged like the other helpers**: a `stage-*.mjs` script and Gradle task modelled on
-  `stageTetherExec`, with the same ELF and alignment checks, so a release cannot be assembled with
-  the file missing once it is expected.
+**How it is built.** `scripts/stage-whisper-server.mjs`, run by the Gradle task
+`stageWhisperServer` (a dependency of `merge*JniLibFolders`), writes
+`composeApp/build/generated/whisper/jniLibs/<abi>/libwhisper_server.so`. The source is a shallow
+git clone of tag `b5454` of https://github.com/ggml-org/whisper.cpp, the same release (v1.9.5) the
+desktop daemon installs prebuilt, kept in `composeApp/build/generated/whisper/cache`. A tag can be
+moved, so the build stops unless the clone's HEAD is commit
+`d1be6fde11ac6e0407606b4e42fe72d34add8037`. The first build therefore needs git and network access
+to github.com, and about a minute per ABI; later builds find a stamp (commit, NDK, the script and
+its CMake flags) and return at once. `--source <dir>` builds from a checkout you already have, for
+a machine with no network. `-PturbollmWhisperServer=false` leaves the server out; the packaging
+check then does not expect it.
 
-The server needs nothing from the app beyond being runnable: it listens on a loopback port the
-daemon picks and only the daemon talks to it, so the WebView's rule against other `127.0.0.1`
-ports does not apply.
+**Why these flags.**
+
+- `BUILD_SHARED_LIBS=OFF` and `ANDROID_STL=c++_static`: one self-contained file. whisper.cpp builds
+  its own ggml, and `nativeLibraryDir` is flat, so a `libggml.so` of its own would replace
+  llama.cpp's ([gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two)).
+- `GGML_OPENMP=OFF`: no `libomp.so` to ship, or to duplicate beside the one Build A ships.
+- `GGML_NATIVE=OFF`: the build machine's CPU is not the phone's.
+- CPU only: no GPU backend is enabled.
+- `ANDROID_PLATFORM=android-24`: the app's minSdk.
+- `ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON`: 16 KB-page devices.
+- Stripped after the build.
+
+The script then checks the result, with the LiteRT-LM staging's `checkElf`: the ELF machine, 16 KB
+alignment of the LOAD segments, and that it needs nothing but `libc.so`, `libm.so` and `libdl.so`.
+A file that fails is never given its final name, so it is not packaged.
+
+**Sizes**, uncompressed: 2.4 MB (arm64-v8a) and 2.8 MB (x86_64).
+
+**Bumping.** Change `WHISPER_TAG` and `WHISPER_COMMIT` together in the script (the commit from
+`git ls-remote https://github.com/ggml-org/whisper.cpp refs/tags/<tag>`), keep the tag equal to
+`WHISPER_BUILD` in the daemon, rebuild, and transcribe something once on a device. The daemon
+depends on the server's command line (`--host`, `--port`, `-m`, `-l`, `-t`, `-ng`) and on its `/health`
+and `/inference` routes, and nothing else checks them.
+
+`node --test scripts/stage-whisper-server.test.mjs` covers the CMake arguments, the pin, the
+command line and the file checks (those with the NDK, found as for the tether test). Setting
+`TURBOLLM_WHISPER_SOURCE` to a whisper.cpp checkout adds a real x86_64 build, about a minute.
+
+The server listens on a loopback port the daemon picks and only the daemon talks to it, so the
+WebView's rule against other `127.0.0.1` ports does not apply.
 
 ---
 

@@ -94,6 +94,15 @@ val shipVulkanEngine: Boolean =
 val shipLitertLmEngine: Boolean =
     providers.gradleProperty("turbollmLitertLmEngine").orNull?.toBoolean() ?: true
 
+// Whether the speech-to-text server (whisper.cpp's whisper-server) is packaged. On by default: the
+// microphone in the web UI turns speech into text through it, and the app cannot get one any other
+// way (it may only execute files installed with its APK). Costs about 1 MB compressed per ABI.
+// -PturbollmWhisperServer=false builds without it, for a machine with no git or network on its
+// first build; Settings → Voice then says speech-to-text is not part of this build, and voice
+// messages still reach models that hear audio themselves.
+val shipWhisperServer: Boolean =
+    providers.gradleProperty("turbollmWhisperServer").orNull?.toBoolean() ?: true
+
 // The ABIs the APK carries. Shared by abiFilters and the LiteRT-LM staging task so the two can
 // never disagree about which engine builds exist.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
@@ -105,6 +114,10 @@ val litertLmJniLibs = layout.buildDirectory.dir("generated/litert-lm/jniLibs")
 // Where stageTetherExec puts <abi>/libtether_exec.so, the helper the daemon starts every engine through (see "The
 // engine tether" below). jniLibs packages everything in it.
 val tetherJniLibs = layout.buildDirectory.dir("generated/tether-exec/jniLibs")
+
+// Where stageWhisperServer puts <abi>/libwhisper_server.so, the speech-to-text server (see "Speech-to-text" below).
+// jniLibs packages everything in it.
+val whisperJniLibs = layout.buildDirectory.dir("generated/whisper/jniLibs")
 
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
@@ -241,6 +254,8 @@ android {
         // The engine tether, staged into the build dir by stageTetherExec (below): compiled on every machine, like the
         // LiteRT-LM server, and in every build.
         jniLibs.srcDir(tetherJniLibs)
+        // whisper-server, staged into the build dir by stageWhisperServer (below): built from source on every machine.
+        if (shipWhisperServer) jniLibs.srcDir(whisperJniLibs)
     }
 
     // Upload signing, read from local.properties (gitignored) — never from the repo. Created by
@@ -598,6 +613,59 @@ tasks.matching { tetherPackagingTask.matches(it.name) }.configureEach {
                         "The daemon would tie each engine with an extra sh process instead. " +
                         "It is built by stageTetherExec (scripts/stage-tether-exec.mjs).",
                 )
+            }
+        }
+    }
+}
+
+// ── Speech-to-text ────────────────────────────────────────────────────────────────────────
+//
+// libwhisper_server.so: whisper.cpp's whisper-server, built by scripts/stage-whisper-server.mjs from a pinned commit
+// of the release the desktop daemon installs. The daemon runs it to turn a recording from the web UI's microphone
+// into text (TurboLLM's src/voice), and looks for it in nativeLibraryDir before anything else. One static file that
+// needs only bionic, so it shares nothing with llama.cpp's libraries in the same folder. See BUILDING-ENGINES.md,
+// "Speech-to-text (whisper.cpp)".
+//
+// The NDK and CMake are the ones the LiteRT-LM server is built with. The first run clones whisper.cpp (git, and the
+// network) and compiles it, about a minute per ABI; after that the script finds its stamp and returns at once, so it
+// runs every time, like the two tasks above.
+val stageWhisperServer by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds libwhisper_server.so, the speech-to-text server, from whisper.cpp into the APK's jniLibs."
+    workingDir = rootProject.projectDir
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+    val outDir = whisperJniLibs
+    outputs.upToDateWhen { false }
+    doFirst {
+        val exe = if (System.getProperty("os.name").lowercase().contains("windows")) ".exe" else ""
+        val cmakeBin = androidExt.sdkDirectory.resolve("cmake/3.22.1/bin")
+        commandLine(
+            "node", "scripts/stage-whisper-server.mjs",
+            "--ndk", androidExt.ndkDirectory.absolutePath,
+            "--out", outDir.get().asFile.absolutePath,
+            "--abis", shippedAbis.joinToString(","),
+            "--cmake", cmakeBin.resolve("cmake$exe").absolutePath,
+            "--ninja", cmakeBin.resolve("ninja$exe").absolutePath,
+        )
+    }
+}
+
+if (shipWhisperServer) {
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+        dependsOn(stageWhisperServer)
+    }
+    // The APK/AAB tasks only, as for the LiteRT-LM engine above.
+    val whisperPackagingTask = Regex("^(assemble|bundle)(Debug|Release)?$")
+    tasks.matching { whisperPackagingTask.matches(it.name) }.configureEach {
+        doLast {
+            for (abi in shippedAbis) {
+                val f = whisperJniLibs.get().file("$abi/libwhisper_server.so").asFile
+                if (!f.exists()) {
+                    throw GradleException(
+                        "Speech-to-text server missing: ${f.absolutePath}\n" +
+                            "Build with -PturbollmWhisperServer=false to leave it out on purpose.",
+                    )
+                }
             }
         }
     }
