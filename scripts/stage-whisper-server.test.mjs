@@ -7,6 +7,7 @@
 // ANDROID_NDK_ROOT, or the pinned version under ANDROID_HOME or ANDROID_SDK_ROOT).
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -15,8 +16,8 @@ import { fileURLToPath } from 'node:url'
 
 import { ndkToolchain } from './stage-litert-lm-engine.mjs'
 import {
-  ABIS, buildStamp, checkoutCommit, cmakeArgs, GPU_ABIS, GPU_PATCH, KHRONOS, SERVER, SERVER_GPU, WHISPER_COMMIT,
-  WHISPER_TAG,
+  ABIS, buildStamp, checkoutCommit, cmakeArgs, dropForeignBuildDir, GPU_ABIS, GPU_PATCH, KHRONOS, SERVER, SERVER_GPU,
+  WHISPER_COMMIT, WHISPER_TAG,
   ndkRevision,
 } from './stage-whisper-server.mjs'
 
@@ -77,6 +78,32 @@ test('the build stamp is stable, and changes with the ABI, the commit, the NDK a
   assert.notEqual(buildStamp('arm64-v8a', { ...base, commit: 'b'.repeat(40) }), stamp)
   assert.notEqual(buildStamp('arm64-v8a', { ...base, ndk: '/ndk/28' }), stamp)
   assert.notEqual(buildStamp('arm64-v8a', { ...base, script: 'other' }), stamp)
+})
+
+test('a build directory generated from another source folder is emptied, and one from this source is kept', () => {
+  // CMake refuses a build directory whose cache names another source, and the source folder is named by the pinned
+  // commit: without this, every bump failed to configure until someone deleted the build folder.
+  const source = mkdtempSync(join(work, 'src-new-'))
+  const cacheOf = (home) => `# This is the CMakeCache file.\r\nCMAKE_GENERATOR:INTERNAL=Ninja\r\nCMAKE_HOME_DIRECTORY:INTERNAL=${home}\r\n`
+  const buildDirFor = (home) => {
+    const dir = mkdtempSync(join(work, 'cmake-'))
+    if (home !== null) writeFileSync(join(dir, 'CMakeCache.txt'), cacheOf(home))
+    writeFileSync(join(dir, 'build.ninja'), '')
+    return dir
+  }
+  const other = buildDirFor(join(work, 'src-old'))
+  dropForeignBuildDir(other, source)
+  assert.equal(existsSync(other), false)
+
+  const same = buildDirFor(source)
+  dropForeignBuildDir(same, source)
+  assert.ok(existsSync(join(same, 'build.ninja')))
+
+  // Not configured yet (no cache), or not there at all: left alone.
+  const fresh = buildDirFor(null)
+  dropForeignBuildDir(fresh, source)
+  assert.ok(existsSync(join(fresh, 'build.ninja')))
+  dropForeignBuildDir(join(work, 'no-such-build-dir'), source)
 })
 
 test('the pin is well formed, and the script and Gradle ship the same ABIs', () => {
@@ -157,6 +184,17 @@ test('the GPU build is android-28 with Vulkan linked in, and the CPU build has n
   const cpu = cmakeArgs('arm64-v8a', tc)
   assert.ok(cpu.includes('-DANDROID_PLATFORM=android-24'))
   assert.deepEqual(cpu.filter((a) => /vulkan|BACKEND_DL|PREFIX_PATH/i.test(a)), [])
+})
+
+test('the GPU build stamp is the same on Windows as under WSL', () => {
+  // cmakeArgs joins a path, which is `<khronos>\\include` on Windows and `<khronos>/include` under WSL. Hashed as
+  // it came, a GPU server built under WSL was never up to date for the Windows build it was made for.
+  const base = { commit: 'a'.repeat(40), ndk: '27.0.12077973', script: 'hash', gpu: { patch: 'p1' } }
+  const flags = cmakeArgs('arm64-v8a', { toolchain: '<toolchain>', ninja: '<ninja>', gpu: { khronos: '<khronos>', glslc: '<glslc>' } })
+    .join(' ').replaceAll('\\', '/')
+  assert.ok(flags.includes('-DVulkan_INCLUDE_DIR=<khronos>/include'))
+  const stamped = [base.commit, base.ndk, base.script, flags, base.gpu.patch, ...KHRONOS.map((k) => k.commit)].join('\n')
+  assert.equal(buildStamp('arm64-v8a', base), createHash('sha256').update(stamped).digest('hex'))
 })
 
 test('the GPU build stamp differs from the CPU one and follows the patch', () => {

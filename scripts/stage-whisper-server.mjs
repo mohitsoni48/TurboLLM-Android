@@ -54,7 +54,7 @@ import { execFileSync } from 'node:child_process'
 import {
   copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { checkElf, MIN_SDK, ndkToolchain, readDynamic } from './stage-litert-lm-engine.mjs'
@@ -132,7 +132,9 @@ export function cmakeArgs(abi, { toolchain, ninja, gpu }) {
 /** What a build depends on, as one string: when it matches the stamp left beside a staged file,
  *  that file is still what this script would build. */
 export function buildStamp(abi, { commit, ndk, script, gpu }) {
-  const flags = cmakeArgs(abi, { toolchain: '<toolchain>', ninja: '<ninja>', gpu: gpu ? { khronos: '<khronos>', glslc: '<glslc>' } : undefined }).join(' ')
+  // With forward slashes whatever the machine: a path cmakeArgs joins is `<khronos>\include` on Windows, and the
+  // stamp of a server built under WSL has to be the one a Windows build works out for it.
+  const flags = cmakeArgs(abi, { toolchain: '<toolchain>', ninja: '<ninja>', gpu: gpu ? { khronos: '<khronos>', glslc: '<glslc>' } : undefined }).join(' ').replace(/\\/g, '/')
   // The GPU build is also made of the patch it applies and the headers it is compiled against.
   const more = gpu ? [gpu.patch, ...KHRONOS.map((k) => k.commit)] : []
   return createHash('sha256').update([commit, ndk, script, flags, ...more].join('\n')).digest('hex')
@@ -243,6 +245,27 @@ function fetchSource(cacheDir) {
   return dest
 }
 
+/** Empties a CMake build directory that was generated from a source folder other than `source`. CMake refuses to
+ *  configure one ("does not match the source … used to generate cache"), and the source folder changes with every
+ *  bumped pin (it is named by the commit) and with --source, while the build directories are named by ABI only. */
+export function dropForeignBuildDir(buildDir, source) {
+  let home
+  try {
+    home = /^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$/m.exec(readFileSync(join(buildDir, 'CMakeCache.txt'), 'utf8'))?.[1]?.trim()
+  } catch {
+    return // never configured: nothing to disagree with
+  }
+  // Through any symbolic link: CMake may have written down either name of the same folder.
+  const real = (dir) => {
+    try {
+      return realpathSync(dir)
+    } catch {
+      return resolve(dir)
+    }
+  }
+  if (!home || real(home) !== real(source)) rmSync(buildDir, { recursive: true, force: true })
+}
+
 // ── Khronos' headers, for the GPU build (cached, commit-pinned) ───────────────────────────
 // Each is fetched by its commit and installed, by its own CMake, into one folder the build is
 // pointed at: ggml's CMake finds SPIRV-Headers as a package, which only an install provides.
@@ -266,6 +289,7 @@ function khronosHeaders(cacheDir, cmake) {
       }
       if (checkoutCommit(src) !== commit) throw new Error(`${name}: fetched ${checkoutCommit(src)}, not the pinned ${commit}`)
     }
+    dropForeignBuildDir(join(cacheDir, `${name}-build`), src)
     try {
       execFileSync(cmake, ['-S', src, '-B', join(cacheDir, `${name}-build`), `-DCMAKE_INSTALL_PREFIX=${prefix}`], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
       execFileSync(cmake, ['--install', join(cacheDir, `${name}-build`)], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' })
@@ -310,6 +334,7 @@ function build(abi, source, opts, { gpu = false } = {}) {
   const cmake = findTool(opts.cmake, 'cmake')
   const ninja = findTool(opts.ninja, 'ninja')
   const buildDir = join(opts.out, '..', gpu ? `cmake-${abi}-vk` : `cmake-${abi}`)
+  dropForeignBuildDir(buildDir, source)
   console.log(`building ${gpu ? SERVER_GPU : SERVER} for ${abi}…`)
   const args = cmakeArgs(abi, { toolchain, ninja, gpu: gpu ? gpuInputs(opts, cmake) : undefined })
   try {
