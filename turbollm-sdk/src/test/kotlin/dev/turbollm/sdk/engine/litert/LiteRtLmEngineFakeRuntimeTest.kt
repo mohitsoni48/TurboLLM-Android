@@ -97,14 +97,36 @@ class LiteRtLmEngineFakeRuntimeTest {
     }
 
     @Test
-    fun anExplicitGpuRequestThatFailsIsAModelLoadFailureWithoutACpuRetry() = runBlocking<Unit> {
+    fun anExplicitGpuRequestThatFailsRetriesOnTheCpuWithANote() = runBlocking {
+        liteRt.gpuFailure = IllegalStateException("Engine is not initialized.")
+
+        val info = engine.load(spec(Backend.GPU))
+
+        assertEquals(listOf(LiteRtBackend.Gpu, LiteRtBackend.Cpu(DEVICE_THREADS)), liteRt.opened.map { it.backend })
+        assertEquals(Backend.CPU, info.backend)
+        assertEquals(listOf("GPU unavailable: Engine is not initialized."), info.notes)
+    }
+
+    @Test
+    fun anExplicitGpuRequestTheCpuCannotLoadEitherIsAModelLoadFailureWithTheCpuReason() = runBlocking<Unit> {
         liteRt.gpuFailure = IllegalStateException("no OpenCL")
+        liteRt.cpuFailure = IllegalArgumentException("not a LiteRT-LM bundle")
 
         val failure = assertThrows(TurboLLMException.ModelLoadFailed::class.java) {
             runBlocking { engine.load(spec(Backend.GPU)) }
         }
 
-        assertTrue(failure.message!!.contains("no OpenCL"))
+        assertTrue(failure.message!!.contains("not a LiteRT-LM bundle"))
+    }
+
+    @Test
+    fun anExplicitGpuRequestOnAnEngineThatCannotRunHereIsUnavailableAndNotRetriedOnTheCpu() = runBlocking<Unit> {
+        liteRt.gpuFailure = TurboLLMException.EngineUnavailable(EngineKind.LITERT_LM)
+
+        assertThrows(TurboLLMException.EngineUnavailable::class.java) {
+            runBlocking { engine.load(spec(Backend.GPU)) }
+        }
+
         assertEquals(listOf(LiteRtBackend.Gpu), liteRt.opened.map { it.backend })
     }
 

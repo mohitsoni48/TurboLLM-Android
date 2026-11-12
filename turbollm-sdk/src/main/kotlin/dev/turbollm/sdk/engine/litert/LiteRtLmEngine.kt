@@ -25,7 +25,8 @@ private const val DEFAULT_CONTEXT_SIZE = 4096
 
 /**
  * The LiteRT-LM [Engine] over Google's AAR (architecture §2.4, §2.7). Each load gets its own engine thread,
- * stopped by [unload], and every LiteRT call runs on it. `AUTO` tries the GPU, then the CPU with a note.
+ * stopped by [unload], and every LiteRT call runs on it. `AUTO` and `GPU` both try the GPU, then the CPU with a
+ * note: a GPU that fails to initialise is a slower load, not a failed one. A failure the CPU shares still fails.
  * Each request runs in a fresh conversation, with no prefix reuse in M1. A thinking model's thinking (LiteRT-LM's
  * `thought` channel) streams as [EngineEvent.Reasoning] and its answer as [EngineEvent.Text], as on the llama.cpp
  * path, so a client gets it as `reasoning_content` and stop sequences apply to the answer only. A request that
@@ -83,8 +84,7 @@ internal class LiteRtLmEngine(
         val cpu = LiteRtBackend.Cpu(threads)
         return when (spec.backend) {
             Backend.CPU -> openOn(spec, cpu)
-            Backend.GPU -> openOn(spec, LiteRtBackend.Gpu)
-            Backend.AUTO -> openOnGpuElse(spec, cpu)
+            Backend.GPU, Backend.AUTO -> openOnGpuElse(spec, cpu)
         }
     }
 
