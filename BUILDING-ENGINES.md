@@ -38,6 +38,12 @@ paste into a search box in three months.
   build its server with the NDK AGP already uses (`stageLitertLmEngine`, needs network on the
   first build). `-PturbollmLitertLmEngine=false` leaves it out. See
   [the LiteRT-LM engine](#the-litert-lm-engine).
+- **Speech-to-text?** Nothing to do — every build compiles `libwhisper_server.so` from a pinned
+  whisper.cpp (`stageWhisperServer`; git and network access to github.com on the first build).
+  `-PturbollmWhisperServer=false` leaves it out. Every build also compiles its GPU twin,
+  `libwhisper_server_vk.so`, which needs a host C++ compiler on `PATH` (under WSL on a Windows
+  machine without one); `-PturbollmWhisperVulkan=false` leaves that out. It has not been run on a
+  phone yet. See [Speech-to-text](#speech-to-text-whispercpp).
 - **The engine tether?** Nothing to do — every build compiles `libtether_exec.so`, the helper
   that makes the kernel end each engine with the app, with the same NDK (`stageTetherExec`). See
   [the engine tether](#the-engine-tether).
@@ -231,6 +237,143 @@ run — packaged only with `-PturbollmVulkanEngine=true`. Note there is still no
 shipped beside it, which is the whole point of [gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two).
 
 The whole directory is gitignored, so none of these are in a fresh clone.
+
+### Speech-to-text (whisper.cpp)
+
+The web UI's voice input has two ways to use a recording: send it to a model that hears audio, or
+have whisper.cpp turn it into text first. The second needs whisper.cpp's `whisper-server`, and on
+Android that has to be one more executable in `nativeLibraryDir`, for the reason this whole
+document is about: the daemon cannot run a binary it downloads.
+
+**What ships.** `libwhisper_server.so` for each ABI, which is `whisper-server` renamed to fit the
+`lib*.so` rule. It is an HTTP server: the daemon runs it on `127.0.0.1` on a port the OS picks,
+under the engine tether like `llama-server`, starts it when a recording needs transcribing and
+stops it after 10 minutes unused. Only the server is bundled. The user picks a whisper model in
+Settings → Voice, and the daemon downloads it at run time from Hugging Face
+(`ggerganov/whisper.cpp`) into its data dir (`whisper/models/`).
+
+**How the daemon finds it.** It looks for `libwhisper_server.so` in `TURBOLLM_ANDROID_NATIVE_LIB_DIR`
+before any other source (`turbollm/src/voice/whisper-binary.ts`, `ANDROID_WHISPER_SERVER`). When the
+file is absent, Settings → Voice says speech-to-text is not part of this build, and the chat's
+microphone offers a recording only to a model that hears (a LiteRT-LM bundle with an audio encoder,
+on the native server).
+
+**How it is built.** `scripts/stage-whisper-server.mjs`, run by the Gradle task
+`stageWhisperServer` (a dependency of `merge*JniLibFolders`), writes
+`composeApp/build/generated/whisper/jniLibs/<abi>/libwhisper_server.so`. The source is a shallow
+git clone of tag `b5454` of https://github.com/ggml-org/whisper.cpp, the same release (v1.9.5) the
+desktop daemon installs prebuilt, kept in `composeApp/build/generated/whisper/cache`. A tag can be
+moved, so the build stops unless the clone's HEAD is commit
+`d1be6fde11ac6e0407606b4e42fe72d34add8037`. The first build therefore needs git and network access
+to github.com, and about a minute per ABI; later builds find a stamp (commit, NDK, the script and
+its CMake flags) and return at once. `--source <dir>` builds from a checkout you already have, for
+a machine with no network. `-PturbollmWhisperServer=false` leaves the server out; the packaging
+check then does not expect it.
+
+**Why these flags.**
+
+- `BUILD_SHARED_LIBS=OFF` and `ANDROID_STL=c++_static`: one self-contained file. whisper.cpp builds
+  its own ggml, and `nativeLibraryDir` is flat, so a `libggml.so` of its own would replace
+  llama.cpp's ([gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two)).
+- `GGML_OPENMP=OFF`: no `libomp.so` to ship, or to duplicate beside the one Build A ships.
+- `GGML_NATIVE=OFF`: the build machine's CPU is not the phone's.
+- CPU only: this server has no GPU backend. The GPU one is a second file, built
+  [below](#speech-to-text-on-the-gpu).
+- `ANDROID_PLATFORM=android-24`: the app's minSdk.
+- `ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON`: 16 KB-page devices.
+- Stripped after the build.
+
+The script then checks the result, with the LiteRT-LM staging's `checkElf`: the ELF machine, 16 KB
+alignment of the LOAD segments, and that it needs nothing but `libc.so`, `libm.so` and `libdl.so`.
+A file that fails is never given its final name, so it is not packaged.
+
+**Sizes**, uncompressed: 2.4 MB (arm64-v8a) and 2.8 MB (x86_64).
+
+**Bumping.** Change `WHISPER_TAG` and `WHISPER_COMMIT` together in the script (the commit from
+`git ls-remote https://github.com/ggml-org/whisper.cpp refs/tags/<tag>`), keep the tag equal to
+`WHISPER_BUILD` in the daemon, rebuild, and transcribe something once on a device. A bump must also
+carry the GPU patch forward (`git apply --check` it on the new source; the build stops if it does
+not apply), or drop it once upstream has the fix, and bump the Khronos pins (`KHRONOS`) if the new
+ggml asks for newer headers. The daemon
+depends on the server's command line (`--host`, `--port`, `-m`, `-l`, `-t`, `-ng`) and on its `/health`
+and `/inference` routes, and nothing else checks them.
+
+`node --test scripts/stage-whisper-server.test.mjs` covers the CMake arguments, the pin, the
+command line and the file checks (those with the NDK, found as for the tether test). Setting
+`TURBOLLM_WHISPER_SOURCE` to a whisper.cpp checkout adds a real x86_64 build, about a minute, and a
+check that the GPU patch applies; adding `TURBOLLM_WHISPER_VULKAN=1` builds the GPU server too, on
+a copy of the checkout, in a few minutes.
+
+The server listens on a loopback port the daemon picks and only the daemon talks to it, so the
+WebView's rule against other `127.0.0.1` ports does not apply.
+
+#### Speech-to-text on the GPU
+
+**Status.** The GPU server is in every build, and using it is the user's choice: "Use the GPU" in
+Settings → Voice, off until they turn it on. It has been built and its ELF checked. It has not
+been run on any phone, and no speedup has been measured, which is why the daemon never depends on
+it: when it cannot start, the CPU server does the work (see "At run time" below).
+
+**What it is.** `libwhisper_server_vk.so`: the same `whisper-server` with ggml's Vulkan backend
+linked in, for arm64-v8a only. It is a second file, not a flag on the first, for the reason the
+Vulkan llama.cpp engine is one ([gotcha 1](#gotcha-1-ggml_backend_dlon-means-one-engine-not-two),
+[Build B](#build-b--the-vulkan-gpu-engine)): a Vulkan failure must not be able to take the CPU path
+with it. So the Vulkan backend is static (`GGML_BACKEND_DL=OFF`), and the CPU server is built and
+shipped whether or not this one is.
+
+**Leaving it out.** `-PturbollmWhisperVulkan=false` builds the app without it (Gradle then does
+not pass the script `--vulkan`): speech-to-text runs on the CPU only, and Settings → Voice does not
+offer the GPU. Such a build deletes a GPU server staged earlier, because the APK packages whatever
+is in the folder.
+
+**What the build needs**, on top of the CPU build:
+
+- A host C++ compiler (gcc or clang) on `PATH`: ggml builds its shader generator,
+  `vulkan-shaders-gen`, for the build machine.
+- The NDK's `shader-tools/<host>/glslc`.
+- Network access to github.com for Khronos' `Vulkan-Headers` and `SPIRV-Headers`, which the NDK
+  lacks in the C++ form ggml-vulkan includes. They are fetched by commit (`KHRONOS` in the script),
+  installed into `composeApp/build/generated/whisper/cache`, and reused.
+
+A clean build of it takes about a minute and a half on top of the CPU build.
+
+**A machine with no host compiler** (Windows, usually). The shader generator is a host program,
+so without gcc or clang on `PATH` the GPU build stops, showing the compiler's error and what to
+do. Not tried on Windows with a compiler installed. The way that is known to work is to build it
+once under WSL into the same folder, with the same NDK version:
+
+```
+node scripts/stage-whisper-server.mjs --vulkan --abis arm64-v8a --ndk <the Linux NDK> --out <the --out Gradle uses, as WSL sees it>
+```
+
+The stamp names the NDK by its version (`Pkg.Revision`), not its path, so the Windows build then
+finds that file up to date and does not try to rebuild it. After a bump (whisper.cpp, the NDK, the
+patch, the script) the stamp no longer matches: build it under WSL again.
+
+**The patch.** `engines/whisper/vulkan-pre-1.2-devices.patch` is the `ggml-vulkan.cpp` part of
+commit `72d4bcd102d3b823c2bb1260fdc0e5da1af1f4b1` of this project's llama.cpp fork
+(`mohitsoni48/TurboLLM-Android-Llama`, "vulkan: fix three null-pointer crashes on pre-1.2 devices
+reporting VK 1.2 features"). Without it the backend crashes on phones whose driver reports Vulkan
+1.2 features but is older. whisper.cpp `b5454` vendors the same ggml code, so it applies unchanged.
+The script applies it to the source before the GPU build (a checkout already carrying it is left
+alone); the CPU build compiles none of what it touches. Its hash is part of the build stamp.
+
+**The checks.** Those of the CPU server (ELF machine, 16 KB alignment), except that it may also
+need `libvulkan.so`, and it must: a file without it means the backend was not linked in.
+
+**Size and floor.** 23.4 MB stripped, about 7.4 MB compressed in the APK. NEEDED: `libm.so`,
+`libvulkan.so`, `libdl.so`, `libc.so`. It is linked for API 28, because ggml-vulkan calls
+`vkGetPhysicalDeviceFeatures2`, so it cannot start below Android 9 (the APK's minSdk is 24).
+
+**At run time.** The daemon runs it only when "Use the GPU" is on in Settings → Voice, which is off
+by default. If the GPU server fails to start, or dies during a transcription, the daemon goes back
+to the CPU server for the rest of that run and says why in Settings → Voice.
+
+**Next step.** A device run with the option on, and a look at `logs/whisper-server.log` in the
+daemon's data dir for `ggml_vulkan:` lines (which GPU it picked, or why it did not). When the GPU
+server could not start, what it printed is kept beside it in `logs/whisper-server.failed.log`
+(the next start empties the log itself), and the reason is shown in Settings → Voice. Until then
+treat the GPU server as untested.
 
 ---
 

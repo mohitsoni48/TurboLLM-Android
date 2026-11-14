@@ -74,6 +74,9 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
      README; for a repo of checkpoints, their config files too), all from `huggingface.co` over
      HTTPS, with the user's Hugging Face token when one is set (`hf/hf.ts`).
    - Downloading a model you chose, from Hugging Face.
+   - Downloading the whisper model you pick in Settings → Voice, once, from `huggingface.co` (the
+     same host as model downloads), for speech-to-text. The recording itself is transcribed on the
+     device and is not sent anywhere for that.
    - Downloading an inference engine, which a normal install never does: the engines ship inside
      the APK (the CPU `llama-server`, the LiteRT-LM server unless a build turns it off, and the
      Vulkan `llama-server` in builds made with it) and are registered from there at every boot
@@ -123,7 +126,29 @@ CURRENTLY CODED; once Firebase is integrated, add a corresponding "app diagnosti
      folder is set (`StorageAccess.kt`). On Android 11+ the app requests no storage permission, so
      in shared storage it can read only files it created itself; models are imported with the
      system file picker, which needs none.
-   - No location, camera, microphone or contacts permission, and no All files access
+   - `RECORD_AUDIO` (with `MODIFY_AUDIO_SETTINGS`, which the WebView's audio stack needs to open a
+     recording device and which has no prompt) — the chat's voice input. Android asks for it the
+     first time the user taps the microphone in the chat box, never at startup
+     (`DaemonWebView.kt`, `onPermissionRequest`), and the page is granted the microphone only: a
+     request that names the camera is refused. A recording is made only while the user holds a
+     recording open in the chat, with the app on screen; nothing listens in the background, and the
+     foreground service declares no microphone type. The recording goes to the daemon inside the
+     app (`127.0.0.1`) and from there to the model the user has loaded, or to whisper.cpp, which turns it
+     into text on the device (`libwhisper_server.so`, shipped in the APK); audio never leaves the
+     phone for that. It is kept with the conversation in the app's private storage when it is sent as a
+     voice message, and leaves the device only if the user has pointed the chat at another machine
+     of their own (Turbo Link, remote access). Declared with
+     `<uses-feature android:name="android.hardware.microphone" android:required="false" />`, so
+     the app still installs on a device without one.
+   - A `<queries>` entry for `android.intent.action.TTS_SERVICE` — "Read aloud" speaks a reply with
+     the device's own text-to-speech engine (`TtsBridge.kt`), which an app cannot start on Android
+     11+ without naming its service. A reply is read by a voice for the language it is written in.
+     Only voices that speak on the phone are used unless the user turns on "Allow online voices"
+     in Settings → Voice: a speech engine's network voice is made on that engine's servers (for
+     the stock engine, Google's), so with the option on the text of a reply in a language the
+     phone has no voice for is sent there. It is off by default. The page reaches the engine over
+     a channel that only the app's own page gets, not the sandboxed frame a chat artifact runs in.
+   - No location, camera or contacts permission, and no All files access
      (`MANAGE_EXTERNAL_STORAGE`). `FOREGROUND_SERVICE_DATA_SYNC`, which an earlier build declared
      for a foreground service it never implemented and Play's automated review flagged, is gone;
      the foreground service now in the app is the `specialUse` one above.
@@ -219,6 +244,15 @@ would drop the web UI's own settings along with a pasted key.
   collects nothing, but an image in a model reply loads from the host it names (any https host,
   or plain http on port 80) as soon as the reply shows, so text a reply puts in an image's URL
   reaches that host (item 1 under "What this app actually does over the network").
+- **Audio (voice or sound recordings).** The app records the microphone only while the user
+  records a voice message in the chat, and the recording never leaves the device on TurboLLM's
+  account: it goes to the daemon inside the app and on to the model the user loaded (item
+  "`RECORD_AUDIO`" under the permissions above). Play's form counts data as *collected* only when
+  it is sent off the device, so a recording handled on the device is not; if a later build sends
+  recordings anywhere of its own accord, this answer changes. A user who points the chat at
+  another machine of their own (Turbo Link, remote access) sends it there themselves. Review this
+  answer against the form's own wording before submitting: this note was written from the code,
+  not from the Play Console.
 - **Is data encrypted in transit?** Yes for Firebase's traffic (Google's SDKs use HTTPS/TLS).
   N/A for the app's own loopback traffic; Hugging Face/GitHub downloads use HTTPS. Images in a
   reply or a model card can load over plain http, on port 80 (item 1).

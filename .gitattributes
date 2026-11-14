@@ -4,3 +4,6 @@
 # first \r ("set: pipefail: invalid option name"). gradlew is the same for WSL, Linux and macOS.
 *.sh    text eol=lf
 gradlew text eol=lf
+# A patch is applied to a source tree that has LF (scripts/stage-whisper-server.mjs, `git apply`), under WSL from
+# this same checkout too: with CRLF it does not apply.
+*.patch text eol=lf

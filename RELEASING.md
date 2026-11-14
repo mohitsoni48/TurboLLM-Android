@@ -7,18 +7,32 @@ section.
 
 ## What a clean build needs
 
-A fresh checkout downloads two pinned, SHA-256-checked inputs during the build, so the first build needs network
-access to GitHub and PyPI (later builds use the cached copies under `composeApp/src/androidMain/cpp/libnode` and
-`composeApp/build/generated/litert-lm/cache`):
+A fresh checkout downloads three pinned inputs during the build (two checked by SHA-256, whisper.cpp by commit), so
+the first build needs network access to GitHub and PyPI (later builds use the cached copies under
+`composeApp/src/androidMain/cpp/libnode`, `composeApp/build/generated/litert-lm/cache` and
+`composeApp/build/generated/whisper/cache`):
 
 - **libnode** (`scripts/fetch-libnode.mjs`, run by `preBuild`): digidem nodejs-mobile v18.20.4 from GitHub releases.
   On Linux it is unpacked with `unzip`, which must be on `PATH`.
 - **LiteRT-LM** (`scripts/stage-litert-lm-engine.mjs`, run before native libs are merged): the `litert-lm-api` wheel
   from PyPI; its native server is then compiled per ABI.
+- **whisper-server** (`scripts/stage-whisper-server.mjs`, run before native libs are merged): a shallow `git clone` of
+  whisper.cpp tag `b5454` from github.com, which must match the pinned commit, compiled per ABI into
+  `libwhisper_server.so`. Needs `git` on `PATH`.
 
 And from the Android SDK: **NDK 27.0.12077973** (pinned as `ndkVersion`) and **CMake 3.22.1** (the server is built
 with its `cmake` and `ninja`), plus Node on `PATH` for the scripts. Build with `-PturbollmLitertLmEngine=false` to
-leave LiteRT-LM out, which also drops the PyPI and CMake requirements.
+leave LiteRT-LM out, which also drops the PyPI requirement, and `-PturbollmWhisperServer=false` to leave out
+speech-to-text, which drops the git requirement; with both, CMake is not needed either. See
+[Speech-to-text](BUILDING-ENGINES.md#speech-to-text-whispercpp).
+
+Every build also compiles the GPU speech-to-text server, `libwhisper_server_vk.so` (23.4 MB, about 7.4 MB
+compressed; arm64-v8a, Android 9 and later), which the app runs when the user turns on "Use the GPU" in Settings →
+Voice. It needs two things more than the CPU server: a host C++ compiler (gcc or clang) on `PATH`, and network access
+to github.com for the Khronos Vulkan and SPIR-V headers. A machine without a compiler (Windows, usually) builds it
+once under WSL; see [Speech-to-text on the GPU](BUILDING-ENGINES.md#speech-to-text-on-the-gpu).
+`-PturbollmWhisperVulkan=false` leaves it out. CI passes no whisper property (`pr-alpha.yml`) and runs on
+`ubuntu-latest`, which has gcc, so CI builds carry both servers. The GPU server has not been run on a phone yet.
 
 ## One-time: the upload keystore
 
@@ -189,7 +203,7 @@ are skipped; a newer push cancels an in-flight build for the same PR). It fetche
 daemon from `mohitsoni48/TurboLLM@main` and installs its packages (staging builds its web UI),
 fetches `libnode.so` with `scripts/fetch-libnode.mjs` (the digidem 16 KB-aligned nodejs-mobile build,
 verified against the SHA-256s in the script and PROVENANCE.md), stages the LiteRT-LM engine from
-PyPI, and uses the tracked CPU llama.cpp engine in `jniLibs/`. The Vulkan engine is not built in CI.
+PyPI, builds whisper-server from a pinned whisper.cpp clone, and uses the tracked CPU llama.cpp engine in `jniLibs/`. The Vulkan engine is not built in CI.
 Because the daemon comes from TurboLLM `main`, a PR here that needs daemon changes builds a working
 alpha only once those daemon changes are merged.
 
