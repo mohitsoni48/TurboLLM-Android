@@ -1,0 +1,33 @@
+[
+ {
+  "_id": "1",
+  "id": "unsloth/Qwen3-1.7B-GGUF",
+  "likes": 50,
+  "downloads": 1000,
+  "lastModified": "2026-10-01T00:00:00.000Z",
+  "gated": false,
+  "private": false,
+  "tags": [
+   "gguf"
+  ]
+ },
+ {
+  "_id": "2",
+  "id": "google/gemma-3-1b-it",
+  "likes": 5,
+  "downloads": 10,
+  "lastModified": "2026-09-01T00:00:00.000Z",
+  "gated": "manual",
+  "tags": [
+   "gguf",
+   "litert-lm"
+  ]
+ },
+ {
+  "_id": "3",
+  "modelId": "bartowski/Old-GGUF",
+  "likes": 1,
+  "downloads": 3,
+  "createdAt": "2025-01-01T00:00:00.000Z"
+ }
+]

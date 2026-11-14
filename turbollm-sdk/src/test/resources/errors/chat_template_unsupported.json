@@ -1,0 +1,1 @@
+{"error":{"message":"The model's chat template is not supported.","type":"invalid_request_error","param":null,"code":"chat_template_unsupported"}}

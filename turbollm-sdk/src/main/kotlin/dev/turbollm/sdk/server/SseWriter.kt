@@ -1,0 +1,149 @@
+package dev.turbollm.sdk.server
+
+import dev.turbollm.sdk.api.ChatCompletionChunk
+import dev.turbollm.sdk.api.ChatRole
+import dev.turbollm.sdk.api.ChunkDelta
+import dev.turbollm.sdk.api.ErrorBody
+import dev.turbollm.sdk.api.TurboLLMException
+import dev.turbollm.sdk.api.toErrorBody
+import dev.turbollm.sdk.internal.sdkJson
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeStringUtf8
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.ChannelResult
+import kotlinx.coroutines.channels.ProducerScope
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.channels.consume
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
+
+private const val DONE_DATA = "[DONE]"
+private const val PING_FRAME = ": ping\n\n"
+private const val PROBE_FRAME = ":\n\n"
+
+/**
+ * How long a stream may stay silent before [SseWriter] probes the client. CIO notices a closed socket only some
+ * four to six writes after the close, so 25 ms puts that inside about 150-200 ms (measured over loopback):
+ * well inside the 500 ms bound for freeing the gate during a prefill and the 1 s bound during generation, with
+ * room for a slow phone. 50 ms measured 310-330 ms, too close to 500 ms once a client's own polling is added.
+ * The price is one 3-byte comment (8 bytes on the wire) per 25 ms of silence.
+ */
+internal val LIVENESS_PROBE_INTERVAL = 25.milliseconds
+private val ROLE_ONLY_DELTA = ChunkDelta(role = ChatRole.ASSISTANT)
+
+/** What a streamed reply sends: a chunk, a keep-alive ping while the client waits, or the failure that ends it. */
+internal sealed interface StreamEvent {
+    data class Chunk(val chunk: ChatCompletionChunk) : StreamEvent
+    data object Ping : StreamEvent
+    data class Failure(val error: TurboLLMException) : StreamEvent
+}
+
+/** The reply's chunks, ended by a [StreamEvent.Failure] instead of an exception when the reply fails. */
+internal fun Flow<ChatCompletionChunk>.asStreamEvents(): Flow<StreamEvent> =
+    map<ChatCompletionChunk, StreamEvent> { StreamEvent.Chunk(it) }
+        .catch { failure -> emit(StreamEvent.Failure(failure.asReplyFailure())) }
+
+/**
+ * The events with a [StreamEvent.Ping] every [interval] while the request is queued, loading or prefilling.
+ * Pings stop at the first generated event.
+ *
+ * The ping and [SseWriter]'s liveness probe do different jobs. The ping is the visible keep-alive of ADR-347,
+ * `: ping`, for clients and proxies that watch for it before they give up on a slow first token. The probe is
+ * an empty `:` comment that exists only so the server finds a client that left (QA E-10, E-12); it also keeps
+ * the connection from ever being silent, but nothing should rely on that.
+ */
+internal fun Flow<StreamEvent>.withKeepAlive(interval: Duration): Flow<StreamEvent> = channelFlow {
+    val pinger = launch { pingEvery(interval) }
+    collect { event ->
+        if (!event.announcesRoleOnly()) pinger.cancelAndJoin()
+        send(event)
+    }
+    pinger.cancelAndJoin()
+}
+
+/**
+ * Writes one reply as Server-Sent Events: `data: <json>` frames, `: ping` comments, empty `:` liveness probes,
+ * and `data: [DONE]` last. The status line is already sent, so a failure travels as a `data: {"error":{...}}`
+ * event.
+ */
+internal class SseWriter(
+    private val channel: ByteWriteChannel,
+    private val probeInterval: Duration = LIVENESS_PROBE_INTERVAL,
+) {
+
+    /**
+     * Writes [first], then every event of [rest], then `[DONE]`. A write that fails (the client left) cancels
+     * [rest], which cancels the reply and so the engine, even if nothing reports the failure further up.
+     *
+     * Ktor CIO never tells a call that its client closed the connection, and a write to a gone client fails
+     * only a few writes later. So every silence longer than [probeInterval] (a prefill, a slow token) is filled
+     * with an empty SSE comment, which clients ignore: a client that left is found within a few probes, not at
+     * the next token or 15 s ping (QA E-10, E-12).
+     */
+    suspend fun relay(first: StreamEvent?, rest: ReceiveChannel<StreamEvent>) = rest.consume {
+        first?.let { write(it) }
+        while (relayNextOrProbe(rest)) continue
+        done()
+    }
+
+    /** Relays the next event, or probes the client if none comes within [probeInterval]. False once [events] end. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun relayNextOrProbe(events: ReceiveChannel<StreamEvent>): Boolean = select {
+        events.onReceiveCatching { next -> relayed(next) }
+        onTimeout(probeInterval) {
+            frame(PROBE_FRAME)
+            true
+        }
+    }
+
+    private suspend fun relayed(next: ChannelResult<StreamEvent>): Boolean {
+        next.exceptionOrNull()?.let { throw it }
+        next.getOrNull()?.let { write(it) }
+        return next.isSuccess
+    }
+
+    private suspend fun write(event: StreamEvent) = when (event) {
+        is StreamEvent.Chunk -> data(sdkJson.encodeToString(ChatCompletionChunk.serializer(), event.chunk))
+        StreamEvent.Ping -> frame(PING_FRAME)
+        is StreamEvent.Failure -> data(sdkJson.encodeToString(ErrorBody.serializer(), event.error.toErrorBody()))
+    }
+
+    private suspend fun done() = data(DONE_DATA)
+
+    private suspend fun data(payload: String) = frame("data: $payload\n\n")
+
+    private suspend fun frame(text: String) {
+        channel.writeStringUtf8(text)
+        channel.flush()
+    }
+}
+
+private suspend fun ProducerScope<StreamEvent>.pingEvery(interval: Duration) {
+    while (true) {
+        delay(interval)
+        send(StreamEvent.Ping)
+    }
+}
+
+private fun StreamEvent.announcesRoleOnly(): Boolean =
+    this is StreamEvent.Chunk && chunk.choices.singleOrNull()?.delta == ROLE_ONLY_DELTA
+
+/**
+ * The SDK's own failures as they are. An unload ends the generation with a cancellation the request itself did
+ * not ask for, so it is reported as the model no longer being loaded; anything else is an engine failure.
+ */
+internal fun Throwable.asReplyFailure(): TurboLLMException = when (this) {
+    is TurboLLMException -> this
+    is CancellationException -> TurboLLMException.ModelNotLoaded(message ?: "The model was unloaded.")
+    else -> TurboLLMException.EngineFailure(message ?: "The engine failed while generating.", this)
+}
