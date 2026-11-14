@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="turbollm_sdk_notification_title">On-device model</string>
+    <string name="turbollm_sdk_channel_name">On-device model</string>
+</resources>

@@ -17,3 +17,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "TurboLLM"
 include(":composeApp")
+include(":turbollm-sdk")

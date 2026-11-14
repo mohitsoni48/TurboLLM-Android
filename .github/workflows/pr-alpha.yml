@@ -67,7 +67,10 @@ jobs:
           done
           exit $missing
 
+      # submodules: the SDK builds llama.cpp from third_party/llama.cpp, pinned by its gitlink.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
 
       # The Android app is a shell around the TurboLLM daemon, which lives in its own repo and is
       # bundled into the APK (scripts/stage-daemon-assets.mjs). Public repo, so no token needed.

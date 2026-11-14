@@ -1,0 +1,25 @@
+[
+ {
+  "type": "file",
+  "oid": "f5",
+  "size": 135,
+  "path": "Q8_0/Big-Q8_0-00002-of-00002.gguf",
+  "lfs": {
+   "oid": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+   "size": 200,
+   "pointerSize": 135
+  }
+ },
+ {
+  "type": "file",
+  "oid": "f6",
+  "size": 500,
+  "path": "model-int4.litertlm"
+ },
+ {
+  "type": "file",
+  "oid": "f7",
+  "size": 700,
+  "path": "config.json"
+ }
+]
