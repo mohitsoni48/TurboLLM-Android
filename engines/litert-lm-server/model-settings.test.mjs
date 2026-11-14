@@ -16,14 +16,14 @@
 // Every server a test starts is killed by pid when that test ends, or at the latest when the tests end. Every wait is
 // bounded.
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { after, before, test } from 'node:test'
 import {
   buildServer, calls, chat, fb, flatbuffer, killServers, litertlmFile, logged, proto, realLibrary, realModels, request,
-  skip, skipReal, startServer, stopServer,
+  skip, skipReal, sleep, startServer, stopServer,
 } from './testdata/harness.mjs'
 
 const visionModels = (process.env.LITERT_LM_TEST_VISION_MODELS ?? '').split(',').filter(Boolean)
@@ -252,6 +252,54 @@ test('an image or audio part sent to a model without that input is a 400 that sa
   assert.equal((await chat(fake, { model: readable('vl'), messages: imageMessage('What color is this?') })).status, 200)
   assert.equal((await chat(fake, { model: readable('omni'), messages: audioMessage })).status, 200)
   assert.equal((await chat(fake, { model: unreadable('unreadable'), messages: imageMessage('What color is this?') })).status, 200)
+})
+
+test('a model file is read once while it is unchanged, and again once it changes, in the same second at the same size or with its time put back', { skip, timeout: 60_000 }, async () => {
+  const path = join(work, 'rewritten.litertlm')
+  const reads = async (name) => (await logged(fake)).filter((l) => l.startsWith('Reading the header of ') && l.endsWith(`/${name}`)).length
+  // Takes no image, until it is rewritten in place (the same inode), at the same size (a section each), its
+  // modification time moved within the same second: then it has a vision encoder.
+  litertlmFile(path, [decoder, tflite('tf_lite_embedder')])
+  const second = Math.floor(Date.now() / 1000) - 60
+  utimesSync(path, second + 0.25, second + 0.25)
+  const before = statSync(path)
+  assert.deepEqual(await chat(fake, { model: path, messages: imageMessage('What is this?') }), { status: 400, error: 'Invalid messages: rewritten.litertlm takes no image input' })
+  for (let i = 0; i < 3; i++) assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 1)
+  litertlmFile(path, [decoder, tflite('tf_lite_vision_encoder')])
+  utimesSync(path, second + 0.75, second + 0.75)
+  const after = statSync(path)
+  assert.deepEqual([after.ino, after.size, Math.floor(after.mtimeMs / 1000)], [before.ino, before.size, second])
+  assert.equal((await chat(fake, { model: path, messages: imageMessage('What is this?') })).status, 200)
+  assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 2)
+  // Rewritten again, as the file without the encoder, and given back the modification time it had (as cp -p, touch -r
+  // and tar do): the same inode, size and modification time to the nanosecond, its change time moved.
+  const was = statSync(path, { bigint: true })
+  await sleep(20)
+  litertlmFile(path, [decoder, tflite('tf_lite_embedder')])
+  utimesSync(path, second + 0.75, second + 0.75)
+  const now = statSync(path, { bigint: true })
+  assert.deepEqual([now.ino, now.size, now.mtimeNs], [was.ino, was.size, was.mtimeNs])
+  assert.notEqual(now.ctimeNs, was.ctimeNs)
+  assert.deepEqual(await chat(fake, { model: path, messages: imageMessage('What is this?') }), { status: 400, error: 'Invalid messages: rewritten.litertlm takes no image input' })
+  assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  assert.equal(await reads('rewritten.litertlm'), 3)
+  // A header end the runtime cannot load is refused for every request, read once, and the engine loaded stays.
+  const bad = join(work, 'bad-offset.litertlm')
+  const preamble = Buffer.alloc(32)
+  preamble.write('LITERTLM')
+  preamble.writeBigUInt64LE(1n << 40n, 24)
+  writeFileSync(bad, Buffer.concat([preamble, Buffer.alloc(16384)]))
+  const log = await callsDuring(async () => {
+    for (let i = 0; i < 2; i++) {
+      assert.deepEqual(await chat(fake, { model: bad, messages: hello }), { status: 500,
+        error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${bad}: invalid .litertlm header')` })
+    }
+    assert.equal((await chat(fake, { model: path, messages: hello })).status, 200)
+  })
+  assert.deepEqual(log.filter((c) => c.call === 'engine_create'), [])
+  assert.equal(await reads('bad-offset.litertlm'), 1)
 })
 
 // The server's peak resident memory, from /proc (Linux, as the tests are).
@@ -701,6 +749,35 @@ test('repetition penalties reach the model with llama.cpp\'s and OpenAI\'s meani
   assert.equal((await logged(fake)).filter((l) => l === 'min_p is not applied to plain.litertlm: LiteRT-LM has no min-p sampling').length, 1, fake.stderr)
 })
 
+test('a sampler or penalty value a float cannot hold is a 400 that names it, and one it can is passed as set', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const range = (field, value) => `Invalid sampler parameters: ValueError: ${field} must be within a float's range (-3.4028235e+38 to 3.4028235e+38), got ${value}`
+  for (const [request, error] of [
+    [{ temperature: 1e39 }, range('temperature', '1e+39')],
+    [{ repetition_penalty: 1e39 }, range('repetition_penalty', '1e+39')],
+    [{ repeat_penalty: 1e39 }, range('repeat_penalty', '1e+39')],
+    [{ presence_penalty: 1e39 }, range('presence_penalty', '1e+39')],
+    [{ presence_penalty: -1e39 }, range('presence_penalty', '-1e+39')],
+    [{ frequency_penalty: 1e39 }, range('frequency_penalty', '1e+39')],
+    [{ frequency_penalty: -1e39 }, range('frequency_penalty', '-1e+39')],
+    // Past FLT_MAX by more than half a float's step, so it rounds to infinity (3.4028235e38, below, is past it by less
+    // and rounds to FLT_MAX).
+    [{ temperature: 3.4028236e38 }, range('temperature', '3.4028236e+38')],
+  ]) {
+    for (const stream of [false, true]) {
+      assert.deepEqual(await chat(fake, { model, messages: hello, ...request, stream }), { status: 400, error }, JSON.stringify(request))
+    }
+  }
+  // Within a float's range, as set: the sampler and the penalties get it.
+  const log = await callsDuring(async () => {
+    const reply = await chat(fake, { model, messages: hello, temperature: 3e38, repetition_penalty: 3e38, presence_penalty: -3e38, frequency_penalty: 3.4028235e38 })
+    assert.equal(reply.status, 200, reply.error)
+  })
+  assert.equal(log.filter((c) => c.call === 'conversation_create').at(-1).config.sampler.temperature, f(3e38))
+  assert.deepEqual(log.filter((c) => c.call === 'send_message').at(-1).args.repetition_penalty_config,
+    { repetition_penalty: f(3e38), presence_penalty: f(-3e38), frequency_penalty: f(3.4028235e38), window_size: 0 })
+})
+
 test('min_p is said once per model, by a request that is answered, also when requests with it arrive at once', { skip, timeout: 60_000 }, async () => {
   // Each connection has its own thread. The note is taken under the engine lock, so requests refused before it (here
   // for their response_format) never touch it, and answered ones take turns.
@@ -881,6 +958,36 @@ test('a prompt that does not fit the context window is a 400 that says the windo
     '(INVALID_ARGUMENT: Input token ids are too long. Exceeding the maximum number of tokens allowed: 4209 >= 4096)' })
 })
 
+test('model output nested deeper than the server reads fails its request, streamed or not, and the server stays up', { skip, timeout: 60_000 }, async () => {
+  const model = readable('plain')
+  const nested = (n, stream) => chat(fake, { model, messages: [{ role: 'user', content: `nested:${n}` }], stream }, 30_000)
+  // A tool call's arguments nested as deep as a request's may be, 128 levels ({"a": ...} and 127 arrays), are read as
+  // before; so are 125, which LiteRT-LM 0.18.0 itself takes from a model.
+  for (const n of [100, 125, 127]) {
+    const reply = await nested(n, false)
+    assert.equal(reply.status, 200, `${n}: ${reply.error}`)
+    assert.equal(reply.finish, 'tool_calls')
+    assert.deepEqual(JSON.parse(reply.tool_calls[0].function.arguments), { a: JSON.parse('['.repeat(n) + ']'.repeat(n)) })
+  }
+  // One level more is refused. Copied or written out a level at a time, 200,000 levels ran the connection thread out of
+  // stack.
+  const error = 'RuntimeError: the model\'s output, as the runtime parsed it, is nested deeper than 132 levels ' +
+    '(128 within a tool call\'s arguments)'
+  assert.deepEqual(await nested(128, false), { status: 500, error })
+  assert.deepEqual(await nested(200_000, false), { status: 500, error })
+  const res = await request(`http://127.0.0.1:${fake.port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'nested:200000' }], stream: true }),
+  }, 30_000)
+  assert.equal(res.status, 200)
+  assert.ok(res.text.includes(`event: response.error\ndata: ${JSON.stringify({ error })}\n\n`), res.text)
+  assert.ok(res.text.endsWith('data: [DONE]\n\n'), res.text)
+  // A chunk that is no JSON is the reply's text, as always, however many brackets it opens.
+  const text = await chat(fake, { model, messages: [{ role: 'user', content: 'nested-text:200' }] })
+  assert.deepEqual([text.status, text.content], [200, `${'['.repeat(200)} not json`])
+  assert.equal((await chat(fake, { model, messages: hello })).status, 200)
+})
+
 for (const path of realModels.length ? realModels : ['<model>']) {
   test(`a real model's context window is its own when more is asked, and a reply that fills it ends with "length": ${path}`, { skip: skipReal, timeout: 900_000 }, async () => {
     const config = join(work, 'no-cache.json')
@@ -971,6 +1078,52 @@ test('with no backend set, the model\'s own is used, and one that does not start
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['gpu', 'cpu'] })
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
   assert.deepEqual(await engines(recurrent), { status: 200, error: undefined, created: ['cpu'] })
+})
+
+test('a backend the request sets after the model\'s own fell back gets an engine on it or its error, never the other', { skip, timeout: 60_000 }, async () => {
+  const engines = async (ref) => {
+    let reply
+    const log = await callsDuring(async () => { reply = await chat(fake, { model: ref, messages: hello }) })
+    return { status: reply.status, error: reply.error, created: log.filter((c) => c.call === 'engine_create').map((c) => c.backend) }
+  }
+  const ok = (created) => ({ status: 200, error: undefined, created })
+  const gpuError = (path) => ({ status: 500, created: ['gpu'],
+    error: `Failed to load engine: RuntimeError('Failed to create LiteRT-LM engine for ${path}: UNAVAILABLE: no usable OpenCL device')` })
+  // The model's own gpu does not start, so its engine runs on cpu, and a request without a backend keeps that engine.
+  const broken = readable('gpu-broken')
+  assert.deepEqual(await engines(broken), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(broken), ok([]))
+  // gpu set: an engine on gpu, here the GPU's error, not the engine that runs on cpu.
+  assert.deepEqual(await engines(`${broken},gpu`), gpuError(broken))
+  // cpu set: the engine that runs on cpu serves it, and requests without a backend keep it after.
+  assert.deepEqual(await engines(broken), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(`${broken},cpu`), ok([]))
+  assert.deepEqual(await engines(broken), ok([]))
+  // A model that gets a new engine for each conversation (an LFM2 one): gpu set is not the cpu its last one ran on.
+  const recurrent = litertlmFile(join(work, 'gpu-broken-lfm2-set.litertlm'), [tflite('tf_lite_prefill_decode', 'gpu,cpu'), llmMetadata(LFM2)])
+  assert.deepEqual(await engines(recurrent), ok(['gpu', 'cpu']))
+  assert.deepEqual(await engines(`${recurrent},gpu`), gpuError(recurrent))
+  // An engine on the model's own backend serves a request that sets it; one on a backend a request set is not the
+  // model's choice, so a request without a backend gets the model's own.
+  const first = readable('gpu-first')
+  assert.deepEqual(await engines(first), ok(['gpu']))
+  assert.deepEqual(await engines(`${first},gpu`), ok([]))
+  assert.deepEqual(await engines(first), ok([]))
+  assert.deepEqual(await engines(`${first},cpu`), ok(['cpu']))
+  assert.deepEqual(await engines(first), ok(['gpu']))
+  // A model file replaced by one whose own backend is another gets an engine on that one.
+  const replaced = readable('backend-replaced', [decoder])
+  assert.deepEqual(await engines(replaced), ok(['cpu']))
+  readable('backend-replaced', [tflite('tf_lite_prefill_decode', 'gpu'), llmMetadata(GENERIC)])
+  assert.deepEqual(await engines(replaced), ok(['gpu']))
+  // And one whose own backend is the one the old file's engine fell back to gets an engine of its own too, not the old
+  // file's: that one was keyed by the cpu it runs on, and served the new file with the old file's settings (here an
+  // LFM2 model's new engine for each conversation was lost to the old file's info).
+  const fellBack = readable('gpu-broken-replaced', [tflite('tf_lite_prefill_decode', 'gpu,cpu'), llmMetadata(GENERIC)])
+  assert.deepEqual(await engines(fellBack), ok(['gpu', 'cpu']))
+  readable('gpu-broken-replaced', [tflite('tf_lite_prefill_decode', 'cpu'), llmMetadata(LFM2)])
+  assert.deepEqual(await engines(fellBack), ok(['cpu']))
+  assert.deepEqual(await engines(fellBack), ok(['cpu']), 'and LFM2 gets a new engine for its next conversation')
 })
 
 test('a developer message is a system message', { skip, timeout: 60_000 }, async () => {
