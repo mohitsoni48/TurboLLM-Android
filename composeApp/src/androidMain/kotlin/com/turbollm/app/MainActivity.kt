@@ -15,6 +15,10 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.pm.PackageInfoCompat
 import dev.turbollm.sdk.ServerHandle
 import dev.turbollm.sdk.TurboLLM
 import java.io.File
@@ -25,6 +29,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "TurboLLM"
 private const val SDK_LOG_TAG = "TurboLLMSdk"
+
+/** In filesDir: the daemon's fatal record (DaemonFatal). */
+private const val DAEMON_FATAL_FILE = "daemon-fatal.json"
 
 /** The daemon's listen port on Android — 7000, not desktop/LAN's 6996, to avoid any ambiguity
  *  between the two when both might be reachable on the same machine during testing (an
@@ -50,6 +57,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var storageAccess: StorageAccess
     /** From EngineService.activityOpened: the service ignores this activity's close once a newer one is open. */
     private var activityNumber = 0
+    /** The daemon's fatal record, when it could not start (DaemonFatal): the app then shows DaemonFatalScreen and
+     *  does not run Node. State, so the screen can replace the WebView without restarting the activity. */
+    private var daemonFatal by mutableStateOf<DaemonFatal?>(null)
+
     /** Set by finish(), so onDestroy tells Back from a swipe from Recents. */
     private var finishedByBack = false
 
@@ -91,7 +102,12 @@ class MainActivity : ComponentActivity() {
         // removes it. Only that suffix: a daemon download into the same folder keeps its <name>.part there.
         Thread { ModelImport.sweepPartialFiles(this) }.start()
 
-        if (nodeStarted.compareAndSet(false, true)) {
+        // A record left by an earlier start of this version: show it instead of running Node into the same failure
+        // (a crash loop, since Node runs in this process). A new APK, or Try again, clears it.
+        val fatalFile = File(filesDir, DAEMON_FATAL_FILE)
+        daemonFatal = readDaemonFatal(fatalFile, appVersionCode())
+
+        if (daemonFatal == null && nodeStarted.compareAndSet(false, true)) {
             val nodeRuntime = NodeRuntimeLauncher()
             Thread {
                 try {
@@ -125,12 +141,18 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_CORE_PATH" to "${applicationInfo.nativeLibraryDir}/libturbollm_core_node.so",
                             // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
+                            // Where the daemon records a failure that ends it (exit 69: no native core). It only
+                            // reports; it does not choose or control the core.
+                            "TURBOLLM_DAEMON_FATAL_FILE" to fatalFile.absolutePath,
                             // Loopback callers must present it (DAEMON_APP_SECRET).
                             "TURBOLLM_APP_SECRET" to DAEMON_APP_SECRET,
                         ) + gpuEnv() + socEnv() + sdkEnv,
                         args = arrayOf("--no-telemetry", "--port", ANDROID_DAEMON_PORT.toString()),
                         preloadScripts = arrayOf("${filesDir.absolutePath}/daemon/dist/android-preload.cjs"),
                     )
+                    // Node normally ends the process when it exits. If it returned with the process alive and left
+                    // a fatal record, show it now; Node is not started again.
+                    readDaemonFatal(fatalFile, appVersionCode())?.let { runOnUiThread { daemonFatal = it } }
                     Log.i(TAG, "TurboLLM daemon started successfully")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start the daemon", e)
@@ -145,7 +167,29 @@ class MainActivity : ComponentActivity() {
             }.start()
         }
 
-        setContent { DaemonWebViewScreen() }
+        setContent {
+            val fatal = daemonFatal
+            if (fatal != null) {
+                DaemonFatalScreen(fatal, DaemonLog.file(filesDir), onTryAgain = { tryAgainAfterFatal(fatalFile) })
+            } else {
+                DaemonWebViewScreen()
+            }
+        }
+    }
+
+    private fun appVersionCode(): Long =
+        PackageInfoCompat.getLongVersionCode(packageManager.getPackageInfo(packageName, 0))
+
+    /** Try again: forget the record and boot again. Node starts once per process (nodeStarted), so if this process
+     *  already ran it, the app ends and the next launch starts clean; otherwise a recreated activity starts it. */
+    private fun tryAgainAfterFatal(fatalFile: File) {
+        clearDaemonFatal(fatalFile)
+        if (nodeStarted.get()) {
+            finishAndRemoveTask()
+            android.os.Process.killProcess(android.os.Process.myPid())
+        } else {
+            recreate()
+        }
     }
 
     override fun onResume() {

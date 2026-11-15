@@ -53,6 +53,10 @@ kotlin {
             implementation(libs.ktor.serialization.kotlinx.json)
             implementation(libs.kotlinx.coroutines.core)
         }
+        // DaemonFatalTest (pure JVM: JSON in, files under a TemporaryFolder).
+        androidUnitTest.dependencies {
+            implementation(libs.junit)
+        }
         iosMain.dependencies {
             implementation(libs.ktor.client.darwin)
         }
@@ -746,7 +750,6 @@ val stageCoreAddon by tasks.registering(Exec::class) {
     dependsOn(fetchLibnode)
     workingDir = rootProject.projectDir
     val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
-    val turbollmDir = providers.gradleProperty("turbollm.dir").map { file(it) }.getOrElse(rootDir.resolve("../turbollm"))
     val libnodeBin = layout.projectDirectory.dir("src/androidMain/cpp/libnode/bin")
     val outDir = coreAddonJniLibs
     outputs.upToDateWhen { false }
