@@ -31,6 +31,8 @@ permissions:
 
 env:
   NODEJS_MOBILE_VERSION: v18.20.4
+  # Same pin as turbollm's core-build.yml.
+  CARGO_NDK_VERSION: 4.1.2
 
 jobs:
   publish-alpha:
@@ -98,6 +100,24 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-36" "cmake;3.22.1" "ndk;27.0.12077973" > /dev/null
+
+      # The Rust core (turbollm-core): the SDK calls it through UniFFI and the daemon loads its nodejs-mobile
+      # addon. The Gradle build runs cargo-ndk for both ABIs, so the toolchain pinned by the turbollm checkout and
+      # its two Android targets must be there.
+      - name: Install the pinned Rust toolchain and Android targets
+        working-directory: turbollm-src/turbollm/core
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: turbollm-src/turbollm/core
+          cache-bin: false
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
 
       # libnode.so is a gitignored build input (~190 MB). scripts/fetch-libnode.mjs downloads the
       # 16 KB-aligned nodejs-mobile ${{ env.NODEJS_MOBILE_VERSION }} build from the digidem fork (the
