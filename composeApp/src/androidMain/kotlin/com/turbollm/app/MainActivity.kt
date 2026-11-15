@@ -119,6 +119,10 @@ class MainActivity : ComponentActivity() {
                             // instead of depending on a manual one-time registration that goes
                             // stale the next time the app is reinstalled.
                             "TURBOLLM_ANDROID_NATIVE_LIB_DIR" to applicationInfo.nativeLibraryDir,
+                            // The Rust core's napi addon (libturbollm_core_node.so, built by
+                            // :turbollm-core:assembleNodejsMobileAddon). Android extracts it here; the daemon
+                            // loads it from this exact path and exits 69 when it cannot (DaemonFatal).
+                            "TURBOLLM_CORE_PATH" to "${applicationInfo.nativeLibraryDir}/libturbollm_core_node.so",
                             // Node's stdout/stderr, otherwise lost in an app process (native-lib.cpp).
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
                             // Loopback callers must present it (DAEMON_APP_SECRET).

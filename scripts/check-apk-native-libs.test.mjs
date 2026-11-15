@@ -21,7 +21,9 @@ const SPAWNED_CPU_ENGINE = [
   'libggml.so', 'libggml-base.so', 'libggml-cpu.so', 'libmtmd.so', 'libomp.so',
 ]
 const SDK_ENGINES = ['libturbollm_llama_base.so', 'liblitertlm_jni.so']
-const APP_LIBS = ['libnode.so', 'libnative-lib.so', 'libc++_shared.so']
+// The Rust core (T25): the nodejs-mobile addon, the UniFFI library, and JNA's loader (PG-8). Every profile needs them.
+const CORE_LIBS = ['libturbollm_core_node.so', 'libturbollm_core_ffi.so', 'libjnidispatch.so']
+const APP_LIBS = ['libnode.so', 'libnative-lib.so', 'libc++_shared.so', ...CORE_LIBS]
 
 function apkListing(libs, abis = ABIS) {
   return ['AndroidManifest.xml', 'classes.dex', ...abis.flatMap((abi) => libs.map((lib) => `lib/${abi}/${lib}`))]
@@ -134,6 +136,23 @@ test('the LiteRT-LM opt-in packages the server beside the SDK runtime', () => {
   assert.deepEqual(nativeLibProblems(apkListing([...DEFAULT_LIBS, ...litert]), 'litert-lm-engine'), [])
   assert.deepEqual(nativeLibProblems(DEFAULT_APK, 'litert-lm-engine'), ABIS.flatMap((abi) =>
     litert.map((lib) => `${abi}: ${lib} is missing`)))
+})
+
+test('each Rust core library is required in every ABI and every profile, named when missing', () => {
+  for (const profile of Object.keys(PROFILES)) {
+    const libs = {
+      default: DEFAULT_LIBS,
+      'no-spawned-engines': [...APP_LIBS, ...SDK_ENGINES],
+      'litert-lm-engine': [...DEFAULT_LIBS, 'liblitertlm_server.so', 'liblitert-lm.so', 'liblrtandr.so'],
+    }[profile]
+    assert.deepEqual(nativeLibProblems(apkListing(libs), profile), [], profile)
+    for (const core of CORE_LIBS) {
+      for (const abi of ABIS) {
+        const apk = apkListing(libs).filter((entry) => entry !== `lib/${abi}/${core}`)
+        assert.deepEqual(nativeLibProblems(apk, profile), [`${abi}: ${core} is missing`], `${profile} ${abi} ${core}`)
+      }
+    }
+  }
 })
 
 test('an unknown profile is refused by name, with the known ones', () => {
