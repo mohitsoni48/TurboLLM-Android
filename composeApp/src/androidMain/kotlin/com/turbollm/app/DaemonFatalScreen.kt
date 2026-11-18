@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -28,11 +30,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.io.File
 
-private val Light = Color(0xFFEDEDEC)
-private val Muted = Color(0xFFB4B4B2)
-
-/** Shown instead of the WebView when the daemon recorded a fatal start failure (DaemonFatal). On the splash's pinned
- *  dark surface, hence the explicit light text colors, like the renderer-crash screen. [onTryAgain] deletes the record
+/** Shown instead of the WebView when the daemon recorded a fatal start failure (DaemonFatal). It paints its own dark
+ *  surface (the splash's) with explicit text colors, because the activity's theme background follows the system theme and
+ *  light text on a light one is unreadable (DaemonFatalPalette). [onTryAgain] deletes the record
  *  and starts the app's boot again; nothing here starts Node by itself. */
 @Composable
 fun DaemonFatalScreen(fatal: DaemonFatal, daemonLog: File, onTryAgain: () -> Unit) {
@@ -40,28 +40,38 @@ fun DaemonFatalScreen(fatal: DaemonFatal, daemonLog: File, onTryAgain: () -> Uni
     // Back leaves the app, as from the WebView's root screen.
     BackHandler(enabled = true) { (context as? Activity)?.finish() }
     Column(
-        modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(24.dp),
+        modifier = Modifier.fillMaxSize().background(Color(DaemonFatalPalette.SURFACE))
+            .windowInsetsPadding(WindowInsets.safeDrawing).padding(24.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("TurboLLM could not start", color = Light, fontSize = 22.sp)
+        Text("TurboLLM could not start", color = Color(DaemonFatalPalette.TITLE), fontSize = 22.sp)
         Text(
             "This build of the app is missing a part it needs. Reinstalling or updating the app from the Play Store " +
                 "usually fixes it.",
-            color = Light,
+            color = Color(DaemonFatalPalette.BODY),
             modifier = Modifier.padding(top = 12.dp),
         )
         // Scrollable and selectable: the message can be a long CoreLoadError listing every path tried.
         SelectionContainer(modifier = Modifier.weight(1f, fill = false).padding(top = 16.dp)) {
             Text(
                 fatal.message,
-                color = Muted,
+                color = Color(DaemonFatalPalette.DETAIL),
                 fontSize = 13.sp,
                 modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
             )
         }
         Row(modifier = Modifier.padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = onTryAgain) { Text("Try again") }
-            OutlinedButton(onClick = { copyDetails(context, fatal, daemonLog) }) { Text("Copy details") }
+            Button(
+                onClick = onTryAgain,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(DaemonFatalPalette.BUTTON),
+                    contentColor = Color(DaemonFatalPalette.BUTTON_TEXT),
+                ),
+            ) { Text("Try again") }
+            OutlinedButton(
+                onClick = { copyDetails(context, fatal, daemonLog) },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(DaemonFatalPalette.OUTLINE_BUTTON_TEXT)),
+            ) { Text("Copy details") }
         }
     }
 }
