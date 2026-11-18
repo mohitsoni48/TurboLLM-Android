@@ -746,7 +746,8 @@ tasks.named("preBuild") { dependsOn(fetchLibnode) }
 // provides, so it runs after it, and before the native libraries are merged into the APK.
 val stageCoreAddon by tasks.registering(Exec::class) {
     group = "build"
-    description = "Builds libturbollm_core_node.so for each shipped ABI into the APK's jniLibs."
+    description = "Builds libturbollm_core_node.so for arm64-v8a and x86_64 (the set build-node.mjs builds) into the APK's jniLibs."
+    // shippedAbis and build-node.mjs's target list must stay equal; check-apk-native-libs.mjs enforces the result per ABI.
     dependsOn(fetchLibnode)
     workingDir = rootProject.projectDir
     val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)

@@ -30,9 +30,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 private const val TAG = "TurboLLM"
 private const val SDK_LOG_TAG = "TurboLLMSdk"
 
-/** In filesDir: the daemon's fatal record (DaemonFatal). */
-private const val DAEMON_FATAL_FILE = "daemon-fatal.json"
-
 /** The daemon's listen port on Android — 7000, not desktop/LAN's 6996, to avoid any ambiguity
  *  between the two when both might be reachable on the same machine during testing (an
  *  emulator's forwarded port and a developer's own desktop daemon). Standard for Android
@@ -60,6 +57,13 @@ class MainActivity : ComponentActivity() {
     /** The daemon's fatal record, when it could not start (DaemonFatal): the app then shows DaemonFatalScreen and
      *  does not run Node. State, so the screen can replace the WebView without restarting the activity. */
     private var daemonFatal by mutableStateOf<DaemonFatal?>(null)
+
+    /** The daemon's fatal record for this install (DaemonFatalRecord); set in onCreate. */
+    private lateinit var fatalRecord: DaemonFatalRecord
+
+    /** False while the fatal screen is up from the start, when neither the engine service nor its notification has a
+     *  daemon to report on. */
+    private var engineServiceStarted = false
 
     /** Set by finish(), so onDestroy tells Back from a swipe from Recents. */
     private var finishedByBack = false
@@ -95,17 +99,25 @@ class MainActivity : ComponentActivity() {
         // runs files/daemon/dist/cli.js, which has to exist by then.
         extractDaemonFromAssets()
 
-        EngineService.start(this)
+        // A record this install's daemon left: show it instead of running Node into the same failure (a crash loop,
+        // since Node runs in this process), and keep the engine service down, which would only idle with no daemon.
+        // Another install's record is stale, and removed (DaemonFatalRecord).
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        fatalRecord = DaemonFatalRecord(
+            filesDir,
+            PackageInfoCompat.getLongVersionCode(packageInfo),
+            packageInfo.lastUpdateTime,
+        ).also { it.sweepStale() }
+        daemonFatal = fatalRecord.read()
+        if (daemonFatal == null) {
+            EngineService.start(this)
+            engineServiceStarted = true
+        }
         requestNotificationPermission()
         storageAccess = StorageAccess(this)
         // A model import interrupted by the process dying leaves a multi-GB <name>.import-part behind; nothing else
         // removes it. Only that suffix: a daemon download into the same folder keeps its <name>.part there.
         Thread { ModelImport.sweepPartialFiles(this) }.start()
-
-        // A record left by an earlier start of this version: show it instead of running Node into the same failure
-        // (a crash loop, since Node runs in this process). A new APK, or Try again, clears it.
-        val fatalFile = File(filesDir, DAEMON_FATAL_FILE)
-        daemonFatal = readDaemonFatal(fatalFile, appVersionCode())
 
         if (daemonFatal == null && nodeStarted.compareAndSet(false, true)) {
             val nodeRuntime = NodeRuntimeLauncher()
@@ -143,7 +155,7 @@ class MainActivity : ComponentActivity() {
                             "TURBOLLM_DAEMON_LOG" to File(filesDir, "daemon.log").absolutePath,
                             // Where the daemon records a failure that ends it (exit 69: no native core). It only
                             // reports; it does not choose or control the core.
-                            "TURBOLLM_DAEMON_FATAL_FILE" to fatalFile.absolutePath,
+                            "TURBOLLM_DAEMON_FATAL_FILE" to fatalRecord.file.absolutePath,
                             // Loopback callers must present it (DAEMON_APP_SECRET).
                             "TURBOLLM_APP_SECRET" to DAEMON_APP_SECRET,
                         ) + gpuEnv() + socEnv() + sdkEnv,
@@ -152,8 +164,13 @@ class MainActivity : ComponentActivity() {
                     )
                     // Node normally ends the process when it exits. If it returned with the process alive and left
                     // a fatal record, show it now; Node is not started again.
-                    readDaemonFatal(fatalFile, appVersionCode())?.let { runOnUiThread { daemonFatal = it } }
-                    Log.i(TAG, "TurboLLM daemon started successfully")
+                    val fatal = fatalRecord.read()
+                    if (fatal != null) {
+                        Log.e(TAG, "the daemon stopped: ${fatal.code}")
+                        runOnUiThread { daemonFatal = fatal }
+                    } else {
+                        Log.i(TAG, "TurboLLM daemon started successfully")
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start the daemon", e)
                     runOnUiThread {
@@ -170,20 +187,17 @@ class MainActivity : ComponentActivity() {
         setContent {
             val fatal = daemonFatal
             if (fatal != null) {
-                DaemonFatalScreen(fatal, DaemonLog.file(filesDir), onTryAgain = { tryAgainAfterFatal(fatalFile) })
+                DaemonFatalScreen(fatal, DaemonLog.file(filesDir), onTryAgain = ::tryAgainAfterFatal)
             } else {
                 DaemonWebViewScreen()
             }
         }
     }
 
-    private fun appVersionCode(): Long =
-        PackageInfoCompat.getLongVersionCode(packageManager.getPackageInfo(packageName, 0))
-
     /** Try again: forget the record and boot again. Node starts once per process (nodeStarted), so if this process
      *  already ran it, the app ends and the next launch starts clean; otherwise a recreated activity starts it. */
-    private fun tryAgainAfterFatal(fatalFile: File) {
-        clearDaemonFatal(fatalFile)
+    private fun tryAgainAfterFatal() {
+        fatalRecord.clear()
         if (nodeStarted.get()) {
             finishAndRemoveTask()
             android.os.Process.killProcess(android.os.Process.myPid())
@@ -198,7 +212,7 @@ class MainActivity : ComponentActivity() {
         // closing and a return from Settings included. Android drops a post made without the permission for good and
         // re-posts nothing on a grant, and the first post (startForeground, from onCreate) goes out before the user
         // can answer the prompt.
-        EngineService.repostNotification(this)
+        if (engineServiceStarted) EngineService.repostNotification(this)
         storageAccess.onResume()
         DaemonLog.rotateIfLarge(filesDir)
     }
@@ -223,7 +237,7 @@ class MainActivity : ComponentActivity() {
         // the same swipe, decided afresh a moment later, so a swipe with a reply running quit the app if the reply
         // ended in between (EngineService.appClosed).
         // Android may run this only after the app was opened again, a new MainActivity included (activityNumber).
-        if (isFinishing && finishedByBack) EngineService.activityFinished(this, activityNumber)
+        if (isFinishing && finishedByBack && engineServiceStarted) EngineService.activityFinished(this, activityNumber)
         super.onDestroy()
     }
 

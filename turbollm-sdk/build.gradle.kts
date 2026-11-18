@@ -82,8 +82,9 @@ dependencies {
 
 // P-7: the JVM tests call the Rust core through JNA, which loads the host library cargoHostBuild produces.
 val hostCoreLibDir = providers.gradleProperty("turbollm.dir")
-    .map { file(it) }
+    .map { rootProject.file(it) }
     .getOrElse(rootProject.file("../turbollm"))
+    .normalize()
     .resolve("core/target/release")
 
 tasks.withType<Test>().configureEach {

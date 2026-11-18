@@ -67,7 +67,7 @@ fun DaemonFatalScreen(fatal: DaemonFatal, daemonLog: File, onTryAgain: () -> Uni
 }
 
 /** The message, plus where the full log is, for a bug report. */
-internal fun fatalDetails(fatal: DaemonFatal, daemonLog: File): String =
+private fun fatalDetails(fatal: DaemonFatal, daemonLog: File): String =
     "${fatal.message}\n\n(${fatal.code}, exit ${fatal.exitCode}, ${fatal.at})\nLog: ${daemonLog.absolutePath}"
 
 private fun copyDetails(context: Context, fatal: DaemonFatal, daemonLog: File) {
