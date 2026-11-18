@@ -1,0 +1,86 @@
+package com.turbollm.app
+
+import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import java.io.File
+
+/** Shown instead of the WebView when the daemon recorded a fatal start failure (DaemonFatal). It paints its own dark
+ *  surface (the splash's) with explicit text colors, because the activity's theme background follows the system theme and
+ *  light text on a light one is unreadable (DaemonFatalPalette). [onTryAgain] deletes the record
+ *  and starts the app's boot again; nothing here starts Node by itself. */
+@Composable
+fun DaemonFatalScreen(fatal: DaemonFatal, daemonLog: File, onTryAgain: () -> Unit) {
+    val context = LocalContext.current
+    // Back leaves the app, as from the WebView's root screen.
+    BackHandler(enabled = true) { (context as? Activity)?.finish() }
+    Column(
+        modifier = Modifier.fillMaxSize().background(Color(DaemonFatalPalette.SURFACE))
+            .windowInsetsPadding(WindowInsets.safeDrawing).padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text("TurboLLM could not start", color = Color(DaemonFatalPalette.TITLE), fontSize = 22.sp)
+        Text(
+            "This build of the app is missing a part it needs. Reinstalling or updating the app from the Play Store " +
+                "usually fixes it.",
+            color = Color(DaemonFatalPalette.BODY),
+            modifier = Modifier.padding(top = 12.dp),
+        )
+        // Scrollable and selectable: the message can be a long CoreLoadError listing every path tried.
+        SelectionContainer(modifier = Modifier.weight(1f, fill = false).padding(top = 16.dp)) {
+            Text(
+                fatal.message,
+                color = Color(DaemonFatalPalette.DETAIL),
+                fontSize = 13.sp,
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+            )
+        }
+        Row(modifier = Modifier.padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                onClick = onTryAgain,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(DaemonFatalPalette.BUTTON),
+                    contentColor = Color(DaemonFatalPalette.BUTTON_TEXT),
+                ),
+            ) { Text("Try again") }
+            OutlinedButton(
+                onClick = { copyDetails(context, fatal, daemonLog) },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(DaemonFatalPalette.OUTLINE_BUTTON_TEXT)),
+            ) { Text("Copy details") }
+        }
+    }
+}
+
+/** The message, plus where the full log is, for a bug report. */
+private fun fatalDetails(fatal: DaemonFatal, daemonLog: File): String =
+    "${fatal.message}\n\n(${fatal.code}, exit ${fatal.exitCode}, ${fatal.at})\nLog: ${daemonLog.absolutePath}"
+
+private fun copyDetails(context: Context, fatal: DaemonFatal, daemonLog: File) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText("TurboLLM error", fatalDetails(fatal, daemonLog)))
+}

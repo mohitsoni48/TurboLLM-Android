@@ -53,6 +53,10 @@ kotlin {
             implementation(libs.ktor.serialization.kotlinx.json)
             implementation(libs.kotlinx.coroutines.core)
         }
+        // DaemonFatalTest (pure JVM: JSON in, files under a TemporaryFolder).
+        androidUnitTest.dependencies {
+            implementation(libs.junit)
+        }
         iosMain.dependencies {
             implementation(libs.ktor.client.darwin)
         }
@@ -137,6 +141,11 @@ val tetherJniLibs = layout.buildDirectory.dir("generated/tether-exec/jniLibs")
 // Where stageWhisperServer puts <abi>/libwhisper_server.so, the speech-to-text server (see "Speech-to-text" below).
 // jniLibs packages everything in it.
 val whisperJniLibs = layout.buildDirectory.dir("generated/whisper/jniLibs")
+
+// Where stageCoreAddon puts <abi>/libturbollm_core_node.so, the Rust core's napi addon the embedded daemon loads
+// (TURBOLLM_CORE_PATH, MainActivity). jniLibs packages everything in it; useLegacyPackaging extracts it to
+// nativeLibraryDir. libturbollm_core_ffi.so and JNA's libjnidispatch.so arrive through :turbollm-sdk.
+val coreAddonJniLibs = layout.buildDirectory.dir("generated/core-addon/jniLibs")
 
 val uploadStoreFile: File? = localProp("TURBOLLM_UPLOAD_STORE_FILE")
     ?.let { rootProject.projectDir.resolve(it).normalize() }
@@ -273,6 +282,8 @@ android {
         // The engine tether, staged into the build dir by stageTetherExec (below): compiled on every machine, like the
         // LiteRT-LM server, and in every build that carries a spawned engine.
         if (shipEngineTether) jniLibs.srcDir(tetherJniLibs)
+        // The Rust core's nodejs-mobile addon, built by stageCoreAddon (below).
+        jniLibs.srcDir(coreAddonJniLibs)
         // whisper-server, staged into the build dir by stageWhisperServer (below): built from source on every machine.
         if (shipWhisperServer) jniLibs.srcDir(whisperJniLibs)
     }
@@ -726,3 +737,34 @@ val fetchLibnode by tasks.registering(Exec::class) {
     commandLine("node", "scripts/fetch-libnode.mjs")
 }
 tasks.named("preBuild") { dependsOn(fetchLibnode) }
+
+// ── The Rust core's nodejs-mobile addon ─────────────────────────────────────────────────
+//
+// The same build as :turbollm-core:assembleNodejsMobileAddon (core/scripts/build-node.mjs: both ABIs, linked against
+// libnode.so, then xtask check-android-elf), run from here because that task reads -Pturbollm.libnodeDir and a
+// consumer build cannot set a Gradle property for another project. It links against the libnode.so fetchLibnode
+// provides, so it runs after it, and before the native libraries are merged into the APK.
+val stageCoreAddon by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds libturbollm_core_node.so for arm64-v8a and x86_64 (the set build-node.mjs builds) into the APK's jniLibs."
+    // shippedAbis and build-node.mjs's target list must stay equal; check-apk-native-libs.mjs enforces the result per ABI.
+    dependsOn(fetchLibnode)
+    workingDir = rootProject.projectDir
+    val androidExt = project.extensions.getByType(com.android.build.gradle.BaseExtension::class.java)
+    val libnodeBin = layout.projectDirectory.dir("src/androidMain/cpp/libnode/bin")
+    val outDir = coreAddonJniLibs
+    outputs.upToDateWhen { false }
+    doFirst {
+        delete(outDir)
+        environment("ANDROID_NDK_HOME", androidExt.ndkDirectory.absolutePath)
+        commandLine(
+            "node", turbollmDir.resolve("core/scripts/build-node.mjs").path,
+            "--flavour", "nodejs-mobile", "--release",
+            "--libnode-dir", libnodeBin.asFile.absolutePath,
+            "--out", outDir.get().asFile.absolutePath,
+        )
+    }
+}
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(stageCoreAddon)
+}

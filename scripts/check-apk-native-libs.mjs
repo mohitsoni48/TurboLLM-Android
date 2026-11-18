@@ -2,7 +2,7 @@
 // Checks that an APK carries the native libraries its engine flags promise, and none they leave out:
 //   node scripts/check-apk-native-libs.mjs <apk> <profile>
 // Profiles name the build flags (composeApp/build.gradle.kts):
-//   default              no engine flags: the SDK, plus the CPU llama-server fallback and its tether (Option B)
+//   default              no engine flags: the SDK and the Rust core, plus the CPU llama-server fallback and its tether (Option B)
 //   no-spawned-engines   -PturbollmSpawnedEngines=false: the SDK alone
 //   litert-lm-engine     -PturbollmLitertLmEngine=true: the default, plus the LiteRT-LM server opt-in
 // Every shipped ABI is checked. It prints the APK's lib/ entries, then PASS, or FAIL and each problem (exit 1).
@@ -11,6 +11,9 @@ import { fileURLToPath } from 'node:url'
 
 export const ABIS = ['arm64-v8a', 'x86_64']
 
+// The Rust core (turbollm-core): the nodejs-mobile addon the daemon loads (TURBOLLM_CORE_PATH), the UniFFI library the
+// SDK calls, and JNA's loader for it. Every profile ships them.
+const CORE_LIBS = ['libturbollm_core_node.so', 'libturbollm_core_ffi.so', 'libjnidispatch.so']
 const SDK_ENGINES = ['libturbollm_llama_base.so', 'liblitertlm_jni.so']
 const SPAWNED_CPU_ENGINE = [
   'libllama_server.so', 'libllama-server-impl.so', 'libllama.so', 'libllama-common.so',
@@ -22,15 +25,15 @@ const VULKAN_ENGINE = 'libllama_server_vk.so'
 
 export const PROFILES = {
   default: {
-    required: [...SDK_ENGINES, ...SPAWNED_CPU_ENGINE, ENGINE_TETHER],
+    required: [...CORE_LIBS, ...SDK_ENGINES, ...SPAWNED_CPU_ENGINE, ENGINE_TETHER],
     forbidden: [...LITERT_LM_SERVER, VULKAN_ENGINE],
   },
   'no-spawned-engines': {
-    required: SDK_ENGINES,
+    required: [...CORE_LIBS, ...SDK_ENGINES],
     forbidden: [...SPAWNED_CPU_ENGINE, ENGINE_TETHER, ...LITERT_LM_SERVER, VULKAN_ENGINE],
   },
   'litert-lm-engine': {
-    required: [...SDK_ENGINES, ...SPAWNED_CPU_ENGINE, ENGINE_TETHER, ...LITERT_LM_SERVER],
+    required: [...CORE_LIBS, ...SDK_ENGINES, ...SPAWNED_CPU_ENGINE, ENGINE_TETHER, ...LITERT_LM_SERVER],
     forbidden: [VULKAN_ENGINE],
   },
 }

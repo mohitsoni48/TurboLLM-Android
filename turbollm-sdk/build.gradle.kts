@@ -66,11 +66,13 @@ kotlin {
 dependencies {
     api(libs.kotlinx.coroutines.android)
     api(libs.kotlinx.serialization.json)
+    implementation(project(":turbollm-core"))
     implementation(libs.litertlm)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
 
     testImplementation(libs.junit)
+    testImplementation("net.java.dev.jna:jna:5.19.1")
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.ktor.server.test.host)
 
@@ -78,6 +80,15 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
 }
 
+// P-7: the JVM tests call the Rust core through JNA, which loads the host library cargoHostBuild produces.
+val hostCoreLibDir = providers.gradleProperty("turbollm.dir")
+    .map { rootProject.file(it) }
+    .getOrElse(rootProject.file("../turbollm"))
+    .normalize()
+    .resolve("core/target/release")
+
 tasks.withType<Test>().configureEach {
     timeout.set(Duration.ofMinutes(10))
+    dependsOn(":turbollm-core:cargoHostBuild")
+    systemProperty("jna.library.path", hostCoreLibDir.path)
 }

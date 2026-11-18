@@ -21,6 +21,19 @@ class QuantParserTest {
         cases.forEach { (name, quant) -> assertEquals(name, quant, quantFromName(name, ModelFormat.GGUF)) }
     }
 
+    // D-K1: the shared Rust core also knows the APEX tiers (golden/quant-names.json rows).
+    @Test
+    fun apexTiersAreReadFromTheFileName() {
+        val cases = mapOf(
+            "Qwen3.6-35B-A3B-APEX-MTP-I-Quality.gguf" to "APEX-I-QUALITY",
+            "Qwen3.6-35B-A3B-APEX-MTP-Balanced.gguf" to "APEX-BALANCED",
+            "model-apex-mini.gguf" to "APEX-MINI",
+            "m-apex-i-nano.gguf" to "APEX-I-NANO",
+        )
+
+        cases.forEach { (name, quant) -> assertEquals(name, quant, quantFromName(name, ModelFormat.GGUF)) }
+    }
+
     @Test
     fun theLastGgufQuantInTheNameWins() {
         assertEquals("IQ4_XS", quantFromName("Q8-distill-IQ4_XS.gguf", ModelFormat.GGUF))
